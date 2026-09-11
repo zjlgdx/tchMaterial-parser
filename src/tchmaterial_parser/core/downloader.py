@@ -37,6 +37,16 @@ def format_bytes(size: float) -> str: # 将数据单位进行格式化，返回�
     return f"{size:3.1f} PB"
 
 
+def new_download_state(url: str, save_path: str) -> dict:
+    """一条下载任务的初始状态。
+
+    只此一处构造：投递、直接调用、测试替身各抄一份的话，任何一处少一个键都要
+    等到真跑起来才报 KeyError，而测试恰恰是绿的。
+    """
+    return { "download_url": url, "save_path": save_path, "downloaded_size": 0,
+             "total_size": 0, "finished": False, "failed_reason": None, "attempts": 0 }
+
+
 def remove_part_file(part_path: str) -> None: # 清理下载残件
     try:
         os.remove(part_path)
@@ -229,8 +239,7 @@ class DownloadManager:
         解析完的后续链接，都还不在 _states 里；把「是否全部完成」建立在
         「此刻已登记的那几条」之上，第一个跑完的任务就会被当成全部跑完。
         """
-        state = { "download_url": url, "save_path": save_path, "downloaded_size": 0,
-                  "total_size": 0, "finished": False, "failed_reason": None, "attempts": 0 }
+        state = new_download_state(url, save_path)
         with self._lock:
             self._states.append(state)
         return self._ensure_executor().submit(self.download_file, url, save_path, state)
@@ -351,8 +360,7 @@ class DownloadManager:
 
     def download_file(self, url: str, save_path: str, current_state: dict = None) -> None: # 在工作线程中执行
         if current_state is None: # 直接调用（测试）时也要登记，保持与 submit 一致
-            current_state = { "download_url": url, "save_path": save_path, "downloaded_size": 0,
-                              "total_size": 0, "finished": False, "failed_reason": None, "attempts": 0 }
+            current_state = new_download_state(url, save_path)
             with self._lock:
                 self._states.append(current_state)
 

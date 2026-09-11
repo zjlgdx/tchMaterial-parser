@@ -12,7 +12,7 @@ from conftest import FakeResponse, FakeSession
 from tchmaterial_parser.config import AppConfig
 from tchmaterial_parser.core import naming
 from tchmaterial_parser.core.downloader import (DownloadManager, content_range_starts_at,
-                                                 response_validator)
+                                                 new_download_state, response_validator)
 from tchmaterial_parser.core.http import HttpClient
 
 URL = "http://example.invalid/a.pdf"
@@ -449,8 +449,7 @@ def test_failures_are_carried_in_the_snapshot(tmp_path):
 
 def test_reset_refuses_while_tasks_are_in_flight(tmp_path):
     manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
-    manager._states.append({"download_url": URL, "save_path": "x", "downloaded_size": 0,
-                            "total_size": 0, "finished": False, "failed_reason": None})
+    manager._states.append(new_download_state(URL, "x"))
     assert manager.reset() is False
     assert len(manager.states()) == 1
 
@@ -1038,3 +1037,37 @@ def test_the_response_is_closed_when_the_download_is_cancelled(tmp_path):
 
     assert manager.states()[0]["failed_reason"] == "下载已取消"
     assert response.closed is True, "取消时响应没关"
+
+
+# ---- R3-P2-5：替身的状态字典不许比真实的少一个键 ----
+
+def test_submit_registers_exactly_the_documented_state(tmp_path):
+    """真实投递登记的键集就是 new_download_state 给的那一份。"""
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
+    manager.submit(URL, str(tmp_path / "书.pdf")).result()
+
+    assert set(manager.states()[0]) == set(new_download_state(URL, "x"))
+
+
+def test_no_test_hand_builds_a_download_state():
+    """测试里不许再手拼下载状态字典。
+
+    替身比真实对象少一个字段，是本轮反复踩到的那个坑：哪天 poll_downloads
+    读到 attempts，就是一个只在测试里不存在的 KeyError，而套件是绿的。
+    """
+    import ast
+    import glob
+
+    tests_dir = os.path.dirname(os.path.abspath(__file__))
+    offenders = []
+    for path in sorted(glob.glob(os.path.join(tests_dir, "*.py"))):
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = {k.value for k in node.keys
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            if "download_url" in keys and "save_path" in keys:
+                offenders.append("%s:%d" % (os.path.basename(path), node.lineno))
+
+    assert not offenders, "手拼的下载状态字典：%s（改用 new_download_state）" % offenders

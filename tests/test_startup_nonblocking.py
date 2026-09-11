@@ -10,6 +10,7 @@ import pytest
 tk = pytest.importorskip("tkinter")
 
 from tchmaterial_parser.core.catalog import CatalogNode  # noqa: E402
+from tchmaterial_parser.core.downloader import new_download_state  # noqa: E402
 import tchmaterial_parser.ui.app as app_module  # noqa: E402
 
 SAMPLE = {"tag-edu": CatalogNode("tag-edu", "电子教材", children={
@@ -223,9 +224,7 @@ def test_closing_asks_before_cancelling_live_downloads(monkeypatch):
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
-    app.downloads._states.append({"download_url": "u", "save_path": "/tmp/x.pdf",
-                                  "downloaded_size": 0, "total_size": 0,
-                                  "finished": False, "failed_reason": None})
+    app.downloads._states.append(new_download_state("u", "/tmp/x.pdf"))
 
     asked = []
     monkeypatch.setattr(app_module.messagebox, "askokcancel",
@@ -272,9 +271,9 @@ def test_completion_gate_opens_only_after_the_whole_batch_is_submitted(monkeypat
     during = []
 
     def submit_and_poll(url, save_path):
-        app.downloads._states.append({"download_url": url, "save_path": save_path,
-                                      "downloaded_size": 8, "total_size": 8,
-                                      "finished": True, "failed_reason": None})
+        state = new_download_state(url, save_path)
+        state.update(downloaded_size=8, total_size=8, finished=True)
+        app.downloads._states.append(state)
         app.poll_downloads()
         during.append(len(finished))
 
@@ -315,9 +314,9 @@ def test_poller_ignores_snapshots_while_the_gate_is_closed(monkeypatch):
 
     # 造出一个「已登记两个、都已完成」的半截快照
     for i in range(2):
-        app.downloads._states.append({"download_url": "u%d" % i, "save_path": "/tmp/x.pdf",
-                                      "downloaded_size": 8, "total_size": 8,
-                                      "finished": True, "failed_reason": None})
+        state = new_download_state("u%d" % i, "/tmp/x.pdf")
+        state.update(downloaded_size=8, total_size=8, finished=True)
+        app.downloads._states.append(state)
 
     app.download_session = False # 闸门未开
     app.poll_downloads()
