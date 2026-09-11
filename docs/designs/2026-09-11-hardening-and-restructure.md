@@ -158,6 +158,7 @@ tchMaterial-parser/
 │       │   ├── parser.py            # 资源页 URL -> ResourceRef
 │       │   ├── catalog.py           # 资源树抓取 / 建树 / 字段裁剪
 │       │   ├── cache.py             # 版本号为键的资源树磁盘缓存
+│       │   ├── startup.py           # 启动时的目录加载编排（探版本 / 读缓存 / 拉取）
 │       │   ├── naming.py            # 文件名清洗 + 去重
 │       │   ├── downloader.py        # DownloadManager：线程池、断点续传、重试、状态
 │       │   └── tokens.py            # Access Token 跨平台持久化
@@ -212,6 +213,10 @@ tchMaterial-parser/
 - `load_any()`：不校验版本，连同它自己的版本号一起返回。**只在 `fetch_version()` 失败（离线）时使用**，让用户在断网时仍有一棵可用的目录树，UI 侧据此打上「离线缓存」标注。
 - `store()`：先写同目录 `.tmp` 再 `os.replace`，避免半截缓存。
 
+**`core/startup.py`** — `load_catalog(client, progress_cb=None) -> (tree, is_stale, failure)`，把「探版本 → 查缓存 → 必要时拉取」这条启动路径编排成一个函数，供 UI 在后台线程里调用。
+
+它独立成一个模块而不是并进相邻的两个：`cache` 需要 `catalog` 的 `CatalogNode` 才能反序列化，`catalog` 再反过来依赖 `cache` 就成环了，编排只能落在两者之上的一层。它也不属于 `ui/`——这段逻辑没有任何界面依赖，放进 `ui/` 会让它在无图形界面的环境里连导入都做不到，与「核心逻辑可在无 Tk 环境导入并测试」这条约束直接冲突。因此它和 `core/` 下其余模块受同一条纪律约束：不得 import `tkinter`。
+
 **`core/naming.py`** — 纯函数，零 I/O 依赖以外的东西，是测试密度最高的模块（B4）。
 - `sanitize_filename(title) -> str`：替换 `/ \ : * ? " < > |` 与所有 `ord(c) < 32` 的控制字符为 `_`；去掉首尾空白与点；`.` / `..` 视同空；Windows 保留名（`CON` `PRN` `AUX` `NUL` `COM1-9` `LPT1-9`，不分大小写、含扩展名形式）前缀 `_`；**按 UTF-8 编码后的字节数截断到 200 字节**；结果为空则用 `download`。
   按字节而非字符截断是因为文件系统的限制本来就是字节数（主流文件系统单个文件名上限 255 字节），而教材标题全是中文——一个汉字 UTF-8 占 3 字节，按字符数算的限额会让长标题照样写入失败，那正是 B4 要消灭的场景。200 字节这个数给 ` (99)` 这样的去重后缀与 `.pdf.part` 扩展名留了余量。截断**必须落在字符边界上**：先编码再截到 200 字节，若末尾切断了多字节序列就逐字节回退，直到 `decode("utf-8")` 成功。
@@ -254,14 +259,14 @@ tchMaterial-parser/
 
 **`ui/app.py`** — 唯一知道「窗口生命周期」的地方。
 - `main()`：`setup_logging()` → `AppConfig()` → `HttpClient` → `tk.Tk()` → 建全部控件 → 启动后台线程加载资源树 → 启动 200 ms 轮询器 → `mainloop()`。**任何 `messagebox` 都在 `tk.Tk()` 之后**（A4）。
-- 后台资源树线程的完整流程（A3、任务 9/10）：
+- 后台资源树线程调用 `core.startup.load_catalog()`（A3、任务 9/10），该函数内部依次是：
 
   1. `catalog.fetch_version()` 取版本键——只有一个小文件的代价。
   2. `cache.load(version)` 命中 → 直接用，**整个热启动路径不碰那 40 MB**。
   3. 未命中 → `catalog.fetch_tree()` 拉取建树 → `cache.store(version, tree)`。
   4. 第 1 步失败（离线）→ `cache.load_any()`，有货就用并标注「离线缓存」；没货才显示加载失败提示。
 
-  结果一律通过 `root.after(0, ...)` 交回主线程。
+  `ui/app.py` 只负责把返回的 `(tree, is_stale, failure)` 通过 `root.after(0, ...)` 交回主线程并据此更新界面。
 - 轮询器 `_poll_progress()`：读 `DownloadManager.snapshot()`，刷新进度条与标签，检测到「全部完成」时弹一次完成/失败汇总对话框、把下载按钮恢复为可用并复位，然后 `root.after(200, self._poll_progress)`。完成对话框「弹两次或一次都不弹」的竞态（B2）在这里结构性消失——判定只发生在主线程的一个地方。
 - 下载按钮的点击处理函数**先同步置灰再做任何事**（解析、选目录、提交都在置灰之后），恢复权归轮询器。两者的分工见 Discussion；这样 200 ms 窗口内的双击只会有第一次生效。
 - `on_closing()`：若 `snapshot().in_flight > 0` 则询问；确认后置位**两个线程池的取消标志**（目录加载与下载）并各自 `cancel_all()` → `root.destroy()`，让 `main()` 正常返回，不再 `sys.exit(0)`，也不再有 psutil 杀子进程的无效代码（B7）。阻塞在网络读取上的线程最多 30 s 后结束，进程随之退出。
