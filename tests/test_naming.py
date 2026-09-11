@@ -143,3 +143,47 @@ def test_string_that_becomes_empty_after_trimming_falls_back():
 def test_non_string_titles_do_not_raise(bad):
     """上游偶尔把 title 写成数字：for ch in 2024 会直接抛 TypeError。"""
     assert naming.sanitize_filename(bad) == "download"
+
+
+# ---- PR 评审第 2 轮：大小写不敏感文件系统上的预留 ----
+
+def test_reservations_collide_on_a_case_insensitive_filesystem(tmp_path, monkeypatch):
+    """Windows 上 Teacher Guide.pdf 与 teacher guide.pdf 是同一个文件。
+
+    预留集合按原样字符串去重的话，两个 worker 会各自以为独占，最终对着写
+    同一个 .part。用 normcase 打桩模拟 Windows 语义，不依赖真实平台。
+    """
+    monkeypatch.setattr(naming.os.path, "normcase", str.lower)
+
+    first = naming.unique_path(str(tmp_path), "Teacher Guide", ".pdf")
+    second = naming.unique_path(str(tmp_path), "teacher guide", ".pdf")
+
+    assert first.lower() != second.lower(), \
+        "两个任务拿到了同一个文件（只差大小写）：%r / %r" % (
+            os.path.basename(first), os.path.basename(second))
+    assert os.path.basename(first) == "Teacher Guide.pdf", "对外返回的路径被改了大小写"
+    assert os.path.basename(second) == "teacher guide (2).pdf"
+
+
+def test_releasing_a_path_uses_the_same_key(tmp_path, monkeypatch):
+    """归还也要按同一个键，否则预留永远清不掉。"""
+    monkeypatch.setattr(naming.os.path, "normcase", str.lower)
+
+    first = naming.unique_path(str(tmp_path), "Teacher Guide", ".pdf")
+    naming.release_path(first)
+
+    again = naming.unique_path(str(tmp_path), "Teacher Guide", ".pdf")
+    assert again == first, "归还之后没能拿回原名：%r" % (os.path.basename(again),)
+
+
+def test_reservation_key_is_identity_on_posix(tmp_path):
+    """POSIX 上 normcase 是恒等：大小写不同就是不同的文件，不该被合并。"""
+    if os.path.normcase("A") != "A":
+        pytest.skip("这台机器上 normcase 不是恒等（Windows）")
+
+    first = naming.unique_path(str(tmp_path), "Teacher Guide", ".pdf")
+    second = naming.unique_path(str(tmp_path), "teacher guide", ".pdf")
+
+    assert os.path.basename(first) == "Teacher Guide.pdf"
+    assert os.path.basename(second) == "teacher guide.pdf", \
+        "POSIX 上这是两个不同的文件，不该让号"

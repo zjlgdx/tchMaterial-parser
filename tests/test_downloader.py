@@ -137,9 +137,11 @@ def test_changed_etag_restarts_from_scratch(tmp_path, monkeypatch):
     monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
     save_path = str(tmp_path / "书.pdf")
 
-    old_prefix = [b"OLDOLDOL", b"DXXX"]
+    # 新旧文件长度必须一致：不一致的话「矛盾的全长」那道检查会先把这个 206
+    # 挡掉，校验子门根本轮不到执行，这条用例就不再是它的保护了
+    old_prefix = [b"OLDOLDOL", b"DXXXXXXX"]
     first = FakeResponse(200, old_prefix, boom_after=1,
-                         headers={"ETag": "v1", "Content-Length": "12"})
+                         headers={"ETag": "v1", "Content-Length": "16"})
     # 服务端接受了 Range，但校验子已经变了。Content-Range 要给对：给不对的话
     # 这个响应会先被起点检查拦下，校验子那道门根本轮不到执行
     stale = FakeResponse(206, [b"NEWTAIL!"],
@@ -499,8 +501,9 @@ def test_resume_without_matching_validator_restarts(tmp_path, monkeypatch,
     monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
     save_path = str(tmp_path / "书.pdf")
 
-    first = FakeResponse(200, [b"OLDOLDOL", b"DXXX"], boom_after=1,
-                         headers=dict(first_headers, **{"Content-Length": "12"}))
+    # 同上：新旧长度一致，才轮得到校验子那道门说话
+    first = FakeResponse(200, [b"OLDOLDOL", b"DXXXXXXX"], boom_after=1,
+                         headers=dict(first_headers, **{"Content-Length": "16"}))
     stale = FakeResponse(206, [b"NEWTAIL!"])
     stale.headers.clear()
     # 起点报对，这个 206 才会一路走到校验子那道门——这条用例测的正是那道门
@@ -1781,3 +1784,85 @@ def test_is_unencoded(value, unencoded):
 
     headers = {} if value is None else {"Content-Encoding": value}
     assert is_unencoded(FakeResponse(200, headers=headers)) is unencoded
+
+
+# ---- PR 评审第 2 轮：两个互相矛盾的全长 ----
+
+def test_a_contradicting_total_discards_the_part_file(tmp_path, monkeypatch):
+    """校验子对得上，声明的全长却换了一个——这次续传不可信。
+
+    挑一个信都是错的：凑满记住的 100 就交付，会把一个 200 字节资源的前 100
+    字节当成完整文件。丢掉 .part 整份重下才是对的。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"A" * 8, b"X" * 92], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "100"}),
+        FakeResponse(206, [b"B" * 92],
+                     headers={"ETag": "v1", "Content-Length": "92",
+                              "Content-Range": "bytes 8-99/200"}),
+        FakeResponse(200, [b"N" * 200], headers={"ETag": "v1", "Content-Length": "200"}),
+    ])
+    manager = make_manager(session, config=AppConfig(chunk_size=100, max_retries=3))
+    manager.download_file(URL, save_path)
+
+    content = open(save_path, "rb").read()
+    assert len(content) != 100, "最新响应声明资源是 200 字节，却凑满记住的 100 就交付了"
+    assert content == b"N" * 200
+    assert range_headers(session.calls[2]) == {}, "重下时不该再带续传头"
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_a_partial_range_of_a_known_resource_is_not_a_contradiction(tmp_path, monkeypatch):
+    """负对照：/Z 始终是整份资源的长度，一段的 Content-Range 不该被判成矛盾。
+
+    bytes 8-15/100 里的 100 与已知的 100 一致——把它当成矛盾会让每一次
+    分段续传都退化成整份重下。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"A" * 8, b"X" * 8], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "24"}),
+        FakeResponse(206, [b"B" * 8], # 只给 8-15 这一段，但说清了资源共 24
+                     headers={"ETag": "v1", "Content-Length": "8",
+                              "Content-Range": "bytes 8-15/24"}),
+        FakeResponse(206, [b"C" * 8],
+                     headers={"ETag": "v1", "Content-Length": "8",
+                              "Content-Range": "bytes 16-23/24"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    # 先断请求形状：整份重下时目标文件根本不存在，先读文件会让失败原因变成
+    # 一个没头没脑的 FileNotFoundError
+    assert range_headers(session.calls[1])["Range"] == "bytes=8-"
+    assert range_headers(session.calls[2]).get("Range") == "bytes=16-", \
+        "分段续传被当成矛盾，退化成整份重下了：%r" % (range_headers(session.calls[2]),)
+    assert open(save_path, "rb").read() == b"A" * 8 + b"B" * 8 + b"C" * 8
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_a_silent_range_does_not_count_as_a_contradiction(tmp_path, monkeypatch):
+    """负对照：这条响应没说全长（/*），是弱信息，不是矛盾。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    silent = FakeResponse(206, [b"B" * 8],
+                          headers={"ETag": "v1", "Content-Range": "bytes 8-15/*"})
+    silent.headers.pop("Content-Length", None)
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"A" * 8, b"X" * 8], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "16"}),
+        silent,
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert len(session.calls) == 2, "没说全长被当成矛盾，白重下了一遍"
+    assert open(save_path, "rb").read() == b"A" * 8 + b"B" * 8
+    assert manager.states()[0]["failed_reason"] is None

@@ -144,7 +144,9 @@ def expected_bytes_on_disk(response, start: int, known_total=None):
     判据按强弱排，**强的一旦拿到就不许被弱的顶掉**：
 
     1. `known_total`——之前某一轮已经问出来的全长。它是这份文件的属性，不会
-       因为后面某条响应偷懒写了 `/*` 就失效。
+       因为后面某条响应偷懒写了 `/*` 就失效。与它**矛盾**的声明是另一回事，
+       那说明这次续传本身不可信，`_open_stream` 已经把那种响应挡在外面了，
+       走到这里的 known 与 declared 不可能互相打架。
     2. 这条响应自己声明的全长（`/Z`，或首次的 `Content-Length`）。
     3. 都没有时，退到 `Content-Range` 的**终点加一**。它只说明「这一段发完之后
        盘上该到哪个偏移」，不能当成全长：RFC 9110 §15.3.7 允许 206 只满足所请求
@@ -410,8 +412,13 @@ class DownloadManager:
             raise DownloadCancelled("资源下载已取消")
         return self.client.stream(url, headers=headers)
 
-    def _open_stream(self, url: str, resume_from: int, validator):
-        """发起请求；resume_from > 0 时尝试续传，返回 (响应, 实际起点)。"""
+    def _open_stream(self, url: str, resume_from: int, validator, known_total=None):
+        """发起请求；resume_from > 0 时尝试续传，返回 (响应, 实际起点)。
+
+        「这个 206 值不值得接着写」这件事，三道检查都在这里做完：校验子对不对、
+        起点对不对、声明的全长与已知的矛不矛盾。走出这个函数时，拿到 206 就
+        意味着三样都过了。
+        """
         headers = None
         if resume_from > 0 and validator is not None:
             headers = { "Range": f"bytes={resume_from}-", "If-Range": validator[1] }
@@ -463,10 +470,24 @@ class DownloadManager:
             response.close()
             return self._stream(url), 0
 
+        # 全长有三种情形，别混成「记住的赢」一句话：
+        #   这条响应没说（/*）——弱信息，不许顶掉已经问出来的强信息；
+        #   说了同一个——一致，照常往下接；
+        #   说了另一个——矛盾。校验子对得上却给出不同的全长，说明我们对这份资源
+        #   的认知已经不成立了，盘上那批字节不能再往下接。
+        # 注意「一段的 Content-Range」不会误触发：/Z 始终是整份资源的长度，
+        # bytes 8-15/100 里的 100 与已知的 100 一致
+        declared = declared_total_size(response, resume_from)
+        if known_total is not None and declared is not None and declared != known_total:
+            logger.info("续传声明的全长与已知的不符（本次 %d，已知 %d），改为整份重下：%s",
+                        declared, known_total, url)
+            response.close()
+            return self._stream(url), 0
+
         return response, resume_from
 
     def _download_once(self, url: str, part: PartFile, current_state: dict, resume_from: int):
-        response, start = self._open_stream(url, resume_from, part.validator)
+        response, start = self._open_stream(url, resume_from, part.validator, part.total)
 
         # stream=True 的响应不关掉，连接要等 GC 才归还。出路不止状态码分类
         # 这一条：中途断流、写盘失败、取消、正常读完都要关，而中途断流恰恰是

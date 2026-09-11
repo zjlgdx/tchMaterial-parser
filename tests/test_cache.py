@@ -232,3 +232,26 @@ def test_upstream_shape_change_falls_back_instead_of_caching_an_empty_tree():
     assert failure is None
     assert cache.load("v-new") is None, "把空树当成好数据写进了缓存"
     assert cache.load("v-old") == sample_tree(), "旧缓存被覆盖了"
+
+
+# ---- PR 评审第 2 轮：缓存写入的临时文件名要唯一 ----
+
+def test_cache_writes_use_a_unique_temp_name(monkeypatch):
+    """固定名会让两个实例打开同一个 inode，一个改名走了另一个还在写。"""
+    import tempfile
+
+    names = []
+    original = tempfile.mkstemp
+
+    def spy(*args, **kwargs):
+        fd, name = original(*args, **kwargs)
+        names.append(os.path.basename(name))
+        return fd, name
+
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+
+    cache.store("v-1", sample_tree())
+    cache.store("v-2", sample_tree())
+
+    assert len(set(names)) == 2, "两次缓存写入用了同一个临时文件名：%s" % names
+    assert cache.load("v-2") == sample_tree()

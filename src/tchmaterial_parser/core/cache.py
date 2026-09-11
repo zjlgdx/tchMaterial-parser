@@ -8,6 +8,7 @@
 import json
 import logging
 import os
+import tempfile
 
 from .. import config
 from .catalog import CatalogNode
@@ -70,10 +71,21 @@ def store(cache_key: str, tree: dict) -> bool:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         payload = { "version": cache_key, "tree": {k: v.to_dict() for k, v in tree.items()} }
 
-        tmp = path + ".tmp" # 先写临时文件再改名，避免进程中断留下半截缓存
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        # 先写临时文件再改名，避免进程中断留下半截缓存。临时名必须唯一：
+        # 用固定的 .tmp，两个实例同时重建缓存就会打开同一个 inode，一个改名走了
+        # 另一个还在往自己的 fd 里写，最终缓存可能是坏的——而改名本来就是为了原子
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                                   prefix=os.path.basename(path) + ".", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except FileNotFoundError:
+                pass
+            raise
         return True
     except Exception:
         logger.warning("资源目录缓存写入失败", exc_info=True)

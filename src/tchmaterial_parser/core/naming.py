@@ -37,8 +37,19 @@ def sanitize_filename(title: str) -> str:
     return name or "download"
 
 
-_reserved_paths = set() # 已被在飞任务占用的目标路径
+_reserved_paths = set() # 已被在飞任务占用的目标路径（存的是归一化后的键）
 _reserved_lock = threading.Lock()
+
+
+def reservation_key(path: str) -> str:
+    """预留集合的键。
+
+    键必须和「文件系统认为的同一个文件」一一对应，否则两个任务会各自以为
+    自己独占。Windows 上 `Teacher Guide.pdf` 与 `teacher guide.pdf` 是同一个
+    文件，作为字符串却是两条——两个 worker 于是拿到同一个 .part 对着写。
+    normcase 就是标准库给的那个平台判断，POSIX 上是恒等，没有副作用。
+    """
+    return os.path.normcase(os.path.abspath(path))
 
 
 def unique_path(dir_path: str, base_name: str, ext: str) -> str:
@@ -47,12 +58,12 @@ def unique_path(dir_path: str, base_name: str, ext: str) -> str:
         candidate = os.path.join(dir_path, base_name + ext)
         index = 2
         # 实测同名教材多达 19 本；此刻文件都还没建出来，只查磁盘会让它们全部选中同一个路径
-        while candidate in _reserved_paths or os.path.exists(candidate):
+        while reservation_key(candidate) in _reserved_paths or os.path.exists(candidate):
             candidate = os.path.join(dir_path, f"{base_name} ({index}){ext}")
             index += 1
 
-        _reserved_paths.add(candidate)
-        return candidate
+        _reserved_paths.add(reservation_key(candidate))
+        return candidate # 对外仍是原样的路径，用户看到的文件名不该被改大小写
 
 
 def release_path(path: str) -> None:
@@ -63,7 +74,7 @@ def release_path(path: str) -> None:
     成功的任务归还后磁盘上已有真实文件，下次申请照样会因「磁盘已存在」而让号。
     """
     with _reserved_lock:
-        _reserved_paths.discard(path)
+        _reserved_paths.discard(reservation_key(path))
 
 
 def reserved_paths() -> set:
