@@ -48,6 +48,17 @@ def unique_path(dir_path: str, base_name: str, ext: str) -> str:
         return candidate
 
 
+def release_path(path: str) -> None:
+    """归还一个不再占用的路径。
+
+    预留是有生命周期的：任务失败时 .part 已被清掉，磁盘上并不存在该文件，
+    不归还号段会让用户修好网络后重下同一本教材时一路涨到 (2) (3) 的幽灵序号。
+    成功的任务归还后磁盘上已有真实文件，下次申请照样会因「磁盘已存在」而让号。
+    """
+    with _reserved_lock:
+        _reserved_paths.discard(path)
+
+
 def reserved_paths() -> set:
     """当前被占用的路径快照，供测试与诊断使用。"""
     with _reserved_lock:

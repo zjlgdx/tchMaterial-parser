@@ -260,7 +260,9 @@ class App:
             if not messagebox.askokcancel("提示", "下载任务未完成，是否退出？"):
                 return
 
-        # 下载线程均为守护线程，不会阻止解释器退出
+        # 线程池的工作线程不是守护线程，解释器退出时会等它们；必须显式置位取消标志。
+        # 正阻塞在网络读取上的线程要等到读取超时才看得到标志，退出延迟的上界即读取超时
+        self.downloads.cancel_all()
         self.root.destroy()
 
     def run(self) -> None:

@@ -14,6 +14,11 @@ class FakeResponse:
         self.headers.setdefault("Content-Length", str(sum(len(c) for c in self._chunks)))
         self._boom_after = boom_after
         self._on_chunk = on_chunk
+        self.closed = False
+
+    def close(self):
+        # requests.Response 一定有 close()，替身也得有，否则会掩盖真实调用路径
+        self.closed = True
 
     def json(self):
         if self._json is None:
