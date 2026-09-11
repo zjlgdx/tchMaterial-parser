@@ -68,10 +68,11 @@ CONTENT_RANGE_RE = re.compile(r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 
 
 def parse_content_range(response):
-    """解析 206 的 Content-Range，返回 (起点, 资源总长)。
+    """解析 206 的 Content-Range，返回 (起点, 终点, 资源总长)。
 
     头缺失或形如 bytes */8 这种没说清区间的，一律返回 None——这个响应证明不了
-    正文是从我们请求的偏移开始的。总长写成 * 时元组第二项为 None。
+    正文是从我们请求的偏移开始的。总长写成 * 时第三项为 None，但起点与终点
+    仍然是服务端明确承诺的。
     """
     raw = response.headers.get("Content-Range")
     if not raw:
@@ -80,7 +81,8 @@ def parse_content_range(response):
     if not match:
         return None
     complete = match.group(3)
-    return int(match.group(1)), (None if complete == "*" else int(complete))
+    return (int(match.group(1)), int(match.group(2)),
+            None if complete == "*" else int(complete))
 
 
 def content_range_starts_at(response, expected_start: int) -> bool:
@@ -97,22 +99,27 @@ def content_range_starts_at(response, expected_start: int) -> bool:
 def expected_file_size(response, start: int):
     """这一轮写完之后文件应当有多长；服务端没说清就返回 None。
 
-    「不知道」必须是 None 而不是 0。0 一旦参与 start + declared 的加法就会变成
-    一个看起来合理的错数：分块传输的 206 按 RFC 9110 §8.6 严禁带 Content-Length，
-    于是每一次收全的续传都会被判成短传。
+    「不知道」必须是 None 而不是 0。0 一旦参与加法就会变成一个看起来合理的
+    错数：分块传输的 206 按 RFC 9110 §8.6 严禁带 Content-Length，拿
+    start + Content-Length 当全长的话，每一次收全的续传都会被判成短传。
 
     内容编码是同一个陷阱的另一面：Content-Length 数的是线路上的字节，而写进
     文件的是 iter_content 解码之后的字节。两者在开了 gzip 的链路上必然不等，
-    而且此时按字节续传本身也是错的——区间是对着编码后的表示算的。所以只要
-    出现内容编码就宣告「不知道」，由下载请求侧的 Accept-Encoding: identity
-    从源头避免这种局面。
+    而且此时按字节续传本身也是错的——区间是对着编码后的表示算的。所以出现
+    内容编码就宣告「不知道」，由下载请求侧的 Accept-Encoding: identity 从
+    源头避免这种局面。identity 是例外：RFC 9110 §8.4.1 里它的语义恰恰是
+    「没有内容编码」，而我们主动发的那个请求头最容易招来服务端原样回显。
     """
-    if response.headers.get("Content-Encoding"):
+    encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
+    if encoding and encoding != "identity":
         return None
 
     parsed = parse_content_range(response)
     if parsed is not None:
-        return parsed[1] # /Z 是资源总长，与是否分块传输无关
+        first, last, complete = parsed
+        # 总长写成 * 时终点仍然算数：我们请求的是开区间 bytes=N-，一个守规矩的
+        # 206 覆盖到结尾，终点加一就是全长。丢掉它等于连本段短传都不再检测
+        return complete if complete is not None else last + 1
 
     if start: # 续上了一段却没有 Content-Range，无从知道整份有多长
         return None

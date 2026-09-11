@@ -1388,10 +1388,10 @@ def test_downloads_ask_for_no_content_encoding(tmp_path):
 
 
 @pytest.mark.parametrize("raw, expected", [
-    ("bytes 8-15/16", (8, 16)),
-    ("Bytes 8-15/16", (8, 16)),
-    ("bytes 0-0/1", (0, 1)),
-    ("bytes 8-15/*", (8, None)), # 总长未知，但起点是确定的
+    ("bytes 8-15/16", (8, 15, 16)),
+    ("Bytes 8-15/16", (8, 15, 16)),
+    ("bytes 0-0/1", (0, 0, 1)),
+    ("bytes 8-15/*", (8, 15, None)), # 总长未知，但起点与终点都是确定的
     ("bytes */16", None),
     ("items 8-15/16", None),
     ("8-15/16", None),
@@ -1410,9 +1410,14 @@ def test_parse_content_range(raw, expected):
     ({}, 0, None, "首次下载但没给长度：不知道"),
     ({"Content-Range": "bytes 8-15/16"}, 8, 16, "续传：全长取 Content-Range 的 /Z"),
     ({"Content-Length": "8"}, 8, None, "续传却没有 Content-Range：不知道"),
-    ({"Content-Range": "bytes 8-15/*"}, 8, None, "服务端自己也不知道总长"),
+    ({"Content-Range": "bytes 8-15/*"}, 8, 16,
+     "总长写成 * 也还有终点：我们请求的是开区间，终点加一就是全长"),
     ({"Content-Length": "16", "Content-Encoding": "gzip"}, 0,
      None, "声明的长度描述的不是要写进文件的那些字节"),
+    ({"Content-Length": "16", "Content-Encoding": "identity"}, 0, 16,
+     "identity 的语义就是「没有内容编码」，而我们主动发的请求头最招它回显"),
+    ({"Content-Length": "16", "Content-Encoding": " IDENTITY "}, 0, 16,
+     "头值大小写与空白都不该改变结论"),
     ({"Content-Length": "不是数字"}, 0, None, "长度不是数字"),
 ])
 def test_expected_file_size(headers, start, expected, why):
@@ -1443,3 +1448,73 @@ def test_a_tampered_part_file_is_discarded_together_with_its_identity(tmp_path):
 
     assert part.size == 0, "被篡改的残件留了下来，下一轮会接着它往下写"
     assert part.validator is None, "身份还留着，下一轮会带旧校验子去续传"
+
+
+def test_an_echoed_identity_encoding_does_not_blind_the_progress_bar(tmp_path):
+    """服务端把我们发的 Accept-Encoding: identity 原样回显。
+
+    identity 的语义就是「没有内容编码」，长度完全可信。当成「有编码」处理的话，
+    每一次下载都进度条恒 0%、完整性校验全程关闭——而这个请求头正是我们自己发的。
+    """
+    save_path = str(tmp_path / "书.pdf")
+    manager = make_manager(FakeSession(), config=AppConfig(chunk_size=4, max_retries=3))
+
+    # 必须在下载途中看：结束时那个 finally 会拿已写入字节数回填 total_size，
+    # 事后再断言就永远是对的，什么都测不出来
+    seen = []
+    response = FakeResponse(200, [b"AAAA", b"BBBB"],
+                            headers={"ETag": "v1", "Content-Length": "8",
+                                     "Content-Encoding": "identity"},
+                            on_chunk=lambda i: seen.append(manager.snapshot().total_size))
+    manager.client.session.default = response
+    manager.download_file(URL, save_path)
+
+    assert seen == [8, 8], "下载途中长度认知丢了，进度条会恒为 0%%：%r" % (seen,)
+    assert open(save_path, "rb").read() == b"AAAABBBB"
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_a_range_without_a_known_total_still_detects_a_short_transfer(tmp_path, monkeypatch):
+    """总长写成 * 时，区间终点仍然说明了这一段该有多少字节。
+
+    丢掉它等于对这一轮完全放弃短传检测——而截断的 PDF 是「看起来成功」的失败。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    short = FakeResponse(206, [b"BB"], # 承诺 8-15，只给了 2 字节
+                         headers={"ETag": "v1", "Content-Range": "bytes 8-15/*"})
+    short.headers.pop("Content-Length", None)
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "16"}),
+        short,
+    ])
+    manager = make_manager(session, config=AppConfig(chunk_size=8, max_retries=1))
+    manager.download_file(URL, save_path)
+
+    assert not os.path.exists(save_path), "截断的文件被当成完整下载交出去了"
+    assert "与服务端声明的不符" in manager.states()[0]["failed_reason"]
+
+
+def test_a_complete_range_without_a_known_total_succeeds(tmp_path, monkeypatch):
+    """同一条路径上，收全了就该成功——别把「总长未知」变成「一律失败」。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    full = FakeResponse(206, [b"BBBBBBBB"],
+                        headers={"ETag": "v1", "Content-Range": "bytes 8-15/*"})
+    full.headers.pop("Content-Length", None)
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "16"}),
+        full,
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert len(session.calls) == 2, "收全的续传被判成短传：%d 次请求" % len(session.calls)
+    assert open(save_path, "rb").read() == b"AAAAAAAABBBBBBBB"
+    assert manager.states()[0]["failed_reason"] is None
