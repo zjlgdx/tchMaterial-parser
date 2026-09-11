@@ -11,7 +11,8 @@ import pytest
 from conftest import FakeResponse, FakeSession
 from tchmaterial_parser.config import AppConfig
 from tchmaterial_parser.core import naming
-from tchmaterial_parser.core.downloader import DownloadManager, response_validator
+from tchmaterial_parser.core.downloader import (DownloadManager, content_range_starts_at,
+                                                 response_validator)
 from tchmaterial_parser.core.http import HttpClient
 
 URL = "http://example.invalid/a.pdf"
@@ -101,7 +102,10 @@ def test_retry_sends_range_and_if_range(tmp_path, monkeypatch):
 
     first = FakeResponse(200, [b"AAAA", b"BBBB", b"CCCC"], boom_after=2,
                          headers={"ETag": "v1", "Content-Length": "12"})
-    second = FakeResponse(206, [b"CCCC"], headers={"ETag": "v1", "Content-Length": "4"})
+    # 真实的 206 一定带 Content-Range（RFC 9110 §15.3.7），替身少一个头就会
+    # 把「缺头该不该信」这类判断测成假绿
+    second = FakeResponse(206, [b"CCCC"], headers={"ETag": "v1", "Content-Length": "4",
+                                                   "Content-Range": "bytes 8-11/12"})
     session = ScriptedSession([first, second])
     manager = make_manager(session)
     manager.download_file(URL, save_path)
@@ -955,3 +959,42 @@ def test_validator_is_only_assigned_inside_partfile():
                     offenders.append(node.lineno)
 
     assert not offenders, "PartFile 之外有人在改 validator，行号：%s" % offenders
+
+
+# ---- R3-P2-1：Content-Range 的可信度判定 ----
+
+def test_a_206_without_content_range_is_not_trusted(tmp_path, monkeypatch):
+    """缺 Content-Range 时整份重下，而不是按可信处理。
+
+    相同的校验子只说明资源版本没变，证明不了正文是从我们请求的偏移开始的。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "8"}),
+        # 服务端回 206、校验子也对，但没说这段正文从哪开始
+        FakeResponse(206, [b"WHOKNOWS"], headers={"ETag": "v1", "Content-Length": "8"}),
+        FakeResponse(200, [b"AAAABBBB"], headers={"ETag": "v1", "Content-Length": "8"}),
+    ])
+    manager = make_manager(session, config=AppConfig(chunk_size=4, max_retries=3))
+    manager.download_file(URL, save_path)
+
+    assert len(session.calls) == 3, "没有整份重下：%s" % (session.calls,)
+    assert session.calls[2][1] == {}, "重下这一次不该再带续传头：%r" % (session.calls[2][1],)
+    assert open(save_path, "rb").read() == b"AAAABBBB"
+
+
+@pytest.mark.parametrize("raw", ["bytes 4-7/8", "Bytes 4-7/8", "BYTES 4-7/8", " bytes 4-7/8"])
+def test_content_range_unit_is_case_insensitive(raw):
+    """RFC 9110 §14.4：range-unit 大小写不敏感，别把合法的 206 判成不可信。"""
+    assert content_range_starts_at(FakeResponse(206, headers={"Content-Range": raw}), 4)
+
+
+@pytest.mark.parametrize("raw", [None, "", "items 4-7/8", "bytes */8", "4-7/8"])
+def test_content_range_that_proves_nothing_is_rejected(raw):
+    headers = {} if raw is None else {"Content-Range": raw}
+    response = FakeResponse(206, headers=headers)
+    response.headers.pop("Content-Length", None)
+    assert content_range_starts_at(response, 4) is False

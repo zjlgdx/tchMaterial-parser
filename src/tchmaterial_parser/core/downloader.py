@@ -55,12 +55,15 @@ def response_validator(response):
 def content_range_starts_at(response, expected_start: int) -> bool:
     """确认 206 的 Content-Range 确实从我们要的位置开始。
 
-    头缺失时按可信处理：不是所有服务端都给，而真正的防线是 If-Range 校验子。
+    头缺失一律判为不可信：相同的校验子只说明资源版本没变，证明不了正文是从
+    我们请求的偏移开始的——接着 append 一段起点不对的正文，拼出来的是一个
+    「看起来成功」的损坏文件。整份重下只是慢一点。
     """
     raw = response.headers.get("Content-Range")
     if not raw:
-        return True
-    match = re.match(r"\s*bytes\s+(\d+)-", raw)
+        return False
+    # RFC 9110 §14.4：range-unit 大小写不敏感，Bytes 4-7/8 也是合法的 206
+    match = re.match(r"\s*bytes\s+(\d+)-", raw, re.IGNORECASE)
     if not match:
         return False
     return int(match.group(1)) == expected_start
