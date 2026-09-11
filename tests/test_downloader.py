@@ -130,8 +130,11 @@ def test_changed_etag_restarts_from_scratch(tmp_path, monkeypatch):
     old_prefix = [b"OLDOLDOL", b"DXXX"]
     first = FakeResponse(200, old_prefix, boom_after=1,
                          headers={"ETag": "v1", "Content-Length": "12"})
-    # 服务端接受了 Range，但校验子已经变了
-    stale = FakeResponse(206, [b"NEWTAIL!"], headers={"ETag": "v2", "Content-Length": "8"})
+    # 服务端接受了 Range，但校验子已经变了。Content-Range 要给对：给不对的话
+    # 这个响应会先被起点检查拦下，校验子那道门根本轮不到执行
+    stale = FakeResponse(206, [b"NEWTAIL!"],
+                         headers={"ETag": "v2", "Content-Length": "8",
+                                  "Content-Range": "bytes 8-15/16"})
     fresh = FakeResponse(200, [b"NEWNEWNE", b"WFULL!!!"],
                          headers={"ETag": "v2", "Content-Length": "16"})
     session = ScriptedSession([first, stale, fresh])
@@ -490,7 +493,8 @@ def test_resume_without_matching_validator_restarts(tmp_path, monkeypatch,
                          headers=dict(first_headers, **{"Content-Length": "12"}))
     stale = FakeResponse(206, [b"NEWTAIL!"])
     stale.headers.clear()
-    stale.headers.update(resume_headers)
+    # 起点报对，这个 206 才会一路走到校验子那道门——这条用例测的正是那道门
+    stale.headers.update(resume_headers, **{"Content-Range": "bytes 8-15/16"})
     fresh = FakeResponse(200, [b"NEWNEWNE", b"WFULL!!!"],
                          headers={"ETag": "v2", "Content-Length": "16"})
 
@@ -626,7 +630,8 @@ def test_cancel_between_the_two_requests_of_one_attempt(tmp_path, monkeypatch):
 
     first = FakeResponse(200, [b"AAAA", b"BBBB"], boom_after=1,
                          headers={"ETag": "v1", "Content-Length": "8"})
-    stale = FakeResponse(206, [b"CCCC"], headers={"ETag": "v2", "Content-Length": "4"})
+    stale = FakeResponse(206, [b"CCCC"], headers={"ETag": "v2", "Content-Length": "4",
+                                                  "Content-Range": "bytes 4-7/8"})
 
     session = ScriptedSession([first, stale])
     manager = make_manager(session)
@@ -699,7 +704,8 @@ def test_stale_validator_is_cleared_on_a_full_restart(tmp_path, monkeypatch):
     session = ScriptedSession([
         FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
                      headers={"ETag": "v1", "Content-Length": "8"}),
-        FakeResponse(206, [b"ZZZZ"], headers={"ETag": "v2", "Content-Length": "4"}),
+        FakeResponse(206, [b"ZZZZ"], headers={"ETag": "v2", "Content-Length": "4",
+                                              "Content-Range": "bytes 4-7/8"}),
         no_validator,
         FakeResponse(200, [b"FINAL!!!"], headers={"Content-Length": "8"}),
     ])
