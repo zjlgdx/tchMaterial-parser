@@ -8,6 +8,7 @@ import pytest
 from conftest import FakeResponse, FakeSession
 from tchmaterial_parser.config import AppConfig
 from tchmaterial_parser.core import catalog
+from tchmaterial_parser.core.errors import UpstreamFormatError
 from tchmaterial_parser.core.http import HttpClient
 
 LIST_A = "https://example.invalid/list-a.json"
@@ -243,3 +244,78 @@ def test_a_page_that_is_not_an_array_is_skipped_not_fatal(caplog):
     assert ids == {"b1"}, "坏的那一页把好的那一页也带走了：%s" % ids
     assert any("整页跳过" in r.getMessage() for r in caplog.records), \
         [r.getMessage() for r in caplog.records]
+
+
+def test_all_pages_not_arrays_is_a_format_error(caplog):
+    """四个列表文件出自同一个接口，真实的格式变更是四页同时变形。
+
+    此时返回一棵只有分类、没有课本的树，等于把「接口变了」伪装成
+    「上游今年没出教材」：调用方看不出失败，会把空树写进缓存。
+    """
+    page_a = "https://example.invalid/a.json"
+    page_b = "https://example.invalid/b.json"
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(
+            200, json_data={"urls": "%s,%s" % (page_a, page_b)}),
+        page_a: FakeResponse(200, json_data={"data": [], "code": 0}),
+        page_b: FakeResponse(200, json_data={"data": [], "code": 0}),
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+    helper = catalog.ResourceHelper(client)
+
+    with caplog.at_level(logging.WARNING, logger="tchmaterial_parser.core.catalog"):
+        with pytest.raises(UpstreamFormatError):
+            helper.fetch_tree()
+
+    assert helper.skipped_pages == 2, helper.skipped_pages
+    assert any("整页跳过" in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_pages_that_parse_but_place_nothing_are_a_format_error():
+    """页是数组、条目却一本都挂不上，同样是「拿到的不是这个接口该有的东西」。
+
+    单页跳过与「整棵树是空的」是两回事：前者可以容忍，后者必须响亮地失败。
+    """
+    helper = None
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(200, json_data={"urls": LIST_A}),
+        # 结构合法但 tag_paths 指向标签树里不存在的分支
+        LIST_A: FakeResponse(200, json_data=[
+            book("b1", "语文", tag_path="教材/tag-unknown/tag-x"),
+            book("b2", "数学", tag_path=None),
+        ]),
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+    helper = catalog.ResourceHelper(client)
+
+    with pytest.raises(UpstreamFormatError):
+        helper.fetch_tree()
+
+    assert helper.skipped_pages == 0, "这一页本身是数组，不该算整页跳过"
+    assert helper.skipped_entries == 2
+
+
+def test_a_single_bad_page_still_yields_a_tree_and_counts_the_page(caplog):
+    """单页跳过的容忍度不变，但这一页必须被计数并汇总上报。"""
+    good = "https://example.invalid/good.json"
+    bad = "https://example.invalid/bad.json"
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(
+            200, json_data={"urls": "%s,%s" % (bad, good)}),
+        bad: FakeResponse(200, json_data={"unexpected": "object"}),
+        good: FakeResponse(200, json_data=[book("b1", "语文一年级上册")]),
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+    helper = catalog.ResourceHelper(client)
+
+    with caplog.at_level(logging.WARNING, logger="tchmaterial_parser.core.catalog"):
+        tree = helper.fetch_tree()
+
+    assert {book_id for book_id, _ in leaves(tree)} == {"b1"}
+    assert helper.skipped_pages == 1, helper.skipped_pages
+    summary = [r.getMessage() for r in caplog.records if "1/2" in r.getMessage()]
+    assert summary, [r.getMessage() for r in caplog.records]

@@ -209,3 +209,26 @@ def test_list_fetch_failure_also_falls_back():
     assert failure is None
     assert stale is True
     assert tree == sample_tree()
+
+
+def test_upstream_shape_change_falls_back_instead_of_caching_an_empty_tree():
+    """四页同时变形时，旧缓存必须留下来，而不是被一棵空树覆盖。
+
+    覆盖掉的后果是自我固化的：用户看到分类都在、逐层展开全空，重启也没用
+    （缓存命中），除非上游 version 字段再变一次。
+    """
+    cache.store("v-old", sample_tree())
+    routes = {
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(
+            200, json_data={"version": "v-new", "urls": LIST_URL}),
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        LIST_URL: FakeResponse(200, json_data={"data": [], "code": 0}), # 不再是数组
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+    tree, stale, failure = load_catalog_with(client)
+
+    assert tree == sample_tree(), "没有回退到旧缓存：%r" % (tree,)
+    assert stale is True, "回退用的是旧数据，必须标记为过时"
+    assert failure is None
+    assert cache.load("v-new") is None, "把空树当成好数据写进了缓存"
+    assert cache.load("v-old") == sample_tree(), "旧缓存被覆盖了"

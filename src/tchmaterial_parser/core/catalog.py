@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from ..config import AppConfig
+from .errors import UpstreamFormatError
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,19 @@ class CatalogNode:
         )
 
 
+@dataclass(frozen=True)
+class PageOutcome:
+    """一个列表文件的解析结果。
+
+    「整页不可用」与「这一页里一条都没挂上」必须分开记：四个列表文件出自同一个
+    接口，真实的格式变更是四页同时变形，而不是只坏一页。
+    """
+
+    usable: bool
+    placed: int = 0
+    skipped: int = 0
+
+
 def iter_nodes(tree):
     """深度优先遍历整棵树。"""
     for node in tree.values():
@@ -78,6 +92,7 @@ class ResourceHelper: # 获取网站上资源的数据
         self.client = client
         self.config = config or AppConfig()
         self.skipped_entries = 0
+        self.skipped_pages = 0
         self.cancelled = threading.Event()
 
     def cancel(self) -> None:
@@ -147,8 +162,8 @@ class ResourceHelper: # 获取网站上资源的数据
 
         return CatalogVersion(version=version, urls=urls)
 
-    def parse_and_merge(self, url: str, response, parsed_hier: dict) -> int:
-        """解析一个列表文件并挂到树上，返回跳过的条目数。
+    def parse_and_merge(self, url: str, response, parsed_hier: dict) -> PageOutcome:
+        """解析一个列表文件并挂到树上。
 
         调用方必须持有解析锁：解析出来的对象比原始字节大一个数量级，
         同时存在几份会把内存峰值顶上去；建树也在改同一棵树。
@@ -158,23 +173,26 @@ class ResourceHelper: # 获取网站上资源的数据
             # 只丢这一页，另外几页照常建树——「一条坏数据不该让整棵树报废」
             # 同样适用于「一页坏数据」，何况用户失去的是整个选择功能
             logger.warning("课本列表不是数组，整页跳过：%s", url)
-            return 0
+            return PageOutcome(usable=False)
 
+        placed = 0
         skipped = 0
         for book in book_data:
             # 逐条容错：一条坏数据只该丢掉它自己，不该让整棵树报废、
             # 让用户失去全部选择功能
             try:
-                if not self.place_book(parsed_hier, book):
+                if self.place_book(parsed_hier, book):
+                    placed += 1
+                else:
                     skipped += 1
             except (KeyError, IndexError, TypeError, AttributeError) as e:
                 skipped += 1
                 # 坏条目未必是字典：在这里调 book.get("id") 会再抛一次，
                 # 把「逐条容错」变成「一条坏数据毁掉整棵树」
                 logger.debug("跳过一条无法解析的课本数据：%.80s（%s）", repr(book), e)
-        return skipped
+        return PageOutcome(usable=True, placed=placed, skipped=skipped)
 
-    def _load_one_list(self, url: str, parsed_hier: dict, parse_lock) -> int:
+    def _load_one_list(self, url: str, parsed_hier: dict, parse_lock) -> PageOutcome:
         self._check_cancelled()
         response = self.client.get(url) # 传输：并行，瓶颈在网络
         self._check_cancelled()
@@ -191,7 +209,9 @@ class ResourceHelper: # 获取网站上资源的数据
         parsed_hier = self.parse_hierarchy(tags_data["hierarchies"])
 
         total = len(version.urls)
+        placed = 0
         skipped = 0
+        skipped_pages = 0
         done = 0
         parse_lock = threading.Lock()
         workers = max(1, min(self.config.max_catalog_workers, total or 1))
@@ -201,7 +221,10 @@ class ResourceHelper: # 获取网站上资源的数据
                        for url in version.urls}
             try:
                 for future in as_completed(futures):
-                    skipped += future.result()
+                    outcome = future.result()
+                    placed += outcome.placed
+                    skipped += outcome.skipped
+                    skipped_pages += 0 if outcome.usable else 1
                     done += 1
                     if progress_cb is not None:
                         progress_cb(done, total)
@@ -211,9 +234,23 @@ class ResourceHelper: # 获取网站上资源的数据
                     future.cancel()
                 raise
 
+        if skipped_pages:
+            logger.warning("资源目录构建完成，%d/%d 个课本列表文件不是数组，整页跳过",
+                           skipped_pages, total)
         if skipped:
             logger.warning("资源目录构建完成，跳过 %d 条无法解析的条目", skipped)
 
         self.skipped_entries = skipped
+        self.skipped_pages = skipped_pages
+
+        # 一本课本都没挂上，说明拿到的不是这个接口该有的东西。此时返回一棵
+        # 只有分类、没有课本的树，load_catalog 会把它当成好数据写进缓存，
+        # 覆盖掉上一份能用的离线缓存——用户逐层展开全是空的，重启也不自愈。
+        # 响亮地失败，缓存回退才接得住
+        if placed == 0:
+            raise UpstreamFormatError(
+                f"课本列表里没有任何一本课本可以挂上层级树"
+                f"（{skipped_pages}/{total} 个列表文件整页跳过，另有 {skipped} 条条目被跳过）")
+
         return parsed_hier
 
