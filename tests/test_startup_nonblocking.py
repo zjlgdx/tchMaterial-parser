@@ -394,3 +394,48 @@ def test_cancelling_the_save_dialog_restores_the_button(monkeypatch):
 
     monkeypatch.undo()
     app.root.destroy()
+
+
+def test_poller_survives_an_exception_in_poll_downloads(monkeypatch):
+    """poll_downloads 抛异常不该把整个轮询器带走（R2 P2-1）。
+
+    它原本排在 root.after 重排之前，一旦抛，重排语句就执行不到，
+    目录结果、进度、完成提示全部停摆。
+    """
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    scheduled = []
+    real_after = app.root.after
+
+    def spy_after(delay, callback=None, *args):
+        # 不能用 is 比较绑定方法：每次属性访问都会新建一个绑定方法对象
+        if getattr(callback, "__name__", "") == "drain_ui_queue":
+            scheduled.append(delay)
+            return "spy" # 不真的排期，免得用例之间互相干扰
+        return real_after(delay, callback, *args)
+
+    monkeypatch.setattr(app.root, "after", spy_after)
+    monkeypatch.setattr(app, "poll_downloads",
+                        lambda: (_ for _ in ()).throw(RuntimeError("造出来的意外")))
+
+    app.drain_ui_queue() # 不该抛
+
+    assert scheduled, "poll_downloads 抛异常之后没有再排下一次 tick，轮询器死了"
+
+    # 队列里的回调同样不该被它连累
+    ran = []
+    monkeypatch.setattr(app, "poll_downloads",
+                        lambda: (_ for _ in ()).throw(RuntimeError("再来一次")))
+    app.ui_queue.put(lambda: ran.append(True))
+    app.drain_ui_queue()
+    assert ran == [True], "队列回调被 poll_downloads 的异常挡住了"
+
+    monkeypatch.undo()
+    app.root.destroy()

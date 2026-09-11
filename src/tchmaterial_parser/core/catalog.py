@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from ..config import AppConfig
-from .errors import UpstreamFormatError
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +155,10 @@ class ResourceHelper: # 获取网站上资源的数据
         """
         book_data = self.client.parse_json(url, response)
         if not isinstance(book_data, list):
-            raise UpstreamFormatError(f"课本列表不是数组：{url}")
+            # 只丢这一页，另外几页照常建树——「一条坏数据不该让整棵树报废」
+            # 同样适用于「一页坏数据」，何况用户失去的是整个选择功能
+            logger.warning("课本列表不是数组，整页跳过：%s", url)
+            return 0
 
         skipped = 0
         for book in book_data:

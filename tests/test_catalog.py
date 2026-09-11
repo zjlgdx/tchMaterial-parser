@@ -221,15 +221,25 @@ def test_non_object_entries_do_not_break_the_whole_tree(bad, caplog):
     assert helper.skipped_entries == 1
 
 
-def test_list_that_is_not_an_array_is_a_format_error():
-    """整份列表不是数组时，要给出可辨的失败而不是没人接的 TypeError。"""
-    from tchmaterial_parser.core.errors import UpstreamFormatError
+def test_a_page_that_is_not_an_array_is_skipped_not_fatal(caplog):
+    """一页坏数据只丢这一页，另外几页照常建树。
 
+    整棵树报废意味着用户失去全部选择功能——这正是 C2 要根治的，
+    「一条坏数据」如此，「一页坏数据」更如此。
+    """
+    good = "https://example.invalid/good.json"
+    bad = "https://example.invalid/bad.json"
     routes = {
         catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
-        catalog.TCH_MATERIAL_VERSION: FakeResponse(200, json_data={"urls": LIST_A}),
-        LIST_A: FakeResponse(200, json_data={"unexpected": "object"}),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(200, json_data={"urls": "%s,%s" % (bad, good)}),
+        bad: FakeResponse(200, json_data={"unexpected": "object"}),
+        good: FakeResponse(200, json_data=[book("b1", "语文一年级上册")]),
     }
     client = HttpClient(config=AppConfig(), session=FakeSession(routes))
-    with pytest.raises(UpstreamFormatError):
-        catalog.ResourceHelper(client).fetch_tree()
+    with caplog.at_level(logging.WARNING, logger="tchmaterial_parser.core.catalog"):
+        tree = catalog.ResourceHelper(client).fetch_tree()
+
+    ids = {book_id for book_id, _ in leaves(tree)}
+    assert ids == {"b1"}, "坏的那一页把好的那一页也带走了：%s" % ids
+    assert any("整页跳过" in r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]

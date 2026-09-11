@@ -317,17 +317,39 @@ def test_empty_snapshot_reads_as_idle():
 
 
 def test_worker_thread_never_touches_the_ui(tmp_path):
-    """设计点名的哨兵：工作线程手里不该有任何一个会碰界面的回调。"""
-    def sentinel(*args, **kwargs):
-        raise AssertionError("工作线程调用了界面回调")
+    """设计点名的哨兵：把「被碰到即失败」的对象放在工作线程够得着的地方。
 
+    哨兵必须真的接在调用路径上——挂一个没人会碰的属性只是装饰。
+    这里把每个界面钩子名都换成哨兵：工作线程一旦取用或调用，立刻炸。
+    """
     manager = make_manager(FakeSession(default=FakeResponse(200, [b"x" * 8] * 4)))
+
     # 管理器上不许存在任何可被工作线程调用的界面钩子
     for name in ("on_progress", "on_finish"):
         assert not hasattr(manager, name), "DownloadManager 仍持有界面回调 %s" % name
-    manager.sentinel = sentinel
+
+    touched = []
+
+    class Sentinel:
+        def __getattr__(self, name):
+            touched.append(name)
+            raise AssertionError("工作线程碰了界面对象：%s" % name)
+
+        def __call__(self, *args, **kwargs):
+            # 必须显式定义：obj() 走类型上的 __call__，不经过 __getattr__，
+            # 少了它，「工作线程直接调用界面回调」这一格就漏掉了
+            touched.append("__call__")
+            raise AssertionError("工作线程调用了界面回调")
+
+    for name in ("on_progress", "on_finish", "root", "progress_bar",
+                 "progress_label", "download_btn", "update_progress", "finish_downloads"):
+        setattr(manager, name, Sentinel())
 
     manager.download_file(URL, str(tmp_path / "a.pdf"))
+
+    assert touched == [], "工作线程碰了界面钩子：%s" % touched
+    state = manager.states()[0]
+    assert state["finished"] and state["failed_reason"] is None, state
     assert manager.snapshot().finished == 1
 
 
@@ -650,10 +672,11 @@ def test_suggested_name_does_not_reserve_a_path(tmp_path):
     assert "build_save_path" not in expression, expression
     assert "sanitize_filename" in expression, expression
 
-    # 连取两次建议名不该产生序号
+    # 连取两次建议名不该产生序号，也不该登记任何预留
     title = "义务教育教科书/数学一年级上册"
+    before = naming.reserved_paths()
     assert sanitize_filename(title) == sanitize_filename(title)
-    assert naming.reserved_paths() == set(), "取建议名登记了预留"
+    assert naming.reserved_paths() == before, "取建议名登记了预留"
 
 
 # ---- R2-P1-1：跨重试的校验子不许留成陈旧值 ----

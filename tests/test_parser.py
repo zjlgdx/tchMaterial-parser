@@ -285,3 +285,54 @@ def test_title_is_normalised_to_str_or_none(raw_title, expected):
     title = parser.parse(client, PAGE)[2]
     assert title == expected
     assert title is None or isinstance(title, str)
+
+
+# ---- R2-P1-4：专题课程支路的畸形形状也不许逃逸 ----
+
+THEMATIC_PAGE = ("https://basic.smartedu.cn/tchMaterial/detail"
+                 "?contentType=thematic_course&contentId=%s" % CONTENT_ID)
+EMPTY_COURSE = {"id": CONTENT_ID, "title": "专题课程", "ti_items": []}
+GOOD_PDF = {"lc_ti_format": "pdf", "ti_storages": ["https://x/%s.pdf" % CONTENT_ID]}
+
+
+def thematic_client(resources_body):
+    return client_for({
+        parser.SPECIAL_EDU_DETAIL.format(content_id=CONTENT_ID):
+            FakeResponse(200, json_data=EMPTY_COURSE),
+        parser.THEMATIC_COURSE_LIST.format(content_id=CONTENT_ID):
+            FakeResponse(200, json_data=resources_body),
+    })
+
+
+@pytest.mark.parametrize("body, label", [
+    ([None], "列表混入 null"),
+    ([42], "列表混入标量"),
+    (["字符串"], "列表混入字符串"),
+    ({"a": "b"}, "返回的是字典而非列表"),
+    ("xyz", "返回的是字符串"),
+    ([{"resource_type_code": "assets_document", "ti_items": [{"lc_ti_format": "pdf"}]}],
+     "条目缺 ti_storages"),
+    ([{"resource_type_code": "assets_document", "ti_items": None}], "ti_items 是 null"),
+])
+def test_malformed_thematic_course_list_does_not_leak(body, label):
+    """主详情路径修好了，这条支路一样不能漏——配合提交循环的兜底，
+    一条畸形的专题课程链接同样能把按钮卡死。"""
+    try:
+        parser.parse(thematic_client(body), THEMATIC_PAGE)
+    except ParserError:
+        pass # 可辨的领域异常，符合预期
+    except Exception as exc:
+        raise AssertionError("%s 逃出了领域异常：%r" % (label, exc))
+
+
+def test_null_between_valid_thematic_entries_is_skipped():
+    """混进来的 null 只该被跳过，不该挡住后面那条正常条目。"""
+    body = [None, {"resource_type_code": "assets_document", "ti_items": [GOOD_PDF]}]
+    resource_url, _, title = parser.parse(thematic_client(body), THEMATIC_PAGE)
+    assert resource_url.endswith(".pdf")
+    assert title == "专题课程"
+
+
+def test_thematic_list_that_is_not_an_array_is_a_format_error():
+    with pytest.raises(UpstreamFormatError):
+        parser.parse(thematic_client({"not": "a list"}), THEMATIC_PAGE)

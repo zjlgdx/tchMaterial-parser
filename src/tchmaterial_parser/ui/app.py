@@ -172,12 +172,18 @@ class App:
             except Exception:
                 logger.exception("界面更新回调执行失败")
 
-        self.poll_downloads()
-
+        # 先把下一次 tick 排上，再做可能抛异常的事：poll_downloads 一旦抛
+        # （例如窗口销毁后残留的 tick 碰到 TclError），重排语句就执行不到了，
+        # 整个轮询器就此死掉——目录结果、进度、完成提示全部停摆
         try:
             self.root.after(self.config.progress_poll_ms, self.drain_ui_queue)
         except tk.TclError:
-            pass # 窗口已销毁，轮询到此为止
+            return # 窗口已销毁，轮询到此为止
+
+        try:
+            self.poll_downloads()
+        except Exception:
+            logger.exception("刷新下载进度失败")
 
     def poll_downloads(self) -> None: # 只在主线程执行
         """每个 tick 读一次快照，顺便判定这批下载是否已经结束。

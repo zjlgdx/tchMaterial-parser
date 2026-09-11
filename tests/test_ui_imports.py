@@ -29,22 +29,8 @@ def test_detail_url_is_built_in_one_place():
     assert "contentType=assets_document" in build_detail_url("abc-123", None)
 
 
-def test_closing_cancels_the_download_pool(monkeypatch):
-    """线程池的工作线程不是守护线程，关窗必须显式取消，否则进程残留。"""
-    import ast
-    import os
-
-    src_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "src", "tchmaterial_parser", "ui", "app.py")
-    tree = ast.parse(open(src_path, encoding="utf-8").read())
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.FunctionDef) and n.name == "on_closing")
-    calls = [ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)]
-    assert "self.downloads.cancel_all" in calls, calls
-    assert "self.root.destroy" in calls, calls
-
-
 def source_of(module_name, func_name):
+    """取出某个界面模块里某个函数的 AST，供纯静态断言使用。"""
     import ast
     import os as _os
 

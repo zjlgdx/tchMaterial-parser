@@ -87,18 +87,23 @@ def parse(client, url: str):
 
     try:
         resource_url = pick_pdf_url(data.get("ti_items"), client.access_token)
-    except (KeyError, IndexError, TypeError) as e:
+    except (KeyError, IndexError, TypeError, AttributeError) as e:
         raise UpstreamFormatError("详情接口里的资源条目缺少文件地址", e) from e
 
     if not resource_url and content_type == "thematic_course": # 专题课程的 PDF 挂在子资源上
         resources_data = client.get_json(THEMATIC_COURSE_LIST.format(content_id=content_id))
+        if not isinstance(resources_data, list):
+            raise UpstreamFormatError("专题课程的资源列表不是数组")
+
         try:
-            for resource in list(resources_data):
+            for resource in resources_data:
+                if not isinstance(resource, dict): # 上游偶尔会混进 null
+                    continue
                 if resource.get("resource_type_code") == "assets_document":
                     resource_url = pick_pdf_url(resource.get("ti_items"), client.access_token)
                     if resource_url:
                         break
-        except (KeyError, IndexError, TypeError) as e:
+        except (KeyError, IndexError, TypeError, AttributeError) as e:
             raise UpstreamFormatError("专题课程的资源列表结构与预期不符", e) from e
 
     if not resource_url:
