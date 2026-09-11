@@ -112,20 +112,29 @@ def ui_finish_downloads(dir_path: str, failed_detail: str) -> None: # 只允许�
     else:
         messagebox.showinfo("下载完成", f"文件已下载到：{dir_path}") # 显示完成对话框
 
+def remove_part_file(part_path: str) -> None: # 清理下载残件
+    try:
+        os.remove(part_path)
+    except FileNotFoundError: # 失败发生在建出文件之前，没有残件可清
+        pass
+
 def download_file(url: str, save_path: str) -> None: # 下载文件（在工作线程中执行）
     global completion_notified
     current_state = { "download_url": url, "save_path": save_path, "downloaded_size": 0, "total_size": 0, "finished": False, "failed_reason": None }
     with download_states_lock:
         download_states.append(current_state)
 
+    part_path = save_path + ".part" # 先写临时文件，写完整了才改名，失败时不会留下能被当成课本打开的半截 PDF
     response = session.get(url, stream=True, timeout=DEFAULT_TIMEOUT)
 
     # 服务器返回 401 或 403 状态码
     if response.status_code == 401 or response.status_code == 403:
+        remove_part_file(part_path)
         with download_states_lock:
             current_state["finished"] = True
             current_state["failed_reason"] = "授权失败，Access Token 可能已过期或无效，请重新设置"
     elif response.status_code >= 400:
+        remove_part_file(part_path)
         with download_states_lock:
             current_state["finished"] = True
             current_state["failed_reason"] = f"服务器返回状态码 {response.status_code}"
@@ -134,7 +143,7 @@ def download_file(url: str, save_path: str) -> None: # 下载文件（在工作�
             current_state["total_size"] = int(response.headers.get("Content-Length", 0))
 
         try:
-            with open(save_path, "wb") as file:
+            with open(part_path, "wb") as file:
                 for chunk in response.iter_content(chunk_size=131072): # 分块下载，每次下载 131072 字节（128 KB）
                     file.write(chunk)
                     with download_states_lock: # 汇总值必须在同一临界区内一次取齐，否则会读到别的线程写到一半的状态
@@ -149,10 +158,12 @@ def download_file(url: str, save_path: str) -> None: # 下载文件（在工作�
                         progress_text = f"{format_bytes(all_downloaded_size)}/{format_bytes(all_total_size)} ({download_progress:.2f}%) 已下载 {downloaded_number}/{total_number}"
                         root.after(0, partial(ui_update_progress, download_progress, progress_text)) # Tkinter 非线程安全，控件只能由主线程改
 
+            os.replace(part_path, save_path) # 只有完整写完才会出现目标文件
             with download_states_lock:
                 current_state["downloaded_size"] = current_state["total_size"]
                 current_state["finished"] = True
         except Exception as e:
+            remove_part_file(part_path)
             with download_states_lock:
                 current_state["downloaded_size"], current_state["total_size"] = 0, 0
                 current_state["finished"] = True
