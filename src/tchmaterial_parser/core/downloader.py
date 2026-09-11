@@ -8,12 +8,14 @@
 import logging
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
+import requests
+
 from ..config import AppConfig
 from . import naming
+from .errors import NetworkError
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +89,18 @@ class DownloadSnapshot:
 
 class DownloadCancelled(Exception):
     """关窗时置位取消标志，正在下载的任务据此提前退出。"""
+
+
+class PermanentDownloadError(Exception):
+    """重试也不会变好的失败：授权被拒、资源不存在、本地写盘失败。"""
+
+
+class RetryableDownloadError(Exception):
+    """值得再试一次的失败：服务端 5xx、限流、请求超时。"""
+
+
+# 这些状态码重试才有意义：服务端临时故障、限流、请求超时
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
 class DownloadManager:
@@ -178,13 +192,23 @@ class DownloadManager:
 
     # ---- 下载 ----
 
+    def _stream(self, url: str, headers=None):
+        """所有出站请求的唯一入口：发之前先看一眼取消标志。
+
+        一次尝试里可能发两个请求（续传被判不可信之后还要整份重下），
+        只在重试循环顶上检查是拦不住第二个的。
+        """
+        if self._cancelled.is_set():
+            raise DownloadCancelled("资源下载已取消")
+        return self.client.stream(url, headers=headers)
+
     def _open_stream(self, url: str, resume_from: int, validator):
         """发起请求；resume_from > 0 时尝试续传，返回 (响应, 实际起点)。"""
         headers = None
         if resume_from > 0 and validator is not None:
             headers = { "Range": f"bytes={resume_from}-", "If-Range": validator[1] }
 
-        response = self.client.stream(url, headers=headers)
+        response = self._stream(url, headers=headers)
 
         if headers is None:
             return response, 0
@@ -193,7 +217,7 @@ class DownloadManager:
             # 服务端不接受续传（或文件已变），从零重来。416 说明 .part 比远端
             # 还长，同样只能整份重下，否则每次重试都会再撞一次 416
             response.close()
-            return self.client.stream(url), 0
+            return self._stream(url), 0
 
         # 只有拿到与首次同类型、同值的校验子才敢接着写。校验子缺失、类型不同
         # （首次给 ETag、206 只带别的头）都说明我们无从判断这是不是同一份文件；
@@ -204,7 +228,7 @@ class DownloadManager:
             logger.info("续传校验子不可信（本次 %s，首次 %s），放弃续传并重新下载：%s",
                         current, validator, url)
             response.close()
-            return self.client.stream(url), 0
+            return self._stream(url), 0
 
         return response, resume_from
 
@@ -219,9 +243,12 @@ class DownloadManager:
             ctx["validator"] = seen
 
         if response.status_code == 401 or response.status_code == 403:
-            raise PermissionError("授权失败，Access Token 可能已过期或无效，请重新设置")
+            raise PermanentDownloadError("授权失败，Access Token 可能已过期或无效，请重新设置")
+        if response.status_code in RETRYABLE_STATUS:
+            raise RetryableDownloadError(f"服务器返回状态码 {response.status_code}")
         if response.status_code >= 400:
-            raise ConnectionError(f"服务器返回状态码 {response.status_code}")
+            # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
+            raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
 
         if start == 0:
             remove_part_file(part_path) # 从零重来，旧残件先清掉
@@ -258,6 +285,10 @@ class DownloadManager:
 
         try:
             for attempt in range(self.config.max_retries + 1):
+                if self._cancelled.is_set(): # 每轮开始前先看一眼，别在关窗后又发一次请求
+                    failed_reason = "下载已取消"
+                    break
+
                 with self._lock:
                     current_state["attempts"] = attempt + 1
 
@@ -267,15 +298,23 @@ class DownloadManager:
                     os.replace(part_path, save_path) # 只有完整写完才会出现目标文件
                     failed_reason = None
                     break
-                except (DownloadCancelled, PermissionError) as e:
-                    failed_reason = str(e) or "下载已取消"
-                    break # 取消与授权失败都不该重试
-                except Exception as e:
+                except DownloadCancelled:
+                    failed_reason = "下载已取消"
+                    break
+                except (NetworkError, RetryableDownloadError, requests.RequestException) as e:
+                    # 只有真正的网络类失败值得再试
                     failed_reason = str(e)
                     if attempt >= self.config.max_retries:
                         break
                     logger.info("下载失败将重试（第 %d 次）：%s（%s）", attempt + 1, url, e)
-                    time.sleep(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)])
+                    # 用 wait 而不是 sleep：关窗时不必陪着退避把 1+2+4 秒等完
+                    if self._cancelled.wait(RETRY_BACKOFF[min(attempt, len(RETRY_BACKOFF) - 1)]):
+                        failed_reason = "下载已取消"
+                        break
+                except Exception as e:
+                    # 授权被拒、404、本地写盘失败：重试也不会变好
+                    failed_reason = str(e)
+                    break
         finally:
             if failed_reason is not None:
                 remove_part_file(part_path)

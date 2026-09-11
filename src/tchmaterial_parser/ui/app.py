@@ -2,7 +2,6 @@
 """主窗口与程序生命周期。"""
 
 import logging
-import os
 import queue
 import sys
 import threading
@@ -17,6 +16,7 @@ from ..config import AppConfig, os_name
 from ..core import tokens
 from ..core.startup import load_catalog
 from ..core.downloader import DownloadManager, build_save_path
+from ..core.naming import sanitize_filename
 from ..core.catalog import CatalogCancelled, ResourceHelper
 from ..core.errors import ParserError
 from ..core.http import HttpClient
@@ -308,9 +308,12 @@ class App:
             if dir_path:
                 save_path = build_save_path(dir_path, title)
             else:
+                # 建议名只做清洗：拿 build_save_path 取名字会在当前工作目录登记一条
+                # 预留，而用户取消或改名之后这条预留永远回不来，下次下载同一本书
+                # 建议名就变成了 xxx (2).pdf
                 save_path = filedialog.asksaveasfilename(
                     defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
-                    initialfile=os.path.basename(build_save_path(os.getcwd(), title))) # 选择保存路径
+                    initialfile=sanitize_filename(title)) # 选择保存路径
                 if not save_path: # 用户取消了文件保存操作
                     if submitted == 0:
                         self.download_btn.config(state="normal")

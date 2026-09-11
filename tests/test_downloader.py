@@ -500,3 +500,150 @@ def test_content_length_alone_is_not_a_validator():
     assert "Content-Length" not in VALIDATOR_HEADERS
     assert response_validator(FakeResponse(200, [b"abcd"])) is None
     assert response_validator(FakeResponse(200, [b"abcd"], headers={"ETag": "v1"})) == ("ETag", "v1")
+
+
+# ---- P1-4：只重试真正的网络类失败 ----
+
+@pytest.mark.parametrize("code", [400, 404, 410, 451])
+def test_client_errors_are_not_retried(tmp_path, code):
+    """404 这类答案重试三次也还是同一个，不该白等 1+2+4 秒。"""
+    session = ScriptedSession([FakeResponse(code)] * 8)
+    manager = make_manager(session) # 默认 max_retries=3
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+
+    assert len(session.calls) == 1, "%d 被重试了 %d 次" % (code, len(session.calls) - 1)
+    assert manager.states()[0]["attempts"] == 1
+    assert str(code) in manager.states()[0]["failed_reason"]
+
+
+@pytest.mark.parametrize("code", [408, 429, 500, 503])
+def test_transient_server_errors_are_retried(tmp_path, monkeypatch, code):
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    session = ScriptedSession([FakeResponse(code), FakeResponse(code), FakeResponse(200, [b"ok"])])
+    manager = make_manager(session)
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+
+    assert len(session.calls) == 3
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_local_disk_errors_are_not_retried(tmp_path, monkeypatch):
+    """写盘失败（磁盘满、权限）不是网络抖动，重试没有意义。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    session = ScriptedSession([FakeResponse(200, [b"abcd"])] * 8)
+    manager = make_manager(session)
+
+    import builtins
+    real_open = builtins.open
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        if str(path).endswith(".part"):
+            raise OSError(28, "No space left on device")
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+    monkeypatch.undo()
+
+    assert len(session.calls) == 1, "磁盘错误被当成网络抖动重试了"
+    assert "No space left" in manager.states()[0]["failed_reason"]
+
+
+# ---- P1-7：取消拦得住重试与退避 ----
+
+def test_cancel_during_backoff_returns_immediately(tmp_path, monkeypatch):
+    """关窗时不该陪着退避把 1+2+4 秒等完。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (30.0, 30.0, 30.0))
+    session = ScriptedSession([FakeResponse(500)] * 8)
+    manager = make_manager(session)
+
+    def cancel_soon():
+        time.sleep(0.2)
+        manager.cancel_all()
+
+    threading.Thread(target=cancel_soon, daemon=True).start()
+
+    started = time.monotonic()
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5, "退避期间没有响应取消，等了 %.1f 秒" % elapsed
+    assert manager.states()[0]["failed_reason"] == "下载已取消"
+
+
+def test_cancel_stops_further_requests(tmp_path, monkeypatch):
+    """取消之后不该再发新的请求。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    session = ScriptedSession([FakeResponse(500)] * 8)
+    manager = make_manager(session)
+    manager.cancel_all()
+
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+    assert session.calls == [], "取消后仍然发出了请求"
+    assert manager.states()[0]["failed_reason"] == "下载已取消"
+
+
+def test_cancel_between_the_two_requests_of_one_attempt(tmp_path, monkeypatch):
+    """一次尝试可能发两个请求：续传被判不可信之后还要整份重下。
+
+    取消若在这两者之间到达，第二个请求不该再发出去——只在重试循环顶上
+    检查是拦不住它的。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    first = FakeResponse(200, [b"AAAA", b"BBBB"], boom_after=1,
+                         headers={"ETag": "v1", "Content-Length": "8"})
+    stale = FakeResponse(206, [b"CCCC"], headers={"ETag": "v2", "Content-Length": "4"})
+
+    session = ScriptedSession([first, stale])
+    manager = make_manager(session)
+
+    original = manager._stream
+    calls = {"n": 0}
+
+    def stream_then_cancel(url, headers=None):
+        calls["n"] += 1
+        response = original(url, headers=headers)
+        if calls["n"] == 2: # 刚拿到那个不可信的 206，此刻关窗
+            manager._cancelled.set()
+        return response
+
+    manager._stream = stream_then_cancel
+    manager.download_file(URL, save_path)
+
+    assert len(session.calls) == 2, "取消之后仍然发出了整份重下的请求"
+    assert manager.states()[0]["failed_reason"] == "下载已取消"
+    assert not os.path.exists(save_path)
+
+
+def test_suggested_name_does_not_reserve_a_path(tmp_path):
+    """单链接保存对话框的建议名只做清洗，不占预留（R1 P1-3）。
+
+    用 build_save_path 取建议名会在当前工作目录登记一条永不归还的预留，
+    用户取消或改名之后，下次下载同一本书的建议名就变成了 xxx (2).pdf。
+    """
+    import ast
+    import os as _os
+
+    from tchmaterial_parser.core.naming import sanitize_filename
+
+    src_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                             "src", "tchmaterial_parser", "ui", "app.py")
+    tree = ast.parse(open(src_path, encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "download")
+
+    dialog = [n for n in ast.walk(fn)
+              if isinstance(n, ast.Call) and "asksaveasfilename" in ast.unparse(n.func)]
+    assert dialog, "找不到保存对话框调用"
+    initialfile = [k for k in dialog[0].keywords if k.arg == "initialfile"]
+    assert initialfile, "保存对话框没有给建议名"
+
+    expression = ast.unparse(initialfile[0].value)
+    assert "build_save_path" not in expression, expression
+    assert "sanitize_filename" in expression, expression
+
+    # 连取两次建议名不该产生序号
+    title = "义务教育教科书/数学一年级上册"
+    assert sanitize_filename(title) == sanitize_filename(title)
+    assert naming.reserved_paths() == set(), "取建议名登记了预留"

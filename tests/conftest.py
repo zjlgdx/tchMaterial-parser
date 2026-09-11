@@ -2,6 +2,7 @@
 """测试替身。全部离线：任何用例都不应产生真实网络请求。"""
 
 import pytest
+import requests
 
 
 class FakeResponse:
@@ -28,7 +29,9 @@ class FakeResponse:
     def iter_content(self, chunk_size=None):
         for i, chunk in enumerate(self._chunks):
             if self._boom_after is not None and i == self._boom_after:
-                raise IOError("模拟的连接中断")
+                # 真实的流中断是 requests 的异常，不是裸 OSError——
+                # 用错类型会让「网络失败该重试、磁盘失败不该重试」的分类测不出来
+                raise requests.exceptions.ChunkedEncodingError("模拟的连接中断")
             if self._on_chunk is not None:
                 self._on_chunk(i)
             yield chunk
