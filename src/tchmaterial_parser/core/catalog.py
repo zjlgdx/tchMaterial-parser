@@ -146,8 +146,8 @@ class ResourceHelper: # 获取网站上资源的数据
     def fetch_version(self) -> CatalogVersion:
         """只取 data_version.json 这一个小文件。
 
-        版本探测必须廉价到可以无条件执行，缓存才有机会在付出那四十余 MB
-        之前拦下这次加载。
+        版本探测必须廉价到可以无条件执行，缓存才有机会在付出那约 32 MB 的
+        解析与建树之前拦下这次加载。
         """
         payload = self.client.get_json(TCH_MATERIAL_VERSION)
         urls = tuple(u for u in str(payload["urls"]).split(",") if u)

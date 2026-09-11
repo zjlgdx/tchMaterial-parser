@@ -146,7 +146,7 @@ class App:
         self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight()) # 不让用户把窗口缩到内容被裁切
 
     def start_catalog_load(self) -> None:
-        """目录加载放后台：它可能要拉四十余 MB，放在主线程上就是「双击图标后毫无反应」。"""
+        """目录加载放后台：解析与建树约三十余 MB，放在主线程上就是「双击图标后毫无反应」。"""
         self.selector.show_placeholder(PLACEHOLDER_TEXT)
         thread = threading.Thread(target=self._load_catalog_worker, name="catalog-load", daemon=True)
         thread.start()

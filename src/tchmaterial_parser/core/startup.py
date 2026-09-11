@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def load_catalog(client, helper: ResourceHelper = None, progress_cb=None):
     """加载资源目录，返回 (树, 是否为离线缓存, 失败原因)。
 
-    先花一个小请求探版本；命中缓存就直接用，热启动完全不碰上游那四十余 MB。
+    先花一个小请求探版本；命中缓存就直接用，热启动完全不碰上游那四个列表文件。
     """
     helper = helper or ResourceHelper(client)
 
