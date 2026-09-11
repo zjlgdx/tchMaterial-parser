@@ -56,7 +56,7 @@ def build(books, tags=TAGS):
     }
     client = HttpClient(config=AppConfig(), session=FakeSession(routes))
     helper = catalog.ResourceHelper(client)
-    return helper, helper.fetch_resource_list()
+    return helper, helper.fetch_tree()
 
 
 def leaves(tree):
@@ -232,4 +232,4 @@ def test_list_that_is_not_an_array_is_a_format_error():
     }
     client = HttpClient(config=AppConfig(), session=FakeSession(routes))
     with pytest.raises(UpstreamFormatError):
-        catalog.ResourceHelper(client).fetch_resource_list()
+        catalog.ResourceHelper(client).fetch_tree()

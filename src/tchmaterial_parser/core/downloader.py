@@ -111,8 +111,6 @@ class DownloadManager:
         self._states = []
         self._cancelled = threading.Event()
         self._executor = None
-        self._live = 0      # 当前真正在执行的任务数
-        self._peak_live = 0 # 观察到的峰值，用于验证并发上限
 
     # ---- 状态 ----
 
@@ -144,17 +142,12 @@ class DownloadManager:
         with self._lock:
             return all(state["finished"] for state in self._states)
 
-    def peak_concurrency(self) -> int:
-        with self._lock:
-            return self._peak_live
-
     def reset(self) -> bool:
         """清空下载状态；仍有任务在飞时不动它并返回 False。"""
         with self._lock:
             if any(not state["finished"] for state in self._states):
                 return False
             self._states.clear() # 就地清空而非重新绑定，工作线程持有的是同一个列表对象
-            self._peak_live = 0
             self._cancelled.clear()
             return True
 
@@ -275,10 +268,6 @@ class DownloadManager:
             with self._lock:
                 self._states.append(current_state)
 
-        with self._lock:
-            self._live += 1
-            self._peak_live = max(self._peak_live, self._live)
-
         part_path = save_path + ".part" # 先写临时文件，写完整了才改名，失败时不会留下能被当成课本打开的半截 PDF
         ctx = {} # 跨重试保留的上下文，目前只有续传校验子
         failed_reason = None
@@ -323,7 +312,6 @@ class DownloadManager:
             naming.release_path(save_path) # 归还预留的文件名，失败重下时还能拿回原名
 
             with self._lock:
-                self._live -= 1
                 current_state["finished"] = True
                 current_state["failed_reason"] = failed_reason
                 if failed_reason is not None:

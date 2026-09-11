@@ -22,7 +22,7 @@ from ..core.errors import ParserError
 from ..core.http import HttpClient
 from ..core.parser import parse
 from ..logging_setup import setup_logging
-from .catalog_tree import CatalogTree
+from .catalog_tree import PLACEHOLDER_TEXT, CatalogTree
 from .platform_ui import apply_dpi_scaling, set_window_icon, ui_font
 from .token_dialog import attach_context_menu, show_access_token_window
 
@@ -36,7 +36,6 @@ DESCRIPTION = """\
 📥 点击 “下载” 按钮后，程序会解析并下载资源。
 ⚠️ 注：为了更可靠地下载，建议点击 “设置 Token” 按钮，参照里面的说明完成设置。"""
 
-LOADING_TEXT = "正在加载教材目录…"
 
 
 def format_failures(failed_links: list) -> str:
@@ -148,7 +147,7 @@ class App:
 
     def start_catalog_load(self) -> None:
         """目录加载放后台：它可能要拉四十余 MB，放在主线程上就是「双击图标后毫无反应」。"""
-        self.selector.show_placeholder(LOADING_TEXT)
+        self.selector.show_placeholder(PLACEHOLDER_TEXT)
         thread = threading.Thread(target=self._load_catalog_worker, name="catalog-load", daemon=True)
         thread.start()
         self.catalog_thread = thread
@@ -211,7 +210,7 @@ class App:
 
     def _report_catalog_progress(self, done: int, total: int) -> None: # 在后台线程中执行
         self.post_to_ui(partial(self.selector.show_placeholder,
-                                f"{LOADING_TEXT}（{done}/{total}）"))
+                                f"{PLACEHOLDER_TEXT}（{done}/{total}）"))
 
     def apply_catalog(self, resource_list, is_stale: bool, failure) -> None: # 只在主线程执行
         self.resource_list, self.catalog_is_stale = resource_list, is_stale

@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """URL 解析与失败分类（C1、C4）。"""
 
-import json
-
 import pytest
 import requests
 

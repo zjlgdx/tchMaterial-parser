@@ -78,10 +78,3 @@ def store(cache_key: str, tree: dict) -> bool:
     except Exception:
         logger.warning("资源目录缓存写入失败", exc_info=True)
         return False
-
-
-def clear() -> None:
-    try:
-        os.remove(cache_file())
-    except FileNotFoundError:
-        pass

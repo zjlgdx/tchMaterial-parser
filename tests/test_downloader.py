@@ -271,7 +271,6 @@ def test_concurrency_never_exceeds_the_configured_cap(tmp_path):
         f.result(timeout=60)
 
     assert live["peak"] <= config.max_download_workers, live["peak"]
-    assert manager.peak_concurrency() <= config.max_download_workers, manager.peak_concurrency()
     assert len(manager.states()) == 100
     assert manager.in_flight() == 0
     manager.cancel_all()

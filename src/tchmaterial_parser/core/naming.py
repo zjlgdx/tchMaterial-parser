@@ -27,6 +27,10 @@ def sanitize_filename(title: str) -> str:
     else:
         name = ""
 
+    # 截断会重新露出末尾的空格或点，而 Windows 会把它们静默吃掉——
+    # 预留的名字和实际落盘的名字就对不上了
+    name = name.rstrip(" .")
+
     return name or "download"
 
 

@@ -45,10 +45,6 @@ class CatalogNode:
     resource_type_code: str = None
     children: dict = field(default_factory=dict)
 
-    @property
-    def is_leaf(self) -> bool:
-        return not self.children
-
     def to_dict(self) -> dict:
         return {
             "node_id": self.node_id,
@@ -219,5 +215,3 @@ class ResourceHelper: # 获取网站上资源的数据
         self.skipped_entries = skipped
         return parsed_hier
 
-    def fetch_resource_list(self, progress_cb=None): # 获取资源列表
-        return self.fetch_tree(progress_cb=progress_cb)

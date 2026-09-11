@@ -10,7 +10,7 @@ DETAIL_URL = ("https://basic.smartedu.cn/tchMaterial/detail"
 
 MIN_QUERY_LENGTH = 2 # 少于两个字的关键词几乎匹配一切，过滤没有意义
 MAX_SEARCH_RESULTS = 200 # 超过这个数说明关键词没有区分度，继续往下翻不如改关键词
-PLACEHOLDER_TEXT = "正在加载资源目录…"
+PLACEHOLDER_TEXT = "正在加载教材目录…"
 TOO_MANY_TEXT = "结果过多，请细化关键词"
 
 

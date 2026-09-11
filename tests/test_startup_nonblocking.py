@@ -64,7 +64,7 @@ def test_constructor_returns_before_the_catalog_is_loaded(gated_app):
     assert app.root.winfo_exists()
     assert app.download_btn.winfo_exists()
     labels = [app.selector.tree.item(i, "text") for i in app.selector.tree.get_children("")]
-    assert labels == [app_module.LOADING_TEXT], labels
+    assert labels == [app_module.PLACEHOLDER_TEXT], labels
 
 
 def test_tree_is_filled_after_the_result_arrives(gated_app):
@@ -151,8 +151,6 @@ def test_result_arriving_before_mainloop_is_not_lost(monkeypatch):
     直接用 root.after 从工作线程投递会在这种时序下抛 RuntimeError，
     界面就永远停在加载占位上。
     """
-    done = threading.Event()
-
     def instant_load(client, helper=None, progress_cb=None):
         return SAMPLE, False, None
 

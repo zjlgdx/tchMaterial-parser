@@ -98,7 +98,6 @@ def test_parsing_is_serialised():
         try:
             return original(self, url, response, parsed_hier)
         finally:
-            end = time.monotonic()
             time.sleep(0.01) # 拉长临界区，重叠才观察得到
             with lock:
                 windows.append((url, start, time.monotonic()))

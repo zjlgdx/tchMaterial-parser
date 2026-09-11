@@ -114,3 +114,26 @@ def test_nineteen_identical_titles_do_not_collide(tmp_path):
     paths = [naming.unique_path(str(tmp_path), naming.sanitize_filename(title), ".pdf")
              for _ in range(19)]
     assert len(set(paths)) == 19
+
+
+@pytest.mark.parametrize("raw, label", [
+    ("课" * 66 + " 尾", "截断处露出空格"),
+    ("a" * 199 + ".b", "截断处露出点"),
+    ("课" * 66 + ".", "截断处露出点（中文）"),
+])
+def test_truncation_does_not_reexpose_trailing_space_or_dot(raw, label):
+    """先 strip 再截断的话，截断会把末尾的空格或点重新露出来。
+
+    Windows 会把它们静默吃掉，预留的名字和实际落盘的名字就对不上了——
+    正是 B4 那一类问题。
+    """
+    got = naming.sanitize_filename(raw)
+    assert not got.endswith(" "), "%s：%r" % (label, got[-5:])
+    assert not got.endswith("."), "%s：%r" % (label, got[-5:])
+    assert len(got.encode("utf-8")) <= naming.MAX_FILENAME_BYTES
+    assert got == got.strip()
+
+
+def test_string_that_becomes_empty_after_trimming_falls_back():
+    assert naming.sanitize_filename("." * 300) == "download"
+    assert naming.sanitize_filename(" " * 300) == "download"

@@ -70,10 +70,14 @@ def test_design_docs_are_linked():
 
 
 def test_old_design_draft_is_gone():
-    """设计稿只留一份，不许两份并存。"""
+    """被取代的旧稿不该还在。
+
+    只断言它不存在——断言 docs/designs 的完整目录列表会让将来新增任何一份
+    设计稿都把测试套变红。
+    """
     assert not os.path.exists(os.path.join(REPO_ROOT, "重构设计方案.md"))
     designs = os.listdir(os.path.join(REPO_ROOT, "docs", "designs"))
-    assert designs == ["2026-09-11-hardening-and-restructure.md"], designs
+    assert "2026-09-11-hardening-and-restructure.md" in designs, designs
 
 
 def test_no_stale_version_number_in_readme():
