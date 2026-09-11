@@ -934,9 +934,9 @@ def test_part_file_promote_clears_identity(tmp_path):
 def test_validator_is_only_assigned_inside_partfile():
     """结构性保证：校验子只有 PartFile 能改。
 
-    前三轮评审抓到的是同一个根因的三条路径——「记着的身份」与「文件里的字节」
-    在各个分支上脱钩。现在赋值点全部收在 PartFile 内部，且每一处都与文件内容的
-    变化同时发生，不写盘的分支在构造上就够不到它。
+    赋值点一旦散出去，「记着的身份」与「文件里的字节」就能各自变化，续传随时
+    可能把两份不同版本拼在一起。守住「赋值点全在 PartFile 内部」这条，就不必
+    逐个分支去检查有没有漏掉同步。
     """
     import ast
 
