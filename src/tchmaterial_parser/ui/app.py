@@ -29,7 +29,7 @@ DESCRIPTION = """\
 📌 请在下面的文本框中输入一个或多个资源页面的网址（每个网址一行）。
 🔗 资源页面网址示例：
     https://basic.smartedu.cn/tchMaterial/detail?contentType=assets_document&contentId=...
-📝 您也可以直接在下方的选项卡中选择教材。
+📝 您也可以在下方的教材目录里逐层展开，双击教材即可加入上方；也可以直接搜索教材名。
 📥 点击 “下载” 按钮后，程序会解析并下载资源。
 ⚠️ 注：为了更可靠地下载，建议点击 “设置 Token” 按钮，参照里面的说明完成设置。"""
 
