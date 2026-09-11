@@ -1,0 +1,24 @@
+[
+  {
+    "resource_type_code": "assets_video",
+    "ti_items": [
+      {
+        "lc_ti_format": "mp4",
+        "ti_storages": [
+          "https://r1.ykt.cbern.com.cn/v.mp4"
+        ]
+      }
+    ]
+  },
+  {
+    "resource_type_code": "assets_document",
+    "ti_items": [
+      {
+        "lc_ti_format": "pdf",
+        "ti_storages": [
+          "https://r2-ndr-private.ykt.cbern.com.cn/edu_product/esp/assets/4f64356a-8df7-4579-9400-e32c9a7f6718.pkg/pdf.pdf"
+        ]
+      }
+    ]
+  }
+]

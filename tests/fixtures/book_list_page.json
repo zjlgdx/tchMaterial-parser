@@ -1,0 +1,64 @@
+[
+  {
+    "id": "book-dup-1",
+    "title": "（根据2022年版课程标准修订）义务教育教科书·英语三年级下册",
+    "tag_paths": [
+      "教材/tag-edu/tag-primary/tag-chinese"
+    ],
+    "resource_type_code": "assets_document",
+    "global_description": "教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 ",
+    "custom_properties": {
+      "thumbnails": [
+        "https://r1.ykt.cbern.com.cn/t1.jpg"
+      ]
+    }
+  },
+  {
+    "id": "book-dup-2",
+    "title": "（根据2022年版课程标准修订）义务教育教科书·英语三年级下册",
+    "tag_paths": [
+      "教材/tag-edu/tag-primary/tag-chinese"
+    ],
+    "resource_type_code": "assets_document",
+    "global_description": "教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 ",
+    "custom_properties": {
+      "thumbnails": [
+        "https://r1.ykt.cbern.com.cn/t2.jpg"
+      ]
+    }
+  },
+  {
+    "id": "book-empty-tags",
+    "title": "不属于任何层级的资料",
+    "tag_paths": [],
+    "resource_type_code": "assets_document",
+    "global_description": "教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 "
+  },
+  {
+    "id": "book-bad-branch",
+    "title": "指向不存在的分支",
+    "tag_paths": [
+      "教材/tag-nope/tag-x"
+    ],
+    "resource_type_code": "assets_document",
+    "global_description": "教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 "
+  },
+  {
+    "id": "book-no-title",
+    "name": "只有 name 字段的课本",
+    "tag_paths": [
+      "教材/tag-edu/tag-primary/tag-math"
+    ],
+    "resource_type_code": "assets_document",
+    "global_description": "教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 "
+  },
+  {
+    "id": "book-odd-name",
+    "title": "  义务教育教科书/数学:一年级上册  ",
+    "tag_paths": [
+      "教材/tag-edu/tag-primary/tag-math"
+    ],
+    "resource_type_code": "thematic_course",
+    "global_description": "教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 教材简介 "
+  }
+]

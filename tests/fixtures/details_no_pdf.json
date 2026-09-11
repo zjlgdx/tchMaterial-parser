@@ -1,0 +1,12 @@
+{
+  "id": "4f64356a-8df7-4579-9400-e32c9a7f6718",
+  "title": "只有视频的资源",
+  "ti_items": [
+    {
+      "lc_ti_format": "mp4",
+      "ti_storages": [
+        "https://r1.ykt.cbern.com.cn/v.mp4"
+      ]
+    }
+  ]
+}

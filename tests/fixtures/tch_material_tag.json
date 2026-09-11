@@ -1,0 +1,43 @@
+{
+  "hierarchies": [
+    {
+      "children": [
+        {
+          "tag_id": "tag-edu",
+          "tag_name": "电子教材",
+          "hierarchies": [
+            {
+              "children": [
+                {
+                  "tag_id": "tag-primary",
+                  "tag_name": "小学",
+                  "hierarchies": [
+                    {
+                      "children": [
+                        {
+                          "tag_id": "tag-chinese",
+                          "tag_name": "语文",
+                          "hierarchies": []
+                        },
+                        {
+                          "tag_id": "tag-math",
+                          "tag_name": "数学",
+                          "hierarchies": []
+                        }
+                      ]
+                    }
+                  ]
+                },
+                {
+                  "tag_id": "tag-junior",
+                  "tag_name": "初中",
+                  "hierarchies": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
