@@ -309,33 +309,37 @@ class App:
         # 不刷进度也不弹完成框，按钮永远停在 disabled 上——用户只能重启程序
         try:
             for url in urls:
+                # 兜底包的是循环体而不是整个循环：包整个循环的话，第 3 条链接上的
+                # 意外异常会让第 4 条之后根本不被投递，而同一循环里的解析失败是
+                # continue 的——「一条坏链接拖垮整批」会以另一种形式留下来
                 try:
                     resource_url, _content_id, title = parse(self.client, url)
+
+                    if dir_path:
+                        save_path = build_save_path(dir_path, title)
+                    else:
+                        # 建议名只做清洗：拿 build_save_path 取名字会在当前工作目录登记一条
+                        # 预留，而用户取消或改名之后这条预留永远回不来，下次下载同一本书
+                        # 建议名就变成了 xxx (2).pdf
+                        save_path = filedialog.asksaveasfilename(
+                            defaultextension=".pdf",
+                            filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+                            initialfile=sanitize_filename(title)) # 选择保存路径
+                        if not save_path: # 用户取消了文件保存操作
+                            return
+                        if os_name == "Windows":
+                            save_path = save_path.replace("/", "\\")
+
+                    self.downloads.submit(resource_url, save_path)
+                    submitted += 1
                 except ParserError as e:
                     logger.info("解析失败：%s（%s）", url, e.message)
                     failed_links.append((url, e.message)) # 添加到失败链接
-                    continue
-
-                if dir_path:
-                    save_path = build_save_path(dir_path, title)
-                else:
-                    # 建议名只做清洗：拿 build_save_path 取名字会在当前工作目录登记一条
-                    # 预留，而用户取消或改名之后这条预留永远回不来，下次下载同一本书
-                    # 建议名就变成了 xxx (2).pdf
-                    save_path = filedialog.asksaveasfilename(
-                        defaultextension=".pdf",
-                        filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
-                        initialfile=sanitize_filename(title)) # 选择保存路径
-                    if not save_path: # 用户取消了文件保存操作
-                        return
-                    if os_name == "Windows":
-                        save_path = save_path.replace("/", "\\")
-
-                self.downloads.submit(resource_url, save_path)
-                submitted += 1
-        except Exception:
-            logger.exception("投递下载任务时出错")
-            messagebox.showerror("错误", "准备下载任务时出错，请查看日志了解详情。")
+                except Exception as e:
+                    # 走到这里说明是没预料到的失败。它同样只属于这一条链接，
+                    # 并入同一张失败清单，用户看到的是具体原因而不是「请查看日志」
+                    logger.exception("投递下载任务时出错：%s", url)
+                    failed_links.append((url, f"准备下载任务时出错：{e}"))
         finally:
             self.download_session = submitted > 0
             if submitted == 0: # 没有任何线程在飞，完成回调不会到来，只能在这里解禁

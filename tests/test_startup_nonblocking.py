@@ -356,9 +356,15 @@ def test_submit_loop_always_opens_the_gate_and_restores_the_button(monkeypatch, 
                                "https://basic.smartedu.cn/tchMaterial/detail?contentId=y")
     monkeypatch.setattr(app_module, "parse",
                         lambda client, url: ("https://x/a.pdf", "x", "标题"))
+    attempted = []
     monkeypatch.setattr(app_module, "build_save_path",
-                        lambda d, t: (_ for _ in ()).throw(RuntimeError("造出来的意外")))
-    monkeypatch.setattr(app_module.messagebox, "showerror", lambda *a, **k: None)
+                        lambda d, t: (attempted.append(d),
+                                      (_ for _ in ()).throw(RuntimeError("造出来的意外")))[1])
+    dialogs = []
+    monkeypatch.setattr(app_module.messagebox, "showerror",
+                        lambda title, msg, *a, **k: dialogs.append(("error", msg)))
+    monkeypatch.setattr(app_module.messagebox, "showwarning",
+                        lambda title, msg, *a, **k: dialogs.append(("warning", msg)))
     monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
     monkeypatch.setattr(app_module.filedialog, "askdirectory", lambda *a, **k: str(tmp_dir))
 
@@ -366,6 +372,14 @@ def test_submit_loop_always_opens_the_gate_and_restores_the_button(monkeypatch, 
 
     assert str(app.download_btn.cget("state")) == "normal", "按钮卡在 disabled 上"
     assert app.download_session is False
+
+    # 一条坏链接只丢它自己：第 2 条仍然被尝试过（R3 P2-3）
+    assert len(attempted) == 2, "第 1 条出错就没再试第 2 条：%r" % (attempted,)
+
+    # 只弹一个模态框，且带着具体原因，而不是「请查看日志了解详情」
+    assert [kind for kind, _ in dialogs] == ["warning"], dialogs
+    assert "造出来的意外" in dialogs[0][1], dialogs[0][1]
+    assert "contentId=x" in dialogs[0][1] and "contentId=y" in dialogs[0][1], dialogs[0][1]
 
     monkeypatch.undo()
     app.root.destroy()
