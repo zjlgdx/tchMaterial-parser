@@ -162,6 +162,14 @@ class App:
         self.ui_queue.put(callback)
 
     def drain_ui_queue(self) -> None: # 只在主线程执行
+        # 下一次 tick 先排上，再做这个 tick 该做的事：后面任何一步漏出异常，
+        # 重排语句都已经执行过了。否则轮询器会就此死掉——目录结果、进度、
+        # 完成提示全部停摆，而窗口看上去一切正常
+        try:
+            self.root.after(self.config.progress_poll_ms, self.drain_ui_queue)
+        except tk.TclError:
+            return # 窗口已销毁，轮询到此为止
+
         while True:
             try:
                 callback = self.ui_queue.get_nowait()
@@ -171,14 +179,6 @@ class App:
                 callback()
             except Exception:
                 logger.exception("界面更新回调执行失败")
-
-        # 先把下一次 tick 排上，再做可能抛异常的事：poll_downloads 一旦抛
-        # （例如窗口销毁后残留的 tick 碰到 TclError），重排语句就执行不到了，
-        # 整个轮询器就此死掉——目录结果、进度、完成提示全部停摆
-        try:
-            self.root.after(self.config.progress_poll_ms, self.drain_ui_queue)
-        except tk.TclError:
-            return # 窗口已销毁，轮询到此为止
 
         try:
             self.poll_downloads()

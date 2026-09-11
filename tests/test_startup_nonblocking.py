@@ -453,3 +453,45 @@ def test_poller_survives_an_exception_in_poll_downloads(monkeypatch):
 
     monkeypatch.undo()
     app.root.destroy()
+
+
+def test_the_next_tick_is_scheduled_before_anything_that_can_throw(monkeypatch):
+    """重排排在这个 tick 的最前面（R3 P2-4）。
+
+    每个回调各自的 try/except 只挡得住回调自己抛的那一类；取队列这一步本身
+    出问题就会把整个轮询器带走，而窗口看上去一切正常。
+    """
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    order = []
+    real_after = app.root.after
+
+    def spy_after(delay, callback=None, *args):
+        if getattr(callback, "__name__", "") == "drain_ui_queue":
+            order.append("排下一次 tick")
+            return "spy"
+        return real_after(delay, callback, *args)
+
+    class ExplodingQueue:
+        def get_nowait(self):
+            order.append("取队列")
+            raise RuntimeError("造出来的意外")
+
+    monkeypatch.setattr(app.root, "after", spy_after)
+    app.ui_queue = ExplodingQueue()
+
+    with pytest.raises(RuntimeError):
+        app.drain_ui_queue()
+
+    assert order == ["排下一次 tick", "取队列"], \
+        "下一次 tick 没有排在可能抛异常的动作之前：%s" % (order,)
+
+    monkeypatch.undo()
+    app.root.destroy()
