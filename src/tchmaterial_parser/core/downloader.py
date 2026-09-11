@@ -10,6 +10,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
 
 import requests
@@ -315,36 +316,38 @@ class DownloadManager:
     def _download_once(self, url: str, part: PartFile, current_state: dict, resume_from: int):
         response, start = self._open_stream(url, resume_from, part.validator)
 
-        if response.status_code >= 400:
-            # stream=True 的响应不消费也不关闭，连接要等 GC 才归还
-            response.close()
-            if response.status_code in (401, 403):
-                raise PermanentDownloadError("授权失败，Access Token 可能已过期或无效，请重新设置")
-            if response.status_code in RETRYABLE_STATUS:
-                raise RetryableDownloadError(f"服务器返回状态码 {response.status_code}")
-            # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
-            raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
+        # stream=True 的响应不关掉，连接要等 GC 才归还。出路不止状态码分类
+        # 这一条：中途断流、写盘失败、取消、正常读完都要关，而中途断流恰恰是
+        # 这条路径的常客——续传就是为它存在的
+        with closing(response):
+            if response.status_code >= 400:
+                if response.status_code in (401, 403):
+                    raise PermanentDownloadError("授权失败，Access Token 可能已过期或无效，请重新设置")
+                if response.status_code in RETRYABLE_STATUS:
+                    raise RetryableDownloadError(f"服务器返回状态码 {response.status_code}")
+                # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
+                raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
 
-        declared = int(response.headers.get("Content-Length", 0))
-        if start == 0:
-            total = declared
-            # 校验子在这里、也只在这里设置：它描述的就是紧接着写进去的字节
-            handle = part.open_fresh(response_validator(response))
-        else:
-            total = start + declared
-            handle = part.open_append()
+            declared = int(response.headers.get("Content-Length", 0))
+            if start == 0:
+                total = declared
+                # 校验子在这里、也只在这里设置：它描述的就是紧接着写进去的字节
+                handle = part.open_fresh(response_validator(response))
+            else:
+                total = start + declared
+                handle = part.open_append()
 
-        with self._lock:
-            current_state["total_size"] = total
-            current_state["downloaded_size"] = start
+            with self._lock:
+                current_state["total_size"] = total
+                current_state["downloaded_size"] = start
 
-        with handle as file:
-            for chunk in response.iter_content(chunk_size=self.config.chunk_size):
-                if self._cancelled.is_set():
-                    raise DownloadCancelled()
-                file.write(chunk)
-                with self._lock: # 只改自己那一条；聚合由 snapshot() 在读的时候做
-                    current_state["downloaded_size"] += len(chunk)
+            with handle as file:
+                for chunk in response.iter_content(chunk_size=self.config.chunk_size):
+                    if self._cancelled.is_set():
+                        raise DownloadCancelled()
+                    file.write(chunk)
+                    with self._lock: # 只改自己那一条；聚合由 snapshot() 在读的时候做
+                        current_state["downloaded_size"] += len(chunk)
 
     def download_file(self, url: str, save_path: str, current_state: dict = None) -> None: # 在工作线程中执行
         if current_state is None: # 直接调用（测试）时也要登记，保持与 submit 一致

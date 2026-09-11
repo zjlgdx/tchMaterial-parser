@@ -751,7 +751,8 @@ def test_server_falling_back_to_200_on_a_range_request_is_consumed(tmp_path, mon
     assert len(session.calls) == 2, "把一个合法的 200 关掉又重下了一遍：%s" % session.calls
     assert session.calls[1][1]["Range"] == "bytes=4-"
     assert open(save_path, "rb").read() == b"NEWNEWNE", "没有从头重写"
-    assert full_again.closed is False
+    # 「没被关掉再重下一遍」由上面的请求次数断言保证；读完之后它当然要关
+    assert full_again.closed is True
     assert manager.states()[0]["failed_reason"] is None
 
 
@@ -998,3 +999,42 @@ def test_content_range_that_proves_nothing_is_rejected(raw):
     response = FakeResponse(206, headers=headers)
     response.headers.pop("Content-Length", None)
     assert content_range_starts_at(response, 4) is False
+
+
+# ---- R3-P2-2：每一条出路都要关掉响应 ----
+
+def test_the_response_is_closed_on_every_exit(tmp_path, monkeypatch):
+    """成功、中途断流、错误状态码——三条出路都要归还连接。
+
+    stream=True 的响应不关掉，连接要等 GC 才归还；中途断流恰恰是这条路径上
+    最常见的一种，续传就是为它存在的。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    broken = FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                          headers={"ETag": "v1", "Content-Length": "8"})
+    server_error = FakeResponse(503)
+    done = FakeResponse(200, [b"AAAABBBB"], headers={"ETag": "v1", "Content-Length": "8"})
+
+    session = ScriptedSession([broken, server_error, done])
+    manager = make_manager(session, config=AppConfig(chunk_size=4, max_retries=3))
+    manager.download_file(URL, save_path)
+
+    assert broken.closed is True, "中途断流的响应没关"
+    assert server_error.closed is True, "错误状态码的响应没关"
+    assert done.closed is True, "正常读完的响应没关"
+
+
+def test_the_response_is_closed_when_the_download_is_cancelled(tmp_path):
+    """关窗取消时同样要关：否则每关一次窗就漏一条连接。"""
+    save_path = str(tmp_path / "书.pdf")
+    manager = make_manager(FakeSession())
+
+    response = FakeResponse(200, [b"AAAA", b"BBBB"], headers={"Content-Length": "8"},
+                            on_chunk=lambda i: manager.cancel_all())
+    manager.client.session.default = response
+    manager.download_file(URL, save_path)
+
+    assert manager.states()[0]["failed_reason"] == "下载已取消"
+    assert response.closed is True, "取消时响应没关"
