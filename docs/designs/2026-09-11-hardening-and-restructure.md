@@ -155,7 +155,7 @@ tchMaterial-parser/
 │       │   ├── __init__.py
 │       │   ├── errors.py            # 领域异常
 │       │   ├── http.py              # HttpClient：Session、超时、鉴权头、忽略代理
-│       │   ├── parser.py            # 资源页 URL -> ResourceRef
+│       │   ├── parser.py            # 资源页 URL -> (pdf_url, content_id, title)
 │       │   ├── catalog.py           # 资源树抓取 / 建树 / 字段裁剪
 │       │   ├── cache.py             # 版本号为键的资源树磁盘缓存
 │       │   ├── startup.py           # 启动时的目录加载编排（探版本 / 读缓存 / 拉取）
@@ -195,7 +195,9 @@ tchMaterial-parser/
 
 **`core/http.py`** — 唯一的网络出口。`HttpClient` 持有 `requests.Session`，构造时设置 `session.proxies = {"http": None, "https": None}` 与默认 `X-ND-AUTH` 头；`set_access_token(token)` 原地更新 `session.headers`（C4：详情接口从此也带鉴权）。对外只暴露 `get_json(url)` 与 `stream(url, extra_headers)`，两者**在方法内部注入 `timeout=(connect, read)`，调用方无法遗漏**（B6）。`requests` 的异常在此转换成 `NetworkError` / `AuthError`。
 
-**`core/parser.py`** — 纯函数 + 一次网络调用。`parse(client, url) -> ResourceRef`，`ResourceRef` 是 `dataclass(content_id, content_type, title, pdf_url)`。保留现有三条分支（基础性作业 / 专题课程 / 普通电子课本）与未登录时的 URL 改写正则。失败抛 `core/errors.py` 里的具体异常，不再返回 `(None, None, None)`。
+**`core/parser.py`** — 纯函数 + 一次网络调用。`parse(client, url) -> (pdf_url, content_id, title)`。保留现有三条分支（基础性作业 / 专题课程 / 普通电子课本）与未登录时的 URL 改写正则。失败抛 `core/errors.py` 里的具体异常，不再返回 `(None, None, None)`——C1 要的是「每种失败都可辨」，成功路径返回什么形状与此无关。
+
+返回元组而不是 `dataclass`：下游只消费 `pdf_url` 与 `title`（界面拼下载链接用的是目录节点自带的 id，不是这里的 `content_id`）。为两个没人读的字段引入一个类型，属于为将来准备的结构；真有第三个消费者出现时再引入也不迟。
 
 **`core/catalog.py`** — 资源树，分成**廉价的版本探测**与**昂贵的整树拉取**两步，这是缓存能真正生效的前提（A3、任务 10）：
 
@@ -210,7 +212,7 @@ tchMaterial-parser/
 **`core/cache.py`** — `load(cache_key) -> CatalogNode | None` / `load_any() -> tuple[str, CatalogNode] | None` / `store(cache_key, node)`。缓存文件是 `cache_dir()/catalog.json`，内容为 `{"version": <cache_key>, "tree": {...}}`，存的是裁剪后的树，约 1 MB。
 
 - `load(cache_key)`：版本一致才返回树。JSON 损坏、版本不符、字段缺失一律当作未命中（记 WARNING 后重新拉取），永不因缓存崩溃。
-- `load_any()`：不校验版本，连同它自己的版本号一起返回。**只在 `fetch_version()` 失败（离线）时使用**，让用户在断网时仍有一棵可用的目录树，UI 侧据此打上「离线缓存」标注。
+- `load_any()`：不校验版本，连同它自己的版本号一起返回。**只在网络路径走不通时使用**——版本探测失败（离线），或版本探测成功、拉取那几个列表文件时中断。两种情形下旧树都比空面板有用，但它确实可能已经过时，所以这条路径一律把 `is_stale` 置为 `True`，UI 据此打上「离线缓存」标注。缓存里也没有东西时才向用户报告具体失败原因。
 - `store()`：先写同目录 `.tmp` 再 `os.replace`，避免半截缓存。
 
 **`core/startup.py`** — `load_catalog(client, progress_cb=None) -> (tree, is_stale, failure)`，把「探版本 → 查缓存 → 必要时拉取」这条启动路径编排成一个函数，供 UI 在后台线程里调用。
@@ -264,7 +266,7 @@ tchMaterial-parser/
   1. `catalog.fetch_version()` 取版本键——只有一个小文件的代价。
   2. `cache.load(version)` 命中 → 直接用，**整个热启动路径不碰那 40 MB**。
   3. 未命中 → `catalog.fetch_tree()` 拉取建树 → `cache.store(version, tree)`。
-  4. 第 1 步失败（离线）→ `cache.load_any()`，有货就用并标注「离线缓存」；没货才显示加载失败提示。
+  4. 第 1 步或第 3 步失败 → `cache.load_any()`，有货就用并标注「离线缓存」；没货才显示加载失败提示。
 
   `ui/app.py` 只负责把返回的 `(tree, is_stale, failure)` 通过 `root.after(0, ...)` 交回主线程并据此更新界面。
 - 轮询器 `_poll_progress()`：读 `DownloadManager.snapshot()`，刷新进度条与标签，检测到「全部完成」时弹一次完成/失败汇总对话框、把下载按钮恢复为可用并复位，然后 `root.after(200, self._poll_progress)`。完成对话框「弹两次或一次都不弹」的竞态（B2）在这里结构性消失——判定只发生在主线程的一个地方。

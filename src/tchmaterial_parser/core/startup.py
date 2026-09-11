@@ -41,7 +41,9 @@ def load_catalog(client, helper: ResourceHelper = None, progress_cb=None):
     except CatalogCancelled:
         raise
     except Exception as e:
-        logger.warning("资源目录拉取失败：%s", e)
+        # 上游版本已经变了，但这次没拉下来。旧树仍然比空面板有用，
+        # 但它确实已经过时——必须打上标记，否则用户看到的是旧目录却毫不知情
+        logger.warning("资源目录拉取失败，回退到本地缓存：%s", e)
         found = cache.load_any()
         if found:
             return found[1], True, None

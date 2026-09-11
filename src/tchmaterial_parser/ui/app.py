@@ -298,7 +298,7 @@ class App:
 
         for url in urls:
             try:
-                resource_url, content_id, title = parse(self.client, url)
+                resource_url, _content_id, title = parse(self.client, url)
             except ParserError as e:
                 logger.info("解析失败：%s（%s）", url, e.message)
                 failed_links.append((url, e.message)) # 添加到失败链接
