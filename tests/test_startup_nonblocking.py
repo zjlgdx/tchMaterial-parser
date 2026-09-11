@@ -182,3 +182,65 @@ def test_result_arriving_before_mainloop_is_not_lost(monkeypatch):
     labels = [app.selector.tree.item(i, "text") for i in app.selector.tree.get_children("")]
     assert labels == ["电子教材"], labels
     app.root.destroy()
+
+
+def test_closing_actually_sets_both_cancel_flags(monkeypatch):
+    """行为断言：真的构造 App、真的走关窗流程、两个取消标志都被置位。
+
+    只比对源码文本是测不出回归的——把 cancel_all() 的函数体换成 pass，
+    源码断言照样绿。
+    """
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    assert app.downloads._cancelled.is_set() is False
+    assert app.catalog_helper.cancelled.is_set() is False
+
+    destroyed = []
+    monkeypatch.setattr(app.root, "destroy", lambda: destroyed.append(True))
+    app.on_closing()
+
+    assert app.downloads._cancelled.is_set() is True, "下载线程池的取消标志没有被置位"
+    assert app.catalog_helper.cancelled.is_set() is True, "目录加载的取消标志没有被置位"
+    assert destroyed == [True], "窗口没有被销毁"
+
+    monkeypatch.undo()
+    app.root.destroy()
+
+
+def test_closing_asks_before_cancelling_live_downloads(monkeypatch):
+    """还有任务在飞时要先问用户；用户说不，就什么都不该动。"""
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    app.downloads._states.append({"download_url": "u", "save_path": "/tmp/x.pdf",
+                                  "downloaded_size": 0, "total_size": 0,
+                                  "finished": False, "failed_reason": None})
+
+    asked = []
+    monkeypatch.setattr(app_module.messagebox, "askokcancel",
+                        lambda *a, **k: asked.append(True) or False)
+    destroyed = []
+    monkeypatch.setattr(app.root, "destroy", lambda: destroyed.append(True))
+
+    app.on_closing()
+
+    assert asked == [True], "有任务在飞却没有询问用户"
+    assert destroyed == [], "用户点了取消，窗口却还是被销毁了"
+    assert app.downloads._cancelled.is_set() is False, "用户点了取消，却已经把下载取消了"
+
+    monkeypatch.undo()
+    app.downloads._states.clear()
+    app.root.destroy()
