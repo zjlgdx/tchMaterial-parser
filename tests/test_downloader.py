@@ -36,10 +36,10 @@ class ScriptedSession:
         return item
 
 
-def make_manager(session, config=None, **kwargs):
+def make_manager(session, config=None):
     config = config or AppConfig(chunk_size=8, max_retries=3)
     client = HttpClient(config=config, session=session)
-    return DownloadManager(client, config=config, **kwargs)
+    return DownloadManager(client, config=config)
 
 
 @pytest.fixture(autouse=True)
@@ -210,14 +210,21 @@ def test_release_path_returns_the_original_name(tmp_path):
     assert os.path.basename(again) == "语文一年级上册.pdf", "重下拿到了幽灵序号"
 
 
-def test_successful_download_still_yields_a_new_name(tmp_path):
-    """成功的任务归还后，磁盘上已有真实文件，下次申请照样让号。"""
+def test_successful_download_releases_its_reservation(tmp_path):
+    """成功路径也要归还预留。
+
+    只断言「下次拿到 (2)」是测不出回归的：成功的文件已经躺在磁盘上，
+    即使 release_path 被删掉，让号也照样会发生。
+    """
     from tchmaterial_parser.core.downloader import build_save_path
 
     first = build_save_path(str(tmp_path), "数学")
+    assert first in naming.reserved_paths()
+
     manager = make_manager(FakeSession(default=FakeResponse(200, [b"x" * 8])))
     manager.download_file(URL, first)
 
+    assert first not in naming.reserved_paths(), "成功后没有归还预留"
     assert os.path.basename(build_save_path(str(tmp_path), "数学")) == "数学 (2).pdf"
 
 
@@ -250,9 +257,9 @@ def test_concurrency_never_exceeds_the_configured_cap(tmp_path):
 
     original = manager.download_file
 
-    def counted(url, save_path):
+    def counted(url, save_path, state=None):
         try:
-            return original(url, save_path)
+            return original(url, save_path, state)
         finally:
             with lock:
                 live["now"] -= 1
@@ -283,33 +290,136 @@ def test_cancel_stops_the_chunk_loop(tmp_path):
 
 # ---- B1 / B2：状态与回调 ----
 
-def test_progress_callback_receives_plain_data(tmp_path):
-    seen = []
-    manager = make_manager(FakeSession(default=FakeResponse(200, [b"ab", b"cd"])),
-                           on_progress=lambda progress, text: seen.append((progress, text)))
+def test_snapshot_is_plain_immutable_data(tmp_path):
+    """快照只含纯数据，界面读它就够了。"""
+    import dataclasses
+
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"ab", b"cd"])))
     manager.download_file(URL, str(tmp_path / "a.pdf"))
 
-    assert seen
-    for progress, text in seen:
-        assert isinstance(progress, float) and isinstance(text, str)
+    snapshot = manager.snapshot()
+    assert dataclasses.is_dataclass(snapshot)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        snapshot.total = 99
+
+    assert snapshot.total == 1 and snapshot.finished == 1 and snapshot.in_flight == 0
+    assert snapshot.downloaded_size == 4 and snapshot.total_size == 4
+    assert snapshot.percent == 100.0
+    assert snapshot.all_finished is True
+    assert snapshot.failures == ()
+    assert "1/1" in snapshot.progress_text()
 
 
-def test_finish_callback_fires_exactly_once(tmp_path):
-    calls = []
-    manager = make_manager(FakeSession(default=FakeResponse(200, [b"x" * 8] * 4)),
-                           on_finish=lambda dir_path, detail: calls.append((dir_path, detail)))
+def test_empty_snapshot_reads_as_idle():
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
+    snapshot = manager.snapshot()
+    assert snapshot.total == 0 and snapshot.all_finished is False
+    assert snapshot.progress_text() == "等待下载"
 
-    threads = [threading.Thread(target=manager.download_file,
-                                args=(URL, str(tmp_path / ("书%d.pdf" % i)))) for i in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
 
-    assert len(calls) == 1, "完成回调触发了 %d 次" % len(calls)
-    assert manager.all_finished()
-    assert manager.in_flight() == 0
-    assert len(manager.states()) == 6
+def test_worker_thread_never_touches_the_ui(tmp_path):
+    """设计点名的哨兵：工作线程手里不该有任何一个会碰界面的回调。"""
+    def sentinel(*args, **kwargs):
+        raise AssertionError("工作线程调用了界面回调")
+
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"x" * 8] * 4)))
+    # 管理器上不许存在任何可被工作线程调用的界面钩子
+    for name in ("on_progress", "on_finish"):
+        assert not hasattr(manager, name), "DownloadManager 仍持有界面回调 %s" % name
+    manager.sentinel = sentinel
+
+    manager.download_file(URL, str(tmp_path / "a.pdf"))
+    assert manager.snapshot().finished == 1
+
+
+def test_snapshot_is_not_complete_until_every_task_is_registered(tmp_path):
+    """P0-1 的回归门。
+
+    真实时序是「解析一条链接（一次网络往返）-> 投递」，第一个任务完全来得及
+    在第二条链接解析完之前就跑完。此时快照绝不能报「全部完成」。
+    """
+    gate = threading.Event()
+    started = threading.Event()
+
+    class GatedSession(FakeSession):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+            self.guard = threading.Lock()
+
+        def get(self, url, **kwargs):
+            with self.guard:
+                self.n += 1
+                index = self.n
+            if index > 1: # 第一个任务立刻完成，其余卡住
+                started.set()
+                gate.wait(timeout=10)
+            return FakeResponse(200, [b"x" * 8])
+
+    config = AppConfig(chunk_size=8, max_retries=0, max_download_workers=2)
+    manager = make_manager(GatedSession(), config=config)
+
+    manager.submit(URL, str(tmp_path / "书0.pdf"))
+    deadline = time.monotonic() + 5
+    while manager.snapshot().finished < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    # 第一个已经跑完，但这一批还没提交完
+    assert manager.snapshot().finished == 1
+    assert manager.snapshot().all_finished is True, "单个任务的快照本就该是完成的"
+
+    for i in range(1, 4):
+        manager.submit(URL, str(tmp_path / ("书%d.pdf" % i)))
+
+    snapshot = manager.snapshot()
+    assert snapshot.total == 4, "提交处没有登记任务：%s" % snapshot
+    assert snapshot.in_flight == 3
+    assert snapshot.all_finished is False, "只登记了一部分任务就报全部完成"
+
+    assert started.wait(timeout=5)
+    gate.set()
+    deadline = time.monotonic() + 10
+    while manager.snapshot().in_flight and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    final = manager.snapshot()
+    assert final.total == 4 and final.finished == 4 and final.all_finished is True
+    manager.cancel_all()
+
+
+def test_state_is_registered_synchronously_by_submit(tmp_path):
+    """submit 返回时状态必须已经登记，哪怕工作线程还没被调度。"""
+    gate = threading.Event()
+
+    class BlockedSession(FakeSession):
+        def get(self, url, **kwargs):
+            gate.wait(timeout=10)
+            return FakeResponse(200, [b"x"])
+
+    manager = make_manager(BlockedSession(), config=AppConfig(chunk_size=8, max_retries=0,
+                                                             max_download_workers=1))
+    for i in range(3):
+        manager.submit(URL, str(tmp_path / ("书%d.pdf" % i)))
+
+    snapshot = manager.snapshot()
+    assert snapshot.total == 3, "submit 没有同步登记状态"
+    assert snapshot.in_flight == 3
+    assert snapshot.all_finished is False
+
+    gate.set()
+    manager.cancel_all()
+
+
+def test_failures_are_carried_in_the_snapshot(tmp_path):
+    manager = make_manager(FakeSession(default=FakeResponse(404)),
+                           config=AppConfig(chunk_size=8, max_retries=0))
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+
+    snapshot = manager.snapshot()
+    assert len(snapshot.failures) == 1
+    url, reason = snapshot.failures[0]
+    assert url == URL and "404" in reason
+    assert "404" in snapshot.failure_detail()
 
 
 def test_reset_refuses_while_tasks_are_in_flight(tmp_path):

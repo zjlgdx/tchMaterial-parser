@@ -10,6 +10,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 
 from ..config import AppConfig
 from . import naming
@@ -45,20 +46,52 @@ def response_validator(response):
     return None
 
 
+@dataclass(frozen=True)
+class DownloadSnapshot:
+    """某一时刻的聚合状态。
+
+    不可变，且只含纯数据：工作线程把状态改在锁里，界面每个 tick 读一次这个
+    快照就够了——按分块回调会让主线程在每个 tick 重放上百次同样的刷新。
+    """
+
+    downloaded_size: int = 0
+    total_size: int = 0
+    finished: int = 0
+    total: int = 0
+    in_flight: int = 0
+    failures: tuple = ()
+    last_dir: str = ""
+
+    @property
+    def percent(self) -> float:
+        if self.total_size <= 0:
+            return 0.0
+        return (self.downloaded_size / self.total_size) * 100
+
+    @property
+    def all_finished(self) -> bool:
+        return self.total > 0 and self.in_flight == 0
+
+    def progress_text(self) -> str:
+        if self.total == 0:
+            return "等待下载"
+        return (f"{format_bytes(self.downloaded_size)}/{format_bytes(self.total_size)}"
+                f" ({self.percent:.2f}%) 已下载 {self.finished}/{self.total}")
+
+    def failure_detail(self) -> str:
+        return "\n".join(f"{url}，原因：{reason}" for url, reason in self.failures)
+
+
 class DownloadCancelled(Exception):
     """关窗时置位取消标志，正在下载的任务据此提前退出。"""
 
 
 class DownloadManager:
-    def __init__(self, client, config: AppConfig = None, on_progress=None, on_finish=None):
+    def __init__(self, client, config: AppConfig = None):
         self.client = client
         self.config = config or AppConfig()
-        # 两个回调都在工作线程里被调用，调用方负责把它们转投到自己的主线程
-        self.on_progress = on_progress or (lambda progress, text: None)
-        self.on_finish = on_finish or (lambda dir_path, failed_detail: None)
         self._lock = threading.Lock()
         self._states = []
-        self._completion_notified = False
         self._cancelled = threading.Event()
         self._executor = None
         self._live = 0      # 当前真正在执行的任务数
@@ -69,6 +102,22 @@ class DownloadManager:
     def states(self) -> list:
         with self._lock:
             return [dict(state) for state in self._states]
+
+    def snapshot(self) -> DownloadSnapshot:
+        """在锁内一次取齐聚合值，避免读到别的线程写到一半的状态。"""
+        with self._lock:
+            if not self._states:
+                return DownloadSnapshot()
+            return DownloadSnapshot(
+                downloaded_size=sum(s["downloaded_size"] for s in self._states),
+                total_size=sum(s["total_size"] for s in self._states),
+                finished=len([s for s in self._states if s["finished"]]),
+                total=len(self._states),
+                in_flight=len([s for s in self._states if not s["finished"]]),
+                failures=tuple((s["download_url"], s["failed_reason"])
+                               for s in self._states if s["failed_reason"]),
+                last_dir=os.path.dirname(self._states[-1]["save_path"]),
+            )
 
     def in_flight(self) -> int:
         with self._lock:
@@ -88,7 +137,6 @@ class DownloadManager:
             if any(not state["finished"] for state in self._states):
                 return False
             self._states.clear() # 就地清空而非重新绑定，工作线程持有的是同一个列表对象
-            self._completion_notified = False
             self._peak_live = 0
             self._cancelled.clear()
             return True
@@ -102,7 +150,17 @@ class DownloadManager:
         return self._executor
 
     def submit(self, url: str, save_path: str):
-        return self._ensure_executor().submit(self.download_file, url, save_path)
+        """登记任务并投递。
+
+        登记必须发生在这里而不是工作线程里：线程池排队的任务、调用方还没
+        解析完的后续链接，都还不在 _states 里；把「是否全部完成」建立在
+        「此刻已登记的那几条」之上，第一个跑完的任务就会被当成全部跑完。
+        """
+        state = { "download_url": url, "save_path": save_path, "downloaded_size": 0,
+                  "total_size": 0, "finished": False, "failed_reason": None, "attempts": 0 }
+        with self._lock:
+            self._states.append(state)
+        return self._ensure_executor().submit(self.download_file, url, save_path, state)
 
     def cancel_all(self) -> None:
         """关窗时调用。
@@ -171,24 +229,17 @@ class DownloadManager:
                 if self._cancelled.is_set():
                     raise DownloadCancelled()
                 file.write(chunk)
-                with self._lock: # 汇总值必须在同一临界区内一次取齐，否则会读到别的线程写到一半的状态
+                with self._lock: # 只改自己那一条；聚合由 snapshot() 在读的时候做
                     current_state["downloaded_size"] += len(chunk)
-                    all_downloaded_size = sum(state["downloaded_size"] for state in self._states)
-                    all_total_size = sum(state["total_size"] for state in self._states)
-                    downloaded_number = len([state for state in self._states if state["finished"]])
-                    total_number = len(self._states)
 
-                if all_total_size > 0: # 防止下面一行代码除以 0 而报错
-                    progress = (all_downloaded_size / all_total_size) * 100
-                    text = (f"{format_bytes(all_downloaded_size)}/{format_bytes(all_total_size)}"
-                            f" ({progress:.2f}%) 已下载 {downloaded_number}/{total_number}")
-                    self.on_progress(progress, text)
+    def download_file(self, url: str, save_path: str, current_state: dict = None) -> None: # 在工作线程中执行
+        if current_state is None: # 直接调用（测试）时也要登记，保持与 submit 一致
+            current_state = { "download_url": url, "save_path": save_path, "downloaded_size": 0,
+                              "total_size": 0, "finished": False, "failed_reason": None, "attempts": 0 }
+            with self._lock:
+                self._states.append(current_state)
 
-    def download_file(self, url: str, save_path: str) -> None: # 在工作线程中执行
-        current_state = { "download_url": url, "save_path": save_path, "downloaded_size": 0,
-                          "total_size": 0, "finished": False, "failed_reason": None, "attempts": 0 }
         with self._lock:
-            self._states.append(current_state)
             self._live += 1
             self._peak_live = max(self._peak_live, self._live)
 
@@ -232,18 +283,8 @@ class DownloadManager:
                 else:
                     current_state["downloaded_size"] = current_state["total_size"]
 
-        # 完成判定与“是否已通知”的置位必须在同一临界区内完成：
-        # 否则最后两个线程可能同时看到“全部完成”，把完成对话框弹两次
-        with self._lock:
-            should_notify = all(state["finished"] for state in self._states) and not self._completion_notified
-            if should_notify:
-                self._completion_notified = True
-                failed_states = [state for state in self._states if state["failed_reason"]]
-                failed_detail = "\n".join(f"{state['download_url']}，原因：{state['failed_reason']}"
-                                          for state in failed_states)
-
-        if should_notify:
-            self.on_finish(os.path.dirname(save_path), failed_detail)
+        # 完成判定不在这里做：工作线程看不到「调用方还打算提交几个」，
+        # 只有主线程知道一批下载什么时候算结束
 
 
 def build_save_path(dir_path: str, title: str) -> str:

@@ -54,12 +54,10 @@ class App:
         self.root.title(f"国家中小学智慧教育平台 资源下载工具 v{__version__}")
         set_window_icon(self.root)
 
-        # 工作线程只交出纯数据，投递回主线程由这里负责——Tkinter 非线程安全
+        # 工作线程只改自己那条状态；界面每个 tick 读一次聚合快照——Tkinter 非线程安全
         self.ui_queue = queue.Queue()
-        self.downloads = DownloadManager(
-            self.client, config=self.config,
-            on_progress=lambda progress, text: self.post_to_ui(partial(self.update_progress, progress, text)),
-            on_finish=lambda dir_path, detail: self.post_to_ui(partial(self.finish_downloads, dir_path, detail)))
+        self.downloads = DownloadManager(self.client, config=self.config)
+        self.download_session = False # 本批下载是否还在进行；完成判定只由轮询器做
 
         self.resource_list = {}
         self.catalog_is_stale = False
@@ -175,10 +173,29 @@ class App:
             except Exception:
                 logger.exception("界面更新回调执行失败")
 
+        self.poll_downloads()
+
         try:
             self.root.after(self.config.progress_poll_ms, self.drain_ui_queue)
         except tk.TclError:
             pass # 窗口已销毁，轮询到此为止
+
+    def poll_downloads(self) -> None: # 只在主线程执行
+        """每个 tick 读一次快照，顺便判定这批下载是否已经结束。
+
+        完成判定必须在这里做：只有主线程知道这一批一共提交了几个任务，
+        工作线程看到的永远只是「此刻已登记的那几条」。
+        """
+        if not self.download_session:
+            return
+
+        snapshot = self.downloads.snapshot()
+        self.progress_bar["value"] = snapshot.percent
+        self.progress_label.config(text=snapshot.progress_text())
+
+        if snapshot.all_finished:
+            self.download_session = False
+            self.finish_downloads(snapshot)
 
     def _load_catalog_worker(self) -> None: # 在后台线程中执行
         try:
@@ -217,19 +234,17 @@ class App:
         else:
             self.url_text.insert("end", "\n" + url)
 
-    def update_progress(self, progress: float, text: str) -> None:
-        self.progress_bar["value"] = progress
-        self.progress_label.config(text=text)
-
-    def finish_downloads(self, dir_path: str, failed_detail: str) -> None:
+    def finish_downloads(self, snapshot) -> None: # 只在主线程执行
         self.progress_bar["value"] = 0 # 重置进度条
         self.progress_label.config(text="等待下载") # 清空进度标签
         self.download_btn.config(state="normal") # 设置下载按钮为启用状态
 
-        if failed_detail:
-            messagebox.showwarning("下载完成", f"文件已下载到：{dir_path}\n以下链接下载失败：\n{failed_detail}")
+        detail = snapshot.failure_detail()
+        if detail:
+            messagebox.showwarning("下载完成",
+                                   f"文件已下载到：{snapshot.last_dir}\n以下链接下载失败：\n{detail}")
         else:
-            messagebox.showinfo("下载完成", f"文件已下载到：{dir_path}") # 显示完成对话框
+            messagebox.showinfo("下载完成", f"文件已下载到：{snapshot.last_dir}") # 显示完成对话框
 
     def open_token_window(self) -> None:
         show_access_token_window(self.root, self.client,
@@ -304,6 +319,7 @@ class App:
 
             self.downloads.submit(resource_url, save_path)
             submitted += 1
+            self.download_session = True # 登记已经发生，轮询器可以开始判定了
 
         if failed_links:
             messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + format_failures(failed_links))
