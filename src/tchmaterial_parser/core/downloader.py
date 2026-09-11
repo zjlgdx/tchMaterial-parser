@@ -99,39 +99,34 @@ def content_range_starts_at(response, expected_start: int) -> bool:
     return parsed is not None and parsed[0] == expected_start
 
 
-def expected_bytes_on_disk(response, start: int):
-    """这一轮写完之后 .part 应当有多长；服务端没说清就返回 None。
+def is_unencoded(response) -> bool:
+    """线路上的字节与写进文件的字节是不是同一批。
 
-    两种来源，强弱不同，别把它们混成一个说法：
-
-    - `Content-Range` 的 `/Z`，或首次下载时 200 的 `Content-Length`：**整份
-      文件的长度**，收齐了就是收齐了。
-    - `/Z` 写成 `*` 时退到**这一段的终点加一**。它只说明「这一段发完之后盘上
-      该到哪个偏移」，不能当成全长：RFC 9110 §15.3.7 允许 206 只满足所请求
-      区间的一部分（CDN 按块切分就会这样）。所以它够检出这一段的短传，不足以
-      证明整份文件已经完整——总长真正未知时，整份完整性本就无从验证。
-
-    「不知道」必须是 None 而不是 0。0 一旦参与加法就会变成一个看起来合理的
-    错数：分块传输的 206 按 RFC 9110 §8.6 严禁带 Content-Length，拿
-    start + Content-Length 当全长的话，每一次收全的续传都会被判成短传。
-
-    内容编码是同一个陷阱的另一面：Content-Length 数的是线路上的字节，而写进
-    文件的是 iter_content 解码之后的字节。两者在开了 gzip 的链路上必然不等，
-    而且此时按字节续传本身也是错的——区间是对着编码后的表示算的。所以出现
-    内容编码就宣告「不知道」，由下载请求侧的 Accept-Encoding: identity 从
-    源头避免这种局面。identity 是例外：RFC 9110 §8.4.1 里它的语义恰恰是
-    「没有内容编码」，而我们主动发的那个请求头最容易招来服务端原样回显。
+    有内容编码时它们不是：`iter_content` 交给我们的是解码后的字节，而
+    `Content-Length` 数的是线路上的、`Range` 区间也是对着线路上那个表示算的。
+    这一条同时否决两件事——长度对不上，偏移也对不上——所以两处共用这一个判断，
+    别各判各的。`Accept-Encoding: identity` 从源头避免这种局面，而 identity
+    本身是例外：RFC 9110 §8.4.1 里它的语义恰恰是「没有内容编码」，而我们主动
+    发的那个请求头最容易招来服务端原样回显。
     """
     encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
-    if encoding and encoding != "identity":
+    return not encoding or encoding == "identity"
+
+
+def declared_total_size(response, start: int):
+    """这条响应说整份文件有多长；它没说就返回 None。
+
+    只认真正说明**全长**的两个来源：`Content-Range` 的 `/Z`，以及首次下载时
+    200 的 `Content-Length`。`/Z` 写成 `*` 不算——那只说明了这一段。
+    """
+    if not is_unencoded(response):
         return None
 
     parsed = parse_content_range(response)
     if parsed is not None:
-        _first, last, complete = parsed
-        return complete if complete is not None else last + 1
+        return parsed[2] # /Z；写成 * 就是「这条响应没说」
 
-    if start: # 续上了一段却没有 Content-Range，无从知道这一轮该写到哪
+    if start: # 续上了一段却没有 Content-Range，这条响应什么也没说
         return None
 
     declared = response.headers.get("Content-Length")
@@ -141,6 +136,39 @@ def expected_bytes_on_disk(response, start: int):
         return int(declared)
     except ValueError:
         return None
+
+
+def expected_bytes_on_disk(response, start: int, known_total=None):
+    """这一轮写完之后 .part 应当有多长；无从判断就返回 None。
+
+    判据按强弱排，**强的一旦拿到就不许被弱的顶掉**：
+
+    1. `known_total`——之前某一轮已经问出来的全长。它是这份文件的属性，不会
+       因为后面某条响应偷懒写了 `/*` 就失效。
+    2. 这条响应自己声明的全长（`/Z`，或首次的 `Content-Length`）。
+    3. 都没有时，退到 `Content-Range` 的**终点加一**。它只说明「这一段发完之后
+       盘上该到哪个偏移」，不能当成全长：RFC 9110 §15.3.7 允许 206 只满足所请求
+       区间的一部分（CDN 按块切分就会这样）。够检出这一段的短传，不足以证明
+       整份文件已经完整——**从头到尾都没人说过全长时，整份完整性无从验证**。
+
+    「不知道」必须是 None 而不是 0。0 一旦参与加法就会变成一个看起来合理的
+    错数：分块传输的 206 按 RFC 9110 §8.6 严禁带 Content-Length，拿
+    start + Content-Length 当全长的话，每一次收全的续传都会被判成短传。
+    """
+    if known_total is not None:
+        return known_total
+
+    declared = declared_total_size(response, start)
+    if declared is not None:
+        return declared
+
+    if not is_unencoded(response):
+        return None
+
+    parsed = parse_content_range(response)
+    if parsed is None:
+        return None
+    return parsed[1] + 1
 
 
 @dataclass(frozen=True)
@@ -206,11 +234,16 @@ class PartFile:
     所以校验子只有 open_fresh() 一个赋值点，而那同时就是「清空文件、准备
     写入这一轮字节」的那一步。不写盘的路径（错误响应、取消、退避）在构造上
     够不到它；discard() 与 promote() 在交出或丢弃文件的同时清掉它。
+
+    total 同理：它是「这份资源一共多长」，和校验子一样是这批字节的属性，因此
+    绑在同一个赋值点上。记住它才挡得住「首轮明说了 100 字节，后一轮回个
+    bytes 8-15/* 就把 16 字节当成整份文件交付」。
     """
 
     def __init__(self, path: str):
         self.path = path
         self.validator = None # 描述的就是此刻 path 里那些字节
+        self.total = None # 这份资源的全长；从没问出来过就是 None
 
     @property
     def size(self) -> int:
@@ -220,12 +253,13 @@ class PartFile:
             return 0
 
     def discard(self) -> None:
-        """丢弃残件；身份随之作废。"""
+        """丢弃残件；身份与全长随之作废。"""
         remove_part_file(self.path)
         self.validator = None
+        self.total = None
 
-    def open_fresh(self, validator):
-        """清空重写：文件内容与它的身份在同一步里一起换掉。
+    def open_fresh(self, validator, total=None):
+        """清空重写：文件内容与它的身份、全长在同一步里一起换掉。
 
         身份等文件真的建出来再赋：open() 会因磁盘满、无写权限而抛，
         先赋上就等于让这个对象短暂地描述一个并不存在的文件。
@@ -233,6 +267,7 @@ class PartFile:
         self.discard()
         handle = open(self.path, "wb")
         self.validator = validator
+        self.total = total
         return handle
 
     def open_append(self, expected_size: int):
@@ -258,6 +293,7 @@ class PartFile:
         """完整写完了，原子改名到目标位置。"""
         os.replace(self.path, save_path)
         self.validator = None
+        self.total = None
 
 
 class DownloadManager:
@@ -444,14 +480,22 @@ class DownloadManager:
                 # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
                 raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
 
+            if start == 0:
+                # 校验子与全长在这里、也只在这里设置：它们描述的就是紧接着写
+                # 进去的那批字节。有内容编码时不留校验子——下一轮的 Range 会拿
+                # 解码后的长度去请求编码后的偏移，对不上，而编码又恰好关掉了
+                # 长度校验，拼出来的东西会被当成成功交付
+                validator = response_validator(response) if is_unencoded(response) else None
+                # 整份重来，旧的全长跟着旧字节一起作废，不能带到这一轮
+                known_total = declared_total_size(response, 0)
+                handle = part.open_fresh(validator, known_total)
+            else:
+                known_total = part.total # 记住的全长描述的正是盘上这批字节
+                handle = part.open_append(start)
+
             # 「这一轮写完之后盘上该有多少字节」只由这一处回答，进度条与短传
             # 校验共用它。拿不到就是 None，绝不退化成一个能参与算术的 0
-            expected = expected_bytes_on_disk(response, start)
-            if start == 0:
-                # 校验子在这里、也只在这里设置：它描述的就是紧接着写进去的字节
-                handle = part.open_fresh(response_validator(response))
-            else:
-                handle = part.open_append(start)
+            expected = expected_bytes_on_disk(response, start, known_total)
 
             with self._lock:
                 current_state["total_size"] = expected or 0

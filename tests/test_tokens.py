@@ -4,6 +4,7 @@
 import json
 import os
 import stat
+import tempfile
 
 import pytest
 
@@ -198,3 +199,60 @@ def test_broken_file_does_not_block_a_later_save(home):
     assert tokens.load_token() is None
     assert "已保存" in tokens.save_token("tok-new")
     assert tokens.load_token() == "tok-new"
+
+
+# ---- PR 评审：残留的临时文件不许挡住此后每一次保存 ----
+
+def record_temp_names(monkeypatch) -> list:
+    """记下每次保存实际用的临时文件名。"""
+    names = []
+    original = tempfile.mkstemp
+
+    def spy(*args, **kwargs):
+        fd, name = original(*args, **kwargs)
+        names.append(name)
+        return fd, name
+
+    monkeypatch.setattr(tempfile, "mkstemp", spy)
+    return names
+
+
+def test_a_leftover_temp_file_does_not_block_saving(tmp_path):
+    """进程在改名前崩过一次，之后每一次保存都不该失败。
+
+    固定名 + O_EXCL 会让用户被钉死在旧 Token 上，只能自己去删那个文件。
+    """
+    target = str(tmp_path / "cfg" / "data.json")
+    tokens.write_private_json(target, {"token": "tok-0"})
+
+    leftover = target + ".tmp" # 上一次崩溃留下的
+    with open(leftover, "w", encoding="utf-8") as f:
+        f.write("半截内容")
+
+    tokens.write_private_json(target, {"token": "tok-1"})
+
+    with open(target, encoding="utf-8") as f:
+        assert json.load(f)["token"] == "tok-1", "新 Token 没存进去"
+
+
+def test_two_saves_do_not_use_the_same_temp_name(tmp_path, monkeypatch):
+    """两个实例同时保存：固定名会撞，唯一名不会。"""
+    target = str(tmp_path / "cfg" / "data.json")
+    names = record_temp_names(monkeypatch)
+
+    tokens.write_private_json(target, {"token": "tok-0"})
+    tokens.write_private_json(target, {"token": "tok-1"})
+
+    assert len(set(names)) == 2, "两次保存用了同一个临时文件名：%s" % names
+
+
+@posix_only
+def test_the_temp_file_is_private_and_gets_renamed_away(tmp_path, monkeypatch):
+    """临时文件一建出来就得是 0600——Token 在改名之前就已经写进去了。"""
+    target = str(tmp_path / "cfg" / "data.json")
+    names = record_temp_names(monkeypatch)
+
+    tokens.write_private_json(target, {"token": "tok-0"})
+
+    assert oct(mode_of(target)) == "0o600"
+    assert not os.path.exists(names[0]), "临时文件没被改名走"

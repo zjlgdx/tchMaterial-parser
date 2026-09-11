@@ -963,11 +963,16 @@ def test_part_file_promote_clears_identity(tmp_path):
     assert not os.path.exists(part.path)
 
 
-def _writes_to_validator(node) -> bool:
-    """这个节点是否在给某个对象的 validator 赋值。
+# PartFile 上「描述这批字节」的字段：校验子是它们的身份，total 是它们一共多长。
+# 两者同生共死，守卫也一视同仁
+PART_FILE_FIELDS = ("validator", "total")
+
+
+def _writes_to_part_file_field(node) -> bool:
+    """这个节点是否在给某个对象的 validator / total 赋值。
 
     要认全赋值的各种语法形态，漏一种这条守卫就形同虚设：属性赋值只是最常见
-    的一种，解包（part.validator, part.path = v, p 这种一行换掉身份和路径的
+    的一种，解包（part.validator, part.total = v, n 这种一行换掉身份和长度的
     写法尤其该拦）、setattr、带注解的赋值、直写 __dict__ 同样能改。
     """
     import ast
@@ -981,11 +986,11 @@ def _writes_to_validator(node) -> bool:
     for target in targets:
         # 解包目标是一棵树：a, (b, *c) = ... 里的每个叶子都是赋值点
         for leaf in ast.walk(target):
-            if isinstance(leaf, ast.Attribute) and leaf.attr == "validator":
+            if isinstance(leaf, ast.Attribute) and leaf.attr in PART_FILE_FIELDS:
                 return True
-            # part.__dict__["validator"] = x / vars(part)["validator"] = x
+            # part.__dict__["validator"] = x / vars(part)["total"] = n
             if (isinstance(leaf, ast.Subscript) and isinstance(leaf.slice, ast.Constant)
-                    and leaf.slice.value == "validator"):
+                    and leaf.slice.value in PART_FILE_FIELDS):
                 return True
 
     if isinstance(node, ast.Call):
@@ -993,13 +998,13 @@ def _writes_to_validator(node) -> bool:
             node.func.attr if isinstance(node.func, ast.Attribute) else ""
         if name in ("setattr", "__setattr__") and len(node.args) >= 2:
             key = node.args[1]
-            if isinstance(key, ast.Constant) and key.value == "validator":
+            if isinstance(key, ast.Constant) and key.value in PART_FILE_FIELDS:
                 return True
     return False
 
 
-def test_validator_is_only_assigned_inside_partfile():
-    """静态守卫：源码里不存在 PartFile 之外给 validator 赋值的写法。
+def test_part_file_fields_are_only_assigned_inside_partfile():
+    """静态守卫：源码里不存在 PartFile 之外给 validator / total 赋值的写法。
 
     赋值点一旦散出去，「记着的身份」与「文件里的字节」就能各自变化，续传随时
     可能把两份不同版本拼在一起。守住「赋值点全在 PartFile 内部」这条，就不必
@@ -1021,11 +1026,12 @@ def test_validator_is_only_assigned_inside_partfile():
     inside = range(part_cls.lineno, part_cls.end_lineno + 1)
 
     offenders = [node.lineno for node in ast.walk(tree)
-                 if _writes_to_validator(node) and node.lineno not in inside]
-    assert not offenders, "downloader.py 里 PartFile 之外有人在改 validator，行号：%s" % offenders
+                 if _writes_to_part_file_field(node) and node.lineno not in inside]
+    assert not offenders, \
+        "downloader.py 里 PartFile 之外有人在改 validator / total，行号：%s" % offenders
 
     # 上面只扫了一个文件，所以这里要保证不会有第二个文件需要扫：拿不到 PartFile
-    # 实例就改不了它的 validator。按名字去别处搜 ".validator" 是不行的——那会
+    # 实例就改不了它那两个字段。按名字去别处搜 ".validator" 是不行的——那会
     # 把任何无关类的同名属性一并指认成续传身份被污染
     users = []
     for path in sorted(glob.glob(os.path.join(src_dir, "**", "*.py"), recursive=True)):
@@ -1580,11 +1586,13 @@ def test_a_range_without_a_known_total_still_detects_a_short_transfer(tmp_path, 
                          headers={"ETag": "v1", "Content-Range": "bytes 8-15/*"})
     short.headers.pop("Content-Length", None)
 
-    session = ScriptedSession([
-        FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
-                     headers={"ETag": "v1", "Content-Length": "16"}),
-        short,
-    ])
+    # 首个响应也不能带 Content-Length，否则全长在第一轮就已知，走的是
+    # 「记住的全长」那一支，段级兜底根本不会被执行——这条用例就名不副实了
+    first = FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
+                         headers={"ETag": "v1"})
+    first.headers.pop("Content-Length", None)
+
+    session = ScriptedSession([first, short])
     manager = make_manager(session, config=AppConfig(chunk_size=8, max_retries=1))
     manager.download_file(URL, save_path)
 
@@ -1607,14 +1615,169 @@ def test_a_range_that_delivers_what_it_promised_is_accepted(tmp_path, monkeypatc
                         headers={"ETag": "v1", "Content-Range": "bytes 8-15/*"})
     full.headers.pop("Content-Length", None)
 
-    session = ScriptedSession([
-        FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
-                     headers={"ETag": "v1", "Content-Length": "16"}),
-        full,
-    ])
+    # 同上：首个响应不带 Content-Length，这条用例才真的走在段级判据上
+    first = FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
+                         headers={"ETag": "v1"})
+    first.headers.pop("Content-Length", None)
+
+    session = ScriptedSession([first, full])
     manager = make_manager(session)
     manager.download_file(URL, save_path)
 
     assert len(session.calls) == 2, "收全的续传被判成短传：%d 次请求" % len(session.calls)
     assert open(save_path, "rb").read() == b"AAAAAAAABBBBBBBB"
     assert manager.states()[0]["failed_reason"] is None
+
+
+# ---- PR 评审：已知的全长不许被 /* 顶掉 ----
+
+def test_a_total_learned_on_the_first_round_is_not_dropped_by_a_starred_range(
+        tmp_path, monkeypatch):
+    """首轮明说了 100 字节，后一轮回个 bytes 8-15/* 不能让 16 字节算交付完成。
+
+    全长是这份文件的属性，不会因为后面某条响应偷懒写了 * 就失效。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    partial = FakeResponse(206, [b"B" * 8],
+                           headers={"ETag": "v1", "Content-Range": "bytes 8-15/*"})
+    partial.headers.pop("Content-Length", None)
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"A" * 8, b"X" * 92], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "100"}),
+        partial,
+        FakeResponse(206, [b"C" * 84],
+                     headers={"ETag": "v1", "Content-Length": "84",
+                              "Content-Range": "bytes 16-99/100"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    content = open(save_path, "rb").read()
+    assert len(content) == 100, "首轮就知道该有 100 字节，却交付了 %d 字节" % len(content)
+    assert content == b"A" * 8 + b"B" * 8 + b"C" * 84
+    assert manager.states()[0]["failed_reason"] is None
+    assert range_headers(session.calls[2])["Range"] == "bytes=16-"
+
+
+def test_a_full_restart_forgets_the_total_of_the_bytes_it_discarded(tmp_path, monkeypatch):
+    """整份重来时，旧字节的全长跟着旧字节一起作废。
+
+    带到新一轮的话，会拿旧文件的长度去核新文件，一次本该成功的重下变成反复
+    短传失败——记住全长这件事必须和「记住校验子」一样绑在同一批字节上。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"OLDOLDOL", b"DXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "12"}),
+        # 校验子变了，这一轮会被丢弃并整份重下，而新文件比旧的长
+        FakeResponse(206, [b"NEWTAIL!"],
+                     headers={"ETag": "v2", "Content-Length": "8",
+                              "Content-Range": "bytes 8-15/16"}),
+        FakeResponse(200, [b"NEWNEWNE", b"WFULL!!!"],
+                     headers={"ETag": "v2", "Content-Length": "16"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert os.path.exists(save_path), \
+        "整份重下没能交付——旧的 12 字节全长被带到了新一轮：%r" % (
+            manager.states()[0]["failed_reason"],)
+    assert open(save_path, "rb").read() == b"NEWNEWNEWFULL!!!"
+
+
+def test_part_file_remembers_the_total_alongside_the_validator(tmp_path):
+    """全长与校验子同生共死：都只在 open_fresh 里设，丢弃与交出时一起清。"""
+    from tchmaterial_parser.core.downloader import PartFile
+
+    part = PartFile(str(tmp_path / "x.part"))
+    assert part.total is None
+
+    with part.open_fresh(("ETag", "v1"), 100) as f:
+        f.write(b"AAAA")
+    assert part.total == 100
+
+    with part.open_append(4) as f: # 续写不改这份资源有多长
+        f.write(b"BBBB")
+    assert part.total == 100
+
+    with part.open_fresh(("ETag", "v2"), None) as f: # 换了一份内容
+        f.write(b"CC")
+    assert part.total is None
+
+    with part.open_fresh(("ETag", "v3"), 50) as f:
+        f.write(b"DD")
+    part.discard()
+    assert part.total is None
+
+
+@pytest.mark.parametrize("headers, start, expected, why", [
+    ({"Content-Length": "100"}, 0, 100, "首次下载：Content-Length 就是全长"),
+    ({"Content-Range": "bytes 8-15/16"}, 8, 16, "/Z 是全长"),
+    ({"Content-Range": "bytes 8-15/*"}, 8, None, "写成 * 就是这条响应没说"),
+    ({"Content-Length": "100", "Content-Encoding": "gzip"}, 0, None,
+     "声明的长度描述的不是要写进文件的那些字节"),
+    ({"Content-Length": "100"}, 8, None, "续上了一段却没有 Content-Range"),
+])
+def test_declared_total_size(headers, start, expected, why):
+    """只认真正说明全长的来源，段级信息不算。"""
+    from tchmaterial_parser.core.downloader import declared_total_size
+
+    response = FakeResponse(200, headers=headers)
+    if "Content-Length" not in headers:
+        response.headers.pop("Content-Length", None)
+    assert declared_total_size(response, start) == expected, why
+
+
+def test_a_known_total_outranks_a_segment_end():
+    """强判据不许被弱判据顶掉。"""
+    from tchmaterial_parser.core.downloader import expected_bytes_on_disk
+
+    response = FakeResponse(206, headers={"Content-Range": "bytes 8-15/*"})
+    response.headers.pop("Content-Length", None)
+
+    assert expected_bytes_on_disk(response, 8, None) == 16, "没人说过全长时退到段级终点"
+    assert expected_bytes_on_disk(response, 8, 100) == 100, "已知的全长被段级终点顶掉了"
+
+
+# ---- PR 评审：编码响应不得留下可续传的校验子 ----
+
+def test_an_encoded_response_leaves_no_resumable_validator(tmp_path, monkeypatch):
+    """服务端无视 Accept-Encoding: identity 回了编码内容并断流。
+
+    Range 对的是编码后的表示，而 .part 里是解码后的字节，偏移根本对不上；
+    编码又恰好关掉了长度校验，于是拼出来的东西会被当成成功交付。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"A" * 8, b"X" * 8], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "16",
+                              "Content-Encoding": "gzip"}),
+        FakeResponse(200, [b"N" * 8, b"N" * 8],
+                     headers={"ETag": "v1", "Content-Length": "16"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert range_headers(session.calls[1]) == {}, \
+        "拿编码响应的校验子去续传了：%r" % (range_headers(session.calls[1]),)
+    assert open(save_path, "rb").read() == b"N" * 16, "没有整份重下"
+    assert manager.states()[0]["failed_reason"] is None
+
+
+@pytest.mark.parametrize("value, unencoded", [
+    (None, True), ("", True), ("identity", True), (" IDENTITY ", True),
+    ("gzip", False), ("br", False), ("deflate", False), ("gzip, identity", False),
+])
+def test_is_unencoded(value, unencoded):
+    """同一个判断同时管着长度与偏移，两处共用它。"""
+    from tchmaterial_parser.core.downloader import is_unencoded
+
+    headers = {} if value is None else {"Content-Encoding": value}
+    assert is_unencoded(FakeResponse(200, headers=headers)) is unencoded

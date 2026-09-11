@@ -4,6 +4,7 @@
 import json
 import logging
 import os
+import tempfile
 
 from .. import config
 
@@ -72,12 +73,20 @@ def write_private_json(path: str, payload: dict) -> None:
     已存在的 0644 文件会让 Token 先以宽松权限落盘，进程若在收紧权限前中断，
     那个宽松权限还会一直留着。os.replace 保留的是临时文件的权限位，
     目标文件因此从不以宽松权限承载 Token。
-    """
-    os.makedirs(os.path.dirname(path), mode=DIR_MODE, exist_ok=True)
 
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, FILE_MODE)
+    临时文件的名字必须是唯一的。用固定的 .tmp 名，进程在改名前崩一次就会留下
+    它，此后每一次保存都撞上 FileExistsError——用户被钉死在旧 Token 上，除非
+    自己去删那个文件；两个实例同时保存也会撞。mkstemp 建出来就是 0600，与这里
+    要的权限一致，崩溃留下的至多是个孤儿文件，挡不住下一次保存。
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=DIR_MODE, exist_ok=True)
+
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=os.path.basename(path) + ".", suffix=".tmp")
     try:
+        # mkstemp 建出来就是 0600，这里仍显式设一次：文件权限是这个函数的安全
+        # 要求，不该悄悄搭在某个库的默认值上
+        os.fchmod(fd, FILE_MODE)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=4)
         os.replace(tmp, path)
