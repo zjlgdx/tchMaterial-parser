@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""Access Token 的持久化与文件权限（C5）。"""
+
+import json
+import os
+import stat
+
+import pytest
+
+from tchmaterial_parser.core import tokens
+
+WINDOWS = tokens.config.os_name == "Windows"
+posix_only = pytest.mark.skipif(WINDOWS, reason="文件权限只在 POSIX 上有意义")
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    """把配置目录指到临时路径，绝不碰用户真实的 Token。"""
+    cfg = tmp_path / "config"
+    monkeypatch.setattr(tokens.config, "config_dir", lambda: str(cfg))
+    monkeypatch.setattr(tokens.config, "legacy_linux_config_file",
+                        lambda: str(tmp_path / "legacy" / "data.json"))
+    return tmp_path
+
+
+def mode_of(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+@posix_only
+def test_round_trip(home):
+    message = tokens.save_token("tok-abc")
+    assert "已保存" in message
+    assert tokens.load_token() == "tok-abc"
+
+
+@posix_only
+def test_new_file_is_private(home):
+    tokens.save_token("tok-abc")
+    assert oct(mode_of(tokens.data_file())) == "0o600"
+
+
+@posix_only
+def test_directory_is_private(home):
+    tokens.save_token("tok-abc")
+    assert oct(mode_of(os.path.dirname(tokens.data_file()))) == "0o700"
+
+
+@posix_only
+def test_existing_world_readable_file_is_tightened(home):
+    """面板采纳项：预置一个 0o644 的旧文件，写入后必须变成 0o600。"""
+    target = tokens.data_file()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump({"access_token": "old"}, f)
+    os.chmod(target, 0o644)
+    assert oct(mode_of(target)) == "0o644"
+
+    tokens.save_token("tok-new")
+
+    assert oct(mode_of(target)) == "0o600"
+    assert tokens.load_token() == "tok-new"
+
+
+@posix_only
+def test_target_never_holds_the_token_with_loose_permissions(home, monkeypatch):
+    """写入过程中目标文件不得以宽松权限承载新 Token。
+
+    在 os.replace 发生前拦一刀：此刻目标文件要么还是旧内容，要么不存在——
+    新 Token 只存在于那个 0600 的临时文件里。
+    """
+    target = tokens.data_file()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        json.dump({"access_token": "old"}, f)
+    os.chmod(target, 0o644)
+
+    observed = {}
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        observed["tmp_mode"] = oct(mode_of(src))
+        observed["tmp_holds_new"] = "tok-new" in open(src, encoding="utf-8").read()
+        observed["target_content"] = open(dst, encoding="utf-8").read() if os.path.exists(dst) else ""
+        observed["target_mode"] = oct(mode_of(dst)) if os.path.exists(dst) else None
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(tokens.os, "replace", spy_replace)
+    tokens.save_token("tok-new")
+
+    assert observed["tmp_mode"] == "0o600"          # 临时文件一建出来就是私有的
+    assert observed["tmp_holds_new"] is True        # 新 Token 只在临时文件里
+    assert "tok-new" not in observed["target_content"]  # replace 之前目标里没有它
+    assert oct(mode_of(target)) == "0o600"          # replace 之后目标是私有的
+
+
+@posix_only
+def test_legacy_path_is_still_readable(home, tmp_path):
+    """v3.1 及以前写在 ~/.config 下的 Token 仍要读得出来。"""
+    legacy = tmp_path / "legacy" / "data.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"access_token": "legacy-tok"}), encoding="utf-8")
+    assert tokens.load_token() == "legacy-tok"
+
+
+@posix_only
+def test_new_path_wins_over_legacy(home, tmp_path):
+    legacy = tmp_path / "legacy" / "data.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(json.dumps({"access_token": "legacy-tok"}), encoding="utf-8")
+    tokens.save_token("new-tok")
+    assert tokens.load_token() == "new-tok"
+
+
+def test_missing_token_returns_none(home):
+    assert tokens.load_token() is None
+
+
+@posix_only
+def test_corrupted_file_is_ignored(home):
+    target = tokens.data_file()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("{not json")
+    assert tokens.load_token() is None
+
+
+@posix_only
+def test_write_failure_reports_the_truth(home, monkeypatch):
+    """C5：写不进去就必须说写不进去，不许谎报成功。"""
+    def boom(*args, **kwargs):
+        raise OSError("只读文件系统")
+
+    monkeypatch.setattr(tokens, "write_private_json", boom)
+    message = tokens.save_token("tok-abc")
+
+    assert "保存失败" in message
+    assert "已保存" not in message
+    assert "只读文件系统" in message
+
+
+@posix_only
+def test_no_temp_file_left_behind_on_failure(home, monkeypatch):
+    target = tokens.data_file()
+    real_replace = os.replace
+
+    def boom_replace(src, dst):
+        raise OSError("改名失败")
+
+    monkeypatch.setattr(tokens.os, "replace", boom_replace)
+    message = tokens.save_token("tok-abc")
+    monkeypatch.setattr(tokens.os, "replace", real_replace)
+
+    assert "保存失败" in message
+    directory = os.path.dirname(target)
+    assert [n for n in os.listdir(directory) if n.endswith(".tmp")] == []
