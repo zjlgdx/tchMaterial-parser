@@ -300,27 +300,31 @@ class DownloadManager:
         return self._executor
 
     def submit(self, url: str, save_path: str):
-        """登记任务并投递。
+        """投递任务并登记。
 
-        登记必须发生在这里而不是工作线程里：线程池排队的任务、调用方还没
-        解析完的后续链接，都还不在 _states 里；把「是否全部完成」建立在
-        「此刻已登记的那几条」之上，第一个跑完的任务就会被当成全部跑完。
+        登记必须发生在这里、由调用方线程同步完成，而不是挪进工作线程：线程池
+        排队的任务、调用方还没解析完的后续链接，都还不在 _states 里；把「是否
+        全部完成」建立在「此刻已登记的那几条」之上，第一个跑完的任务就会被当成
+        全部跑完。
+
+        登记排在投递之后：ThreadPoolExecutor 是先入队再起线程，起线程失败时
+        那条任务可能已经在队列里、待会真的会跑。先登记再投递的话，为这种失败
+        补一个「就地判死」反而更糟——all_finished 会提前为真（弹完成框、解禁
+        按钮、下一批 reset 掉 _states），而那条 worker 还在写文件。反过来，
+        投递成功之后再登记，失败路径上压根没有半截状态需要收拾。
         """
         state = new_download_state(url, save_path)
+        try:
+            future = self._ensure_executor().submit(self.download_file, url, save_path, state)
+        except Exception as e:
+            # 不归还文件名预留：那条任务可能仍会跑，归还就可能把同一个路径再发给
+            # 另一条 worker，两边同时写一个 .part。代价只是下次重下时名字带个 (2)
+            logger.warning("下载任务投递失败：%s（%s）", url, e)
+            raise
+
         with self._lock:
             self._states.append(state)
-        try:
-            return self._ensure_executor().submit(self.download_file, url, save_path, state)
-        except Exception as e:
-            # 登记在前、投递在后，中间出岔子（线程起不来、池已关闭）就会留下一条
-            # 永远翻不成 finished 的幽灵状态：all_finished 恒假，按钮永久置灰，
-            # 关窗永远弹「下载任务未完成」。就地判它失败，再把异常交出去
-            logger.warning("下载任务投递失败：%s（%s）", url, e)
-            with self._lock:
-                state["finished"] = True
-                state["failed_reason"] = str(e)
-            naming.release_path(save_path)
-            raise
+        return future
 
     def cancel_all(self) -> None:
         """关窗时调用。

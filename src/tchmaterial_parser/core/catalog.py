@@ -248,7 +248,7 @@ class ResourceHelper: # 获取网站上资源的数据
                 raise
 
         if skipped_pages:
-            logger.warning("资源目录构建完成，%d/%d 个课本列表文件不是数组，整页跳过",
+            logger.warning("资源目录构建完成，%d/%d 个课本列表文件不可用，整页跳过",
                            skipped_pages, total)
         if skipped:
             logger.warning("资源目录构建完成，跳过 %d 条无法解析的条目", skipped)

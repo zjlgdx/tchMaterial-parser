@@ -288,16 +288,16 @@ class App:
 
         self.download_btn.config(state="disabled") # 设置下载按钮为禁用状态
 
-        urls = self.input_urls()
         failed_links = []
         submitted = 0 # 已投递的下载线程数；只要不为 0，解禁按钮的权力就归完成回调
 
-        # try 从置灰的下一行就开始：选目录对话框在某些桌面环境会抛，异常被 Tk
-        # 的回调处理器吞掉只记一行日志，按钮就永远停在 disabled 上。
+        # try 从置灰的下一行就开始：读输入框、选目录对话框在某些桌面环境都会抛，
+        # 异常被 Tk 的回调处理器吞掉只记一行日志，按钮就永远停在 disabled 上。
         # 整批提交完了才开闸让轮询器判定——放在循环里开的话，只要循环中途跑过
         # 一次嵌套事件循环（模态对话框就会），轮询器就可能看到「才登记了两个、
         # 而这两个恰好都跑完了」的半截快照，把它当成整批结束
         try:
+            urls = self.input_urls()
             if len(urls) > 1:
                 messagebox.showinfo("提示", "您选择了多个链接，将在选定的文件夹中使用教材名称作为文件名进行下载。")
                 dir_path = filedialog.askdirectory() # 选择文件夹

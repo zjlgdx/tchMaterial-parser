@@ -164,3 +164,36 @@ def test_cancel_mid_flight_exits_within_one_list_file():
     assert len(parsed) == 1, "取消后又多处理了文件：%s" % parsed
     transferred = [w for w in session.windows if w[0] in LIST_URLS]
     assert len(transferred) <= 2, "取消后还在继续传输：%s" % transferred
+
+
+def test_cancellation_is_not_swallowed_by_the_page_level_tolerance():
+    """关窗信号不许被整页容错吞掉（R6 P2-6）。
+
+    传输结束后的那次 _check_cancelled() 就在整页容错的 try 里。
+    CatalogCancelled 现在不是 NetworkError / UpstreamFormatError 的子类所以
+    穿得过去，但一旦有人把 except 放宽成 Exception，取消就会被记成「这一页
+    不可用」然后接着拉下一页——关窗之后目录线程还在闷头拉那四十余 MB。
+
+    直接调 _load_one_list，而不是走 fetch_tree：循环外还有一次
+    _check_cancelled()，它会在下一页补上，把「吞掉」这件事整个掩盖过去。
+    """
+    session = TimedSession(transfer_delay=0)
+    helper = make_helper(session, workers=1)
+
+    class CancelRightAfterTransfer:
+        """传输刚结束就关窗，正好落在 try 内那次检查之前。"""
+
+        def __init__(self, inner):
+            self.inner = inner
+            self.headers = inner.headers
+            self.proxies = inner.proxies
+
+        def get(self, url, **kwargs):
+            response = self.inner.get(url, **kwargs)
+            helper.cancel()
+            return response
+
+    helper.client.session = CancelRightAfterTransfer(session)
+
+    with pytest.raises(CatalogCancelled):
+        helper._load_one_list(LIST_URLS[0], {}, threading.Lock())

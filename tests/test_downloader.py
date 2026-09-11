@@ -1233,13 +1233,14 @@ def test_a_short_transfer_is_not_promoted_as_a_complete_file(tmp_path, monkeypat
     assert "与服务端声明的不符" in manager.states()[0]["failed_reason"]
 
 
-# ---- R5-P2-7：登记之后投递失败，不许留下永远跑不完的幽灵状态 ----
+# ---- R5-P2-7 / R6-P2-5：投递失败不许留下任何半截痕迹 ----
 
-def test_a_failed_submit_does_not_leave_an_unfinishable_task(tmp_path, monkeypatch):
-    """线程起不来时那条状态必须就地判死。
+def test_a_failed_submit_registers_nothing(tmp_path, monkeypatch):
+    """投递失败时那条任务压根不该被登记。
 
-    否则 all_finished 恒假：按钮永久置灰、关窗永远弹「下载任务未完成」，
-    而且没有任何一条线程会来把它翻成完成。
+    登记了又没人跑，all_finished 恒假：按钮永久置灰、关窗永远弹「下载任务
+    未完成」。而补一个「就地判死」比不登记更糟——ThreadPoolExecutor 是先入队
+    再起线程，那条任务可能仍会跑，判死会让 all_finished 提前为真。
     """
     manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
     save_path = str(tmp_path / "书.pdf")
@@ -1253,15 +1254,18 @@ def test_a_failed_submit_does_not_leave_an_unfinishable_task(tmp_path, monkeypat
     with pytest.raises(RuntimeError):
         manager.submit(URL, save_path)
 
-    assert manager.all_finished() is True, "留下了一条永远跑不完的任务"
-    state = manager.states()[0]
-    assert state["finished"] is True
-    assert "can't start new thread" in state["failed_reason"]
-    assert manager.snapshot().all_finished is True
+    assert manager.states() == [], "投递失败却留下了状态：%r" % (manager.states(),)
+    assert manager.all_finished() is True
+    assert manager.snapshot().all_finished is False # 一条都没有，谈不上「整批完成」
 
 
-def test_a_failed_submit_gives_the_reserved_name_back(tmp_path, monkeypatch):
-    """投递失败后重试同一本教材，仍要拿回不带序号的原名。"""
+def test_a_failed_submit_keeps_the_reservation(tmp_path, monkeypatch):
+    """投递失败不归还文件名预留。
+
+    ThreadPoolExecutor 先入队再起线程，起线程失败时那条任务可能仍会跑。
+    此刻归还预留，下一条任务就可能拿到同一个路径，两条 worker 同时写一个
+    .part——用「下次重下时名字带个 (2)」换掉一次静默的文件损坏。
+    """
     manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
     first = build_save_path(str(tmp_path), "语文一年级上册")
 
@@ -1273,7 +1277,33 @@ def test_a_failed_submit_gives_the_reserved_name_back(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         manager.submit(URL, first)
 
-    assert build_save_path(str(tmp_path), "语文一年级上册") == first, "预留没有归还"
+    assert build_save_path(str(tmp_path), "语文一年级上册") != first, \
+        "预留被归还了，下一条任务会拿到同一个路径"
+
+
+def test_a_queued_task_that_still_runs_is_not_declared_dead(tmp_path, monkeypatch):
+    """起线程失败但任务已入队：它照样会跑完，期间不许有人宣布整批结束。"""
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"payload!"])))
+    save_path = str(tmp_path / "书.pdf")
+
+    real = manager._ensure_executor()
+
+    class QueueThenFail:
+        """复刻 ThreadPoolExecutor 的顺序：先入队，再起线程（起线程这步抛）。"""
+
+        def submit(self, fn, *args, **kwargs):
+            real.submit(fn, *args, **kwargs)
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(manager, "_ensure_executor", lambda: QueueThenFail())
+
+    with pytest.raises(RuntimeError):
+        manager.submit(URL, save_path)
+
+    real.shutdown(wait=True) # 等那条仍然入了队的任务跑完
+
+    assert manager.states() == [], "把一条仍会跑的任务登记进了状态表"
+    assert open(save_path, "rb").read() == b"payload!", "入了队的任务没跑完"
 
 
 # ---- R5-P2-8：头名大小写不敏感 ----

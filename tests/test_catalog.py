@@ -348,7 +348,10 @@ def test_any_kind_of_unusable_page_is_skipped_not_fatal(bad_response, fragment, 
 
     assert {book_id for book_id, _ in leaves(tree)} == {"b1"}, "坏的那一页把好的带走了"
     assert helper.skipped_pages == 1
-    assert any("整页跳过" in r.getMessage() for r in caplog.records)
+    # 原因要落到日志里：四种不可用共用一条跳过路径，分不清是哪一种就没法排查
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("整页跳过" in m for m in messages), messages
+    assert any(fragment in m for m in messages), (fragment, messages)
 
 
 @pytest.mark.parametrize("bad_response, fragment", [
@@ -383,3 +386,24 @@ def test_an_expired_token_is_reported_as_such_not_as_a_format_error():
     with pytest.raises(AuthError) as excinfo:
         catalog.ResourceHelper(client).fetch_tree()
     assert "Token" in str(excinfo.value)
+
+
+def test_the_summary_line_does_not_claim_every_skipped_page_was_not_an_array(caplog):
+    """整页不可用有四种形态，汇总行不该只说其中一种（R6 P2-3）。"""
+    good = "https://example.invalid/good.json"
+    bad = "https://example.invalid/bad.json"
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(
+            200, json_data={"urls": "%s,%s" % (bad, good)}),
+        bad: requests.ConnectionError("dropped"), # 连不上，与「不是数组」无关
+        good: FakeResponse(200, json_data=[book("b1", "语文一年级上册")]),
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+
+    with caplog.at_level(logging.WARNING, logger="tchmaterial_parser.core.catalog"):
+        catalog.ResourceHelper(client).fetch_tree()
+
+    summary = [m for m in (r.getMessage() for r in caplog.records) if "资源目录构建完成" in m]
+    assert summary, [r.getMessage() for r in caplog.records]
+    assert not any("不是数组" in m for m in summary), summary

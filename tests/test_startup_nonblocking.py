@@ -606,14 +606,42 @@ def test_refusing_a_second_batch_does_not_disturb_the_running_one(monkeypatch):
 
     app.downloads._states.append(new_download_state("u", "/tmp/x.pdf")) # 还没跑完
     app.download_session = True
-    app.download_btn.config(state="disabled")
+    # 故意让按钮先处于 normal：否则「被这次调用重新置灰」与「本来就是灰的」
+    # 在断言里分不开，置灰与 reset() 的先后顺序就钉不住
+    app.download_btn.config(state="normal")
     monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
 
     app.download()
 
     assert app.download_session is True, "在飞的那一批被这次调用关掉了闸门"
-    assert str(app.download_btn.cget("state")) == "disabled", "任务还在飞，按钮却被解禁了"
+    assert str(app.download_btn.cget("state")) == "normal", \
+        "这次调用什么都没做成，却把按钮置灰了"
 
     monkeypatch.undo()
     app.downloads._states.clear()
+    app.root.destroy()
+
+
+def test_input_urls_blowing_up_still_frees_the_button(monkeypatch):
+    """读输入框这一步同样要被兜底盖住（R6 P2-2）。
+
+    注释写着「try 从置灰的下一行就开始」，那就得真的如此——它在 try 之外时
+    一样会把按钮永久留在 disabled 上。
+    """
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    app = app_module.App()
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    monkeypatch.setattr(app, "input_urls",
+                        lambda: (_ for _ in ()).throw(RuntimeError("输入框读挂了")))
+
+    with pytest.raises(RuntimeError):
+        app.download()
+
+    assert str(app.download_btn.cget("state")) == "normal", "按钮卡在 disabled 上"
+    assert app.download_session is False
+
+    monkeypatch.undo()
     app.root.destroy()
