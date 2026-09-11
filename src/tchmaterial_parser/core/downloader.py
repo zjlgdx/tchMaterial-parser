@@ -102,6 +102,50 @@ class DownloadSnapshot:
         return "\n".join(f"{url}，原因：{reason}" for url, reason in self.failures)
 
 
+class PartFile:
+    """下载中的 .part 文件，以及它里面那些字节的身份。
+
+    校验子曾经被单独维护在一个字典里，于是「记着的身份」和「文件里真实的
+    字节」会在各种分支上悄悄脱钩——三轮评审抓到过三条不同的路径：校验太松、
+    整份重下时忘了清、错误响应也参与赋值。根因是同一个：两者本该是一体的。
+
+    这里把它们绑死：校验子只有一个赋值点，就在 open_fresh() 里，而那同时
+    也是「把文件清空、准备写入这一轮字节」的那一步。不写盘的分支（错误响应、
+    取消、退避）在构造上就够不到它；任何丢弃 .part 的地方都会同步清掉它。
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.validator = None # 描述的就是此刻 path 里那些字节
+
+    @property
+    def size(self) -> int:
+        try:
+            return os.path.getsize(self.path)
+        except OSError:
+            return 0
+
+    def discard(self) -> None:
+        """丢弃残件；身份随之作废。"""
+        remove_part_file(self.path)
+        self.validator = None
+
+    def open_fresh(self, validator):
+        """清空重写：文件内容与它的身份在同一步里一起换掉。"""
+        self.discard()
+        self.validator = validator
+        return open(self.path, "wb")
+
+    def open_append(self):
+        """续写：文件里已有的字节仍然属于 self.validator 描述的那份资源。"""
+        return open(self.path, "ab")
+
+    def promote(self, save_path: str) -> None:
+        """完整写完了，原子改名到目标位置。"""
+        os.replace(self.path, save_path)
+        self.validator = None
+
+
 class DownloadCancelled(Exception):
     """关窗时置位取消标志，正在下载的任务据此提前退出。"""
 
@@ -265,19 +309,8 @@ class DownloadManager:
 
         return response, resume_from
 
-    def _download_once(self, url: str, part_path: str, current_state: dict,
-                       resume_from: int, ctx: dict):
-        response, start = self._open_stream(url, resume_from, ctx.get("validator"))
-
-        # 校验子要在拿到响应头的当下就记住：中途断流时这一轮不会走到结尾，
-        # 而那恰恰是下一轮需要拿它去续传的场合。
-        # 从零重下时必须无条件覆盖，包括覆盖成 None——否则 .part 里换成了这一轮的
-        # 字节，ctx 里却留着上一轮的 ETag，下次续传三项检查全过，直接拼出损坏文件
-        seen = response_validator(response)
-        if start == 0:
-            ctx["validator"] = seen
-        elif ctx.get("validator") is None and seen is not None:
-            ctx["validator"] = seen
+    def _download_once(self, url: str, part: PartFile, current_state: dict, resume_from: int):
+        response, start = self._open_stream(url, resume_from, part.validator)
 
         if response.status_code >= 400:
             # stream=True 的响应不消费也不关闭，连接要等 GC 才归还
@@ -289,17 +322,20 @@ class DownloadManager:
             # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
             raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
 
+        declared = int(response.headers.get("Content-Length", 0))
         if start == 0:
-            remove_part_file(part_path) # 从零重来，旧残件先清掉
-            total = int(response.headers.get("Content-Length", 0))
+            total = declared
+            # 校验子在这里、也只在这里设置：它描述的就是紧接着写进去的字节
+            handle = part.open_fresh(response_validator(response))
         else:
-            total = start + int(response.headers.get("Content-Length", 0))
+            total = start + declared
+            handle = part.open_append()
 
         with self._lock:
             current_state["total_size"] = total
             current_state["downloaded_size"] = start
 
-        with open(part_path, "ab" if start else "wb") as file:
+        with handle as file:
             for chunk in response.iter_content(chunk_size=self.config.chunk_size):
                 if self._cancelled.is_set():
                     raise DownloadCancelled()
@@ -314,8 +350,8 @@ class DownloadManager:
             with self._lock:
                 self._states.append(current_state)
 
-        part_path = save_path + ".part" # 先写临时文件，写完整了才改名，失败时不会留下能被当成课本打开的半截 PDF
-        ctx = {} # 跨重试保留的上下文，目前只有续传校验子
+        # 先写临时文件，写完整了才改名，失败时不会留下能被当成课本打开的半截 PDF
+        part = PartFile(save_path + ".part")
         failed_reason = None
 
         try:
@@ -327,10 +363,12 @@ class DownloadManager:
                 with self._lock:
                     current_state["attempts"] = attempt + 1
 
-                resume_from = os.path.getsize(part_path) if (attempt and os.path.exists(part_path)) else 0
+                # 第一轮不续上一次运行留下的残件：跨进程续传无法确认它还对应
+                # 同一份远端文件
+                resume_from = part.size if attempt else 0
                 try:
-                    self._download_once(url, part_path, current_state, resume_from, ctx)
-                    os.replace(part_path, save_path) # 只有完整写完才会出现目标文件
+                    self._download_once(url, part, current_state, resume_from)
+                    part.promote(save_path) # 只有完整写完才会出现目标文件
                     failed_reason = None
                     break
                 except DownloadCancelled:
@@ -352,7 +390,7 @@ class DownloadManager:
                     break
         finally:
             if failed_reason is not None:
-                remove_part_file(part_path)
+                part.discard()
                 logger.warning("下载失败：%s（%s）", url, failed_reason)
 
             naming.release_path(save_path) # 归还预留的文件名，失败重下时还能拿回原名

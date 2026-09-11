@@ -820,3 +820,138 @@ def test_progress_survives_a_missing_content_length(tmp_path):
     assert snapshot.downloaded_size == 8, snapshot
     assert snapshot.percent == 100.0
     assert "0.0 字节/0.0 字节" not in snapshot.progress_text()
+
+
+# ---- R3-P0-1：不写盘的响应不得动 .part 的身份 ----
+
+def test_transient_error_does_not_destroy_the_resume_state(tmp_path, monkeypatch):
+    """一个瞬时 503 不该让已落盘的字节作废。
+
+    错误响应压根不写盘，却曾经参与设置校验子——于是重试时续传头整个丢掉，
+    40 MB 下到一半的教材要从零重来。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    blip = FakeResponse(503)
+    blip.headers.clear() # 错误页不带 ETag
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "16"}),
+        blip,
+        FakeResponse(206, [b"BBBBBBBB"],
+                     headers={"ETag": "v1", "Content-Length": "8",
+                              "Content-Range": "bytes 8-15/16"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    third = session.calls[2][1]
+    assert third.get("Range") == "bytes=8-", "503 之后续传头丢了：%r" % third
+    assert third.get("If-Range") == "v1", "503 之后 If-Range 丢了：%r" % third
+    assert open(save_path, "rb").read() == b"AAAAAAAABBBBBBBB"
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_error_page_etag_does_not_poison_the_validator(tmp_path, monkeypatch):
+    """错误页自带 ETag 时，不得把它当成 .part 里字节的身份。
+
+    否则下一轮 If-Range 用的是错误页的 ETag，远端新版本恰好同值就会通过校验，
+    把新版本的后半段接在旧版本前缀上。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"OLDX", b"XXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "8"}),
+        FakeResponse(502, headers={"ETag": "v2"}), # 错误页带着新版本的 ETag
+        FakeResponse(206, [b"NEW2"],
+                     headers={"ETag": "v2", "Content-Length": "4",
+                              "Content-Range": "bytes 4-7/8"}),
+        FakeResponse(200, [b"NEW1", b"NEW2"], headers={"ETag": "v2", "Content-Length": "8"}),
+    ])
+    manager = make_manager(session, config=AppConfig(chunk_size=4, max_retries=3))
+    manager.download_file(URL, save_path)
+
+    assert session.calls[2][1].get("If-Range") == "v1", \
+        "错误页的 ETag 污染了校验子：%r" % (session.calls[2][1],)
+
+    content = open(save_path, "rb").read()
+    assert content != b"OLDXNEW2", "拼出了「旧版本前缀 + 新版本后半段」"
+    assert content == b"NEW1NEW2", content
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_part_file_binds_bytes_and_identity(tmp_path):
+    """PartFile 的不变量：校验子描述的永远是文件里此刻那些字节。"""
+    from tchmaterial_parser.core.downloader import PartFile
+
+    part = PartFile(str(tmp_path / "x.part"))
+    assert part.validator is None and part.size == 0
+
+    with part.open_fresh(("ETag", "v1")) as f:
+        f.write(b"AAAA")
+    assert part.validator == ("ETag", "v1")
+    assert part.size == 4
+
+    # 续写不改身份：文件里的字节仍属于同一份资源
+    with part.open_append() as f:
+        f.write(b"BBBB")
+    assert part.validator == ("ETag", "v1")
+    assert part.size == 8
+
+    # 换一份内容，身份必须跟着换
+    with part.open_fresh(None) as f:
+        f.write(b"CC")
+    assert part.validator is None
+    assert part.size == 2
+
+    # 丢弃残件，身份随之作废
+    part.discard()
+    assert part.validator is None and part.size == 0
+
+
+def test_part_file_promote_clears_identity(tmp_path):
+    from tchmaterial_parser.core.downloader import PartFile
+
+    target = str(tmp_path / "书.pdf")
+    part = PartFile(target + ".part")
+    with part.open_fresh(("ETag", "v1")) as f:
+        f.write(b"DONE")
+
+    part.promote(target)
+    assert open(target, "rb").read() == b"DONE"
+    assert part.validator is None
+    assert not os.path.exists(part.path)
+
+
+def test_validator_is_only_assigned_inside_partfile():
+    """结构性保证：校验子只有 PartFile 能改。
+
+    前三轮评审抓到的是同一个根因的三条路径——「记着的身份」与「文件里的字节」
+    在各个分支上脱钩。现在赋值点全部收在 PartFile 内部，且每一处都与文件内容的
+    变化同时发生，不写盘的分支在构造上就够不到它。
+    """
+    import ast
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "src", "tchmaterial_parser", "core", "downloader.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+
+    part_cls = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.ClassDef) and n.name == "PartFile")
+    inside = range(part_cls.lineno, part_cls.end_lineno + 1)
+
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AugAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if isinstance(target, ast.Attribute) and target.attr == "validator":
+                if node.lineno not in inside:
+                    offenders.append(node.lineno)
+
+    assert not offenders, "PartFile 之外有人在改 validator，行号：%s" % offenders
