@@ -242,3 +242,66 @@ def test_closing_asks_before_cancelling_live_downloads(monkeypatch):
     monkeypatch.undo()
     app.downloads._states.clear()
     app.root.destroy()
+
+
+def test_completion_gate_opens_only_after_the_whole_batch_is_submitted():
+    """整批提交完了才允许轮询器判定。
+
+    若在循环里逐个开闸，只要循环中途跑过一次嵌套事件循环（模态对话框就会），
+    轮询器就可能看到「才登记了两个、而这两个恰好都跑完了」的半截快照。
+    """
+    import ast
+    import os as _os
+
+    path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                         "src", "tchmaterial_parser", "ui", "app.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "download")
+
+    loops = [n for n in ast.walk(fn) if isinstance(n, ast.For)]
+    assert loops, "download() 里没有投递循环"
+    in_loop = [n for loop in loops for n in ast.walk(loop)
+               if isinstance(n, ast.Assign)
+               and any(getattr(t, "attr", None) == "download_session" for t in n.targets)]
+    assert not in_loop, "开闸动作还在投递循环里"
+
+    after_loop = [n for n in ast.walk(fn)
+                  if isinstance(n, ast.Assign)
+                  and any(getattr(t, "attr", None) == "download_session" for t in n.targets)]
+    assert after_loop, "找不到开闸动作"
+
+
+def test_poller_ignores_snapshots_while_the_gate_is_closed(monkeypatch):
+    """闸门未开时，轮询器不该因为「此刻恰好没有在飞任务」就报完成。"""
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    finished = []
+    monkeypatch.setattr(app, "finish_downloads", lambda snapshot: finished.append(snapshot))
+
+    # 造出一个「已登记两个、都已完成」的半截快照
+    for i in range(2):
+        app.downloads._states.append({"download_url": "u%d" % i, "save_path": "/tmp/x.pdf",
+                                      "downloaded_size": 8, "total_size": 8,
+                                      "finished": True, "failed_reason": None})
+
+    app.download_session = False # 闸门未开
+    app.poll_downloads()
+    assert finished == [], "闸门没开就报了完成"
+
+    app.download_session = True
+    app.poll_downloads()
+    assert len(finished) == 1, "闸门开了之后应当恰好报一次完成"
+
+    app.poll_downloads()
+    assert len(finished) == 1, "完成通知重复触发"
+
+    monkeypatch.undo()
+    app.downloads._states.clear()
+    app.root.destroy()

@@ -322,7 +322,11 @@ class App:
 
             self.downloads.submit(resource_url, save_path)
             submitted += 1
-            self.download_session = True # 登记已经发生，轮询器可以开始判定了
+
+        # 整批提交完了才开闸让轮询器判定。放在循环里开的话，只要循环中途跑过
+        # 一次嵌套事件循环（模态对话框就会），轮询器就可能看到「才登记了两个、
+        # 而这两个恰好都跑完了」的半截快照，把它当成整批结束
+        self.download_session = submitted > 0
 
         if failed_links:
             messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + format_failures(failed_links))
