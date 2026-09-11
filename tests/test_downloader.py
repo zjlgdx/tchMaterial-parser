@@ -441,3 +441,62 @@ def test_build_save_path_sanitises_and_dedupes(tmp_path):
     second = build_save_path(str(tmp_path), title)
     assert os.path.basename(first) == "义务教育教科书_英语三年级下册.pdf"
     assert os.path.basename(second) == "义务教育教科书_英语三年级下册 (2).pdf"
+
+
+# ---- P0-2：续传校验必须严格 ----
+
+@pytest.mark.parametrize("resume_headers, label", [
+    ({}, "206 不带任何校验子"),
+    ({"Content-Length": "8"}, "206 只带与首次不同类型的校验子"),
+])
+def test_resume_without_matching_validator_restarts(tmp_path, monkeypatch, resume_headers, label):
+    """服务端接受 Range 却忽略 If-Range 时，必须丢弃 .part 从零重下。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    first = FakeResponse(200, [b"OLDOLDOL", b"DXXX"], boom_after=1,
+                         headers={"ETag": "v1", "Content-Length": "12"})
+    stale = FakeResponse(206, [b"NEWTAIL!"], headers=dict(resume_headers))
+    stale.headers.pop("Content-Length", None)
+    stale.headers.update(resume_headers)
+    fresh = FakeResponse(200, [b"NEWNEWNE", b"WFULL!!!"],
+                         headers={"ETag": "v2", "Content-Length": "16"})
+
+    session = ScriptedSession([first, stale, fresh])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    content = open(save_path, "rb").read()
+    assert b"OLD" not in content, "%s：拼出了旧文件前缀 + 新文件后缀" % label
+    assert content == b"NEWNEWNEWFULL!!!", content
+    assert stale.closed is True, "%s：没有关掉那个不可信的续传响应" % label
+    assert session.calls[2][1] == {}, "%s：重下时仍带着 Range" % label
+
+
+def test_416_restarts_from_scratch(tmp_path, monkeypatch):
+    """.part 比远端还长时服务端回 416：必须整份重下，而不是反复撞 416。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    first = FakeResponse(200, [b"AAAA", b"BBBB"], boom_after=1,
+                         headers={"ETag": "v1", "Content-Length": "8"})
+    too_long = FakeResponse(416, headers={"ETag": "v1"})
+    fresh = FakeResponse(200, [b"CCCC"], headers={"ETag": "v1", "Content-Length": "4"})
+
+    session = ScriptedSession([first, too_long, fresh])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert open(save_path, "rb").read() == b"CCCC"
+    assert manager.states()[0]["failed_reason"] is None
+    assert session.calls[2][1] == {}, "416 之后仍带着 Range"
+    assert too_long.closed is True
+
+
+def test_content_length_alone_is_not_a_validator():
+    """206 的 Content-Length 是剩余长度，不能拿来当 If-Range。"""
+    from tchmaterial_parser.core.downloader import VALIDATOR_HEADERS, response_validator
+
+    assert "Content-Length" not in VALIDATOR_HEADERS
+    assert response_validator(FakeResponse(200, [b"abcd"])) is None
+    assert response_validator(FakeResponse(200, [b"abcd"], headers={"ETag": "v1"})) == ("ETag", "v1")

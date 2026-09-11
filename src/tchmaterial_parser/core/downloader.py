@@ -18,8 +18,11 @@ from . import naming
 logger = logging.getLogger(__name__)
 
 RETRY_BACKOFF = (1.0, 2.0, 4.0) # 退避秒数，第 n 次重试取第 n 项
-# 校验子的优先级：判断续传拿到的是不是同一份文件
-VALIDATOR_HEADERS = ("ETag", "Last-Modified", "Content-Length")
+# 校验子的优先级：判断续传拿到的是不是同一份文件。
+# 不含 Content-Length——206 响应里它是剩余字节数，必然与首次的全长不等，
+# 拿它做 If-Range 只会让每一次有效的续传都被判成不一致；它也不是合法的
+# entity-tag 或 HTTP-date
+VALIDATOR_HEADERS = ("ETag", "Last-Modified")
 
 
 def format_bytes(size: float) -> str: # 将数据单位进行格式化，返回以 KB、MB、GB、TB 为单位的数据大小
@@ -187,13 +190,19 @@ class DownloadManager:
             return response, 0
 
         if response.status_code != 206:
-            # 服务端不接受续传（或文件已变），从零重来
-            return response, 0
+            # 服务端不接受续传（或文件已变），从零重来。416 说明 .part 比远端
+            # 还长，同样只能整份重下，否则每次重试都会再撞一次 416
+            response.close()
+            return self.client.stream(url), 0
 
+        # 只有拿到与首次同类型、同值的校验子才敢接着写。校验子缺失、类型不同
+        # （首次给 ETag、206 只带别的头）都说明我们无从判断这是不是同一份文件；
+        # 对一个「接受 Range 但忽略 If-Range」的服务端，接着写就会拼出
+        # 「旧文件前缀 + 新文件后缀」——一个看起来成功的损坏 PDF，比半截文件更难发现
         current = response_validator(response)
-        if current is not None and current[0] == validator[0] and current[1] != validator[1]:
-            # 拼出「旧文件前缀 + 新文件后缀」比半截文件更难发现，宁可重下
-            logger.info("续传校验子不一致，放弃续传并重新下载：%s", url)
+        if current is None or current[0] != validator[0] or current[1] != validator[1]:
+            logger.info("续传校验子不可信（本次 %s，首次 %s），放弃续传并重新下载：%s",
+                        current, validator, url)
             response.close()
             return self.client.stream(url), 0
 
