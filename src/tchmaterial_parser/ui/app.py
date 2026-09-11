@@ -19,7 +19,7 @@ from ..core.errors import ParserError
 from ..core.http import HttpClient
 from ..core.parser import parse
 from ..logging_setup import setup_logging
-from .catalog_tree import CatalogSelector
+from .catalog_tree import CatalogTree
 from .platform_ui import apply_dpi_scaling, set_window_icon, ui_font
 from .token_dialog import attach_context_menu, show_access_token_window
 
@@ -65,59 +65,93 @@ class App:
 
     def build_widgets(self) -> None:
         scale = self.scale
-        container = ttk.Frame(self.root)
-        container.pack(anchor="center", expand="yes", padx=int(40 * scale), pady=int(20 * scale))
+        pad = int(10 * scale)
+
+        # 整窗一个垂直栈：标题 / 说明 / 链接输入 / 目录 / 操作区。
+        # 每一段各占一行，宽度由 grid 的列权重统一拉伸，控件之间不会互相挤。
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        container = ttk.Frame(self.root, padding=pad)
+        container.grid(row=0, column=0, sticky="nsew")
+        container.columnconfigure(0, weight=1)
+        container.rowconfigure(3, weight=1) # 只有目录区跟着窗口一起长
         self.container = container
 
         title_label = ttk.Label(container, text="国家中小学智慧教育平台 资源下载工具",
                                 font=ui_font(16, bold=True, root=self.root))
-        title_label.pack(pady=int(5 * scale))
+        title_label.grid(row=0, column=0, sticky="w", pady=(0, int(4 * scale)))
 
         description_label = ttk.Label(container, text=DESCRIPTION, justify="left",
                                       font=ui_font(9, root=self.root))
-        description_label.pack(pady=int(5 * scale))
+        description_label.grid(row=1, column=0, sticky="w", pady=(0, pad))
 
-        # 长宽是字符数而非像素，不跟随缩放
-        self.url_text = tk.Text(container, width=70, height=12, font=ui_font(9, root=self.root))
-        self.url_text.pack(padx=int(15 * scale), pady=int(15 * scale))
+        url_group = ttk.LabelFrame(container, text="资源链接", padding=int(8 * scale))
+        url_group.grid(row=2, column=0, sticky="ew", pady=(0, pad))
+        url_group.columnconfigure(0, weight=1)
+        # 宽高是字符数而非像素，不跟随缩放
+        self.url_text = tk.Text(url_group, width=72, height=8, font=ui_font(9, root=self.root))
+        self.url_text.grid(row=0, column=0, sticky="ew")
+        url_scroll = ttk.Scrollbar(url_group, orient="vertical", command=self.url_text.yview)
+        self.url_text.configure(yscrollcommand=url_scroll.set)
+        url_scroll.grid(row=0, column=1, sticky="ns")
         attach_context_menu(self.url_text, self.root, [
             ("剪切 (Ctrl＋X)", "<<Cut>>"),
             ("复制 (Ctrl＋C)", "<<Copy>>"),
             ("粘贴 (Ctrl＋V)", "<<Paste>>"),
         ])
 
-        self.dropdown_frame = ttk.Frame(self.root)
-        self.dropdown_frame.pack(padx=int(10 * scale), pady=int(10 * scale))
-        self.selector = None
+        catalog_group = ttk.LabelFrame(container, text="选择教材（双击加入上方链接）",
+                                       padding=int(8 * scale))
+        catalog_group.grid(row=3, column=0, sticky="nsew", pady=(0, pad))
+        catalog_group.columnconfigure(0, weight=1)
+        catalog_group.rowconfigure(0, weight=1)
+        self.selector = CatalogTree(catalog_group, self.insert_url, scale=scale)
+        self.selector.grid(row=0, column=0, sticky="nsew")
 
-        self.token_btn = ttk.Button(container, text="设置 Token", command=self.open_token_window)
-        self.token_btn.pack(side="left", padx=int(5 * scale), pady=int(5 * scale), ipady=int(5 * scale))
+        # 操作区：进度独占一行拿到整宽，按钮在下面一行左右分组，互不挤压
+        action = ttk.Frame(container)
+        action.grid(row=4, column=0, sticky="ew")
+        action.columnconfigure(0, weight=1)
 
-        self.download_btn = ttk.Button(container, text="下载", command=self.download)
-        self.download_btn.pack(side="right", padx=int(5 * scale), pady=int(5 * scale), ipady=int(5 * scale))
+        progress_row = ttk.Frame(action)
+        progress_row.grid(row=0, column=0, sticky="ew", pady=(0, int(6 * scale)))
+        progress_row.columnconfigure(0, weight=1)
+        # 进度文本独占一行：把它和进度条并排会挤掉进度条的宽度，
+        # 而文本长度随下载数量变化，挤压幅度还不固定
+        self.progress_label = ttk.Label(progress_row, text="等待下载", anchor="w")
+        self.progress_label.grid(row=0, column=0, sticky="w", pady=(0, int(3 * scale)))
+        self.progress_bar = ttk.Progressbar(progress_row, mode="determinate")
+        self.progress_bar.grid(row=1, column=0, sticky="ew")
 
-        self.copy_btn = ttk.Button(container, text="解析并复制", command=self.parse_and_copy)
-        self.copy_btn.pack(side="right", padx=int(5 * scale), pady=int(5 * scale), ipady=int(5 * scale))
+        button_row = ttk.Frame(action)
+        button_row.grid(row=1, column=0, sticky="ew")
+        button_row.columnconfigure(1, weight=1) # 中间留白把两组按钮推到两端
 
-        self.progress_bar = ttk.Progressbar(container, length=(125 * scale), mode="determinate")
-        self.progress_bar.pack(side="bottom", padx=int(40 * scale), pady=int(10 * scale), ipady=int(5 * scale))
+        self.token_btn = ttk.Button(button_row, text="设置 Token", command=self.open_token_window)
+        self.token_btn.grid(row=0, column=0, sticky="w")
 
-        self.progress_label = ttk.Label(container, text="等待下载", anchor="center")
-        self.progress_label.pack(side="bottom", padx=int(5 * scale), pady=int(5 * scale))
+        self.copy_btn = ttk.Button(button_row, text="解析并复制", command=self.parse_and_copy)
+        self.copy_btn.grid(row=0, column=2, sticky="e", padx=(0, int(6 * scale)))
+
+        self.download_btn = ttk.Button(button_row, text="下载", command=self.download)
+        self.download_btn.grid(row=0, column=3, sticky="e")
+
+        self.root.update_idletasks()
+        self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight()) # 不让用户把窗口缩到内容被裁切
 
     def load_resource_list(self) -> None:
         self.resource_list, self.catalog_is_stale, failure = load_catalog(self.client)
 
         if failure is not None:
             logger.warning("获取资源列表失败：%s", failure)
+            self.selector.show_placeholder(f"资源目录加载失败：{failure}")
             # 必须在 tk.Tk() 之后：没有 root 时 messagebox 会隐式建出第二个 root
             messagebox.showwarning("警告", f"获取资源列表失败：{failure}\n请手动填写资源链接，或重新打开本程序")
-        elif self.catalog_is_stale:
-            messagebox.showinfo("提示", "当前无法连接服务器，正在使用本地缓存的教材目录，内容可能不是最新的。")
+            return
 
-        self.selector = CatalogSelector(self.dropdown_frame, self.root, self.resource_list,
-                                        self.insert_url, scale=self.scale)
-        self.selector.pack()
+        note = "（离线缓存，内容可能不是最新的）" if self.catalog_is_stale else None
+        self.selector.set_catalog(self.resource_list, note=note)
 
     # ---- 界面回调，只在主线程执行 ----
 

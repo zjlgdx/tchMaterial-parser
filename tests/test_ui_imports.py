@@ -15,7 +15,7 @@ def test_ui_modules_import():
     assert callable(app.main)
     assert callable(platform_ui.apply_dpi_scaling)
     assert callable(token_dialog.show_access_token_window)
-    assert catalog_tree.DEPTH == 8
+    assert callable(catalog_tree.build_detail_url)
 
 
 def test_detail_url_is_built_in_one_place():
