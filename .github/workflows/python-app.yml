@@ -1,37 +1,106 @@
-# This workflow will install Python dependencies, run tests and lint with a single version of Python
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+# 语法门 + 单元测试 + 打包产物
+# 参考：https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: Python application
 
 on:
   push:
     branches: [ "main", "pre-release" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
 permissions:
   contents: read
 
+env:
+  PYINSTALLER_VERSION: "6.11.1"
+
 jobs:
-  build:
-    runs-on: windows-latest
+  lint-and-test:
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install flake8
+        # pywin32 带 environment marker，Linux 上会被自动跳过
+        pip install -r requirements.txt -r requirements-dev.txt
     - name: Lint with flake8
       run: |
-        # stop the build if there are Python syntax errors or undefined names
+        # 语法错误与未定义名：这道门必须是绿的
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        # 风格问题只报告，不阻塞
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Run tests
+      # 不装 python3-tk：核心模块必须在没有图形界面的环境里跑得通，
+      # 界面用例会自行 skip
+      run: pytest -q
+    - name: Check version.txt is in sync
+      run: python scripts/gen_version_file.py --check
+
+  build-windows:
+    needs: lint-and-test
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller==${{ env.PYINSTALLER_VERSION }}
+    - name: Build
+      run: pyinstaller tchMaterial-parser.spec
+    - uses: actions/upload-artifact@v4
+      with:
+        name: tchMaterial-parser-windows-x64
+        path: dist/
+
+  build-linux:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - name: Install Tk
+      # PyInstaller 需要真实的 Tk 才能把它打进产物
+      run: sudo apt-get update && sudo apt-get install -y python3-tk
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller==${{ env.PYINSTALLER_VERSION }}
+    - name: Build
+      run: pyinstaller tchMaterial-parser.spec
+    - uses: actions/upload-artifact@v4
+      with:
+        name: tchMaterial-parser-linux-x64
+        path: dist/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+    - name: Publish release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: artifacts/**/*
