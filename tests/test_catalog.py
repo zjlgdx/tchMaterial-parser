@@ -3,6 +3,8 @@
 
 import logging
 
+import pytest
+
 from conftest import FakeResponse, FakeSession
 from tchmaterial_parser.config import AppConfig
 from tchmaterial_parser.core import catalog
@@ -199,3 +201,35 @@ def test_leaf_resource_type_is_kept_when_present():
     helper, tree = build([book("b1", "专题", resource_type_code="thematic_course")])
     node = dict(leaves(tree))["b1"]
     assert node.resource_type_code == "thematic_course"
+
+
+# ---- R1 P1-8：容错分支自己不许再抛 ----
+
+@pytest.mark.parametrize("bad", [None, "不是对象", 42, [], True])
+def test_non_object_entries_do_not_break_the_whole_tree(bad, caplog):
+    """坏条目未必是字典：日志参数里再调一次 .get() 会把整棵树带走。"""
+    books = [
+        book("good-1", "语文一年级上册"),
+        bad,
+        book("good-2", "数学一年级上册", tag_path="教材/tag-edu/tag-primary/tag-math"),
+    ]
+    with caplog.at_level(logging.DEBUG, logger="tchmaterial_parser.core.catalog"):
+        helper, tree = build(books)
+
+    ids = {book_id for book_id, _ in leaves(tree)}
+    assert ids == {"good-1", "good-2"}, "一条 %r 把整棵树毁了：%s" % (bad, ids)
+    assert helper.skipped_entries == 1
+
+
+def test_list_that_is_not_an_array_is_a_format_error():
+    """整份列表不是数组时，要给出可辨的失败而不是没人接的 TypeError。"""
+    from tchmaterial_parser.core.errors import UpstreamFormatError
+
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(200, json_data={"urls": LIST_A}),
+        LIST_A: FakeResponse(200, json_data={"unexpected": "object"}),
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+    with pytest.raises(UpstreamFormatError):
+        catalog.ResourceHelper(client).fetch_resource_list()

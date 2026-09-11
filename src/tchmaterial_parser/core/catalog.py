@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from ..config import AppConfig
+from .errors import UpstreamFormatError
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,9 @@ class ResourceHelper: # 获取网站上资源的数据
         同时存在几份会把内存峰值顶上去；建树也在改同一棵树。
         """
         book_data = self.client.parse_json(url, response)
+        if not isinstance(book_data, list):
+            raise UpstreamFormatError(f"课本列表不是数组：{url}")
+
         skipped = 0
         for book in book_data:
             # 逐条容错：一条坏数据只该丢掉它自己，不该让整棵树报废、
@@ -167,7 +171,9 @@ class ResourceHelper: # 获取网站上资源的数据
                     skipped += 1
             except (KeyError, IndexError, TypeError, AttributeError) as e:
                 skipped += 1
-                logger.debug("跳过一条无法解析的课本数据：%s（%s）", book.get("id"), e)
+                # 坏条目未必是字典：在这里调 book.get("id") 会再抛一次，
+                # 把「逐条容错」变成「一条坏数据毁掉整棵树」
+                logger.debug("跳过一条无法解析的课本数据：%.80s（%s）", repr(book), e)
         return skipped
 
     def _load_one_list(self, url: str, parsed_hier: dict, parse_lock) -> int:

@@ -126,11 +126,12 @@ def test_tree_built_from_fixture_skips_bad_entries():
     chinese = tree["tag-edu"].children["tag-primary"].children["tag-chinese"]
     math = tree["tag-edu"].children["tag-primary"].children["tag-math"]
 
-    # 每个列表文件都含同样 6 条：2 条同名 + 1 条空 tag_paths + 1 条坏分支
-    # + 1 条无 title + 1 条含非法字符
+    # 每个列表文件都含同样 8 条：2 条同名 + 1 条空 tag_paths + 1 条 null
+    # + 1 条标量 + 1 条坏分支 + 1 条无 title + 1 条含非法字符
     assert set(chinese.children) == {"book-dup-1", "book-dup-2"}
     assert set(math.children) == {"book-no-title", "book-odd-name"}
-    assert helper.skipped_entries == 4 * 2, helper.skipped_entries # 空 tag_paths 与坏分支各 4 次
+    # 每份里有 4 条挂不上去：空 tag_paths、null、标量、坏分支
+    assert helper.skipped_entries == 4 * 4, helper.skipped_entries
 
 
 def test_duplicate_titles_survive_with_distinct_ids():
