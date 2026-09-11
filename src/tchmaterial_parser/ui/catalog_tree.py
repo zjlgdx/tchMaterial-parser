@@ -25,7 +25,7 @@ class CatalogSelector:
         self.event_flag = False # 防止事件循环调用
 
         self.frame = ttk.Frame(parent)
-        self.options = [["---"] + [resource_list[k]["display_name"] for k in resource_list]] \
+        self.options = [["---"] + [resource_list[k].display_name for k in resource_list]] \
             + [["---"] for _ in range(DEPTH - 1)] # 构建选择项
         self.variables = [tk.StringVar(root) for _ in range(DEPTH)]
         self.drops = []
@@ -64,30 +64,37 @@ class CatalogSelector:
             current_drop = self.drops[index + 1]
 
             current_hier = self.resource_list
-            current_id = [e for e in current_hier if current_hier[e]["display_name"] == self.variables[0].get()][0]
-            current_hier = current_hier[current_id]["children"]
+            current_id = [e for e in current_hier if current_hier[e].display_name == self.variables[0].get()][0]
+            current_hier = current_hier[current_id].children
 
             end_flag = False # 是否到达最终目标
             for i in range(index):
-                try:
-                    current_id = [e for e in current_hier if current_hier[e]["display_name"] == self.variables[i + 1].get()][0]
-                    current_hier = current_hier[current_id]["children"]
-                except KeyError: # 无法继续向下选择，说明已经到达最终目标
+                matches = [e for e in current_hier if current_hier[e].display_name == self.variables[i + 1].get()]
+                if not matches:
+                    break
+
+                current_id = matches[0]
+                node = current_hier[current_id]
+                # 只有课本才是最终目标：标签节点即使没有子节点也不能拿去拼下载链接。
+                # current_hier 停在课本所属的那一层，下面还要靠它取回节点
+                if node.resource_type_code is not None:
                     end_flag = True
                     break
+
+                current_hier = node.children
 
             if not current_hier or end_flag:
                 current_options = ["---"]
             else:
-                current_options = ["---"] + [current_hier[k]["display_name"] for k in current_hier.keys()]
+                current_options = ["---"] + [current_hier[k].display_name for k in current_hier.keys()]
 
             current_drop["menu"].delete(0, "end")
             for choice in current_options:
                 current_drop["menu"].add_command(label=choice, command=tk._setit(self.variables[index + 1], choice))
 
             if end_flag: # 到达目标，显示 URL
-                current_id = [e for e in current_hier if current_hier[e]["display_name"] == self.variables[index].get()][0]
-                self.on_pick(build_detail_url(current_id, current_hier[current_id]["resource_type_code"]))
+                current_id = [e for e in current_hier if current_hier[e].display_name == self.variables[index].get()][0]
+                self.on_pick(build_detail_url(current_id, current_hier[current_id].resource_type_code))
                 self.drops[-1]["menu"].delete(0, "end")
                 self.drops[-1]["menu"].add_command(label="---", command=tk._setit(self.variables[-1], "---"))
                 self.variables[-1].set("---")
@@ -105,11 +112,11 @@ class CatalogSelector:
                 return
 
             current_hier = self.resource_list
-            current_id = [e for e in current_hier if current_hier[e]["display_name"] == self.variables[0].get()][0]
-            current_hier = current_hier[current_id]["children"]
+            current_id = [e for e in current_hier if current_hier[e].display_name == self.variables[0].get()][0]
+            current_hier = current_hier[current_id].children
             for i in range(index - 1):
-                current_id = [e for e in current_hier if current_hier[e]["display_name"] == self.variables[i + 1].get()][0]
-                current_hier = current_hier[current_id]["children"]
+                current_id = [e for e in current_hier if current_hier[e].display_name == self.variables[i + 1].get()][0]
+                current_hier = current_hier[current_id].children
 
-            current_id = [e for e in current_hier if current_hier[e]["display_name"] == self.variables[index].get()][0]
-            self.on_pick(build_detail_url(current_id, current_hier[current_id]["resource_type_code"]))
+            current_id = [e for e in current_hier if current_hier[e].display_name == self.variables[index].get()][0]
+            self.on_pick(build_detail_url(current_id, current_hier[current_id].resource_type_code))

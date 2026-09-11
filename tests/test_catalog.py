@@ -58,38 +58,29 @@ def build(books, tags=TAGS):
 
 
 def leaves(tree):
-    """收集所有课本叶子。"""
-    out = []
+    """收集所有课本节点。
 
-    def walk(node):
-        children = node.get("children") if isinstance(node, dict) else None
-        if not children:
-            return
-        for key, child in children.items():
-            if isinstance(child, dict) and "tag_paths" in child:
-                out.append((key, child))
-            else:
-                walk(child)
-
-    for node in tree.values():
-        walk(node)
-    return out
+    只看 is_leaf 不够：没有课本挂上去的标签节点同样没有子节点。课本一定带
+    resource_type_code，标签节点一定不带，用这个区分。
+    """
+    return [(node.node_id, node) for node in catalog.iter_nodes(tree)
+            if node.resource_type_code is not None]
 
 
 def test_tree_structure_matches_tags():
     helper, tree = build([book("b1", "语文一年级上册")])
     assert list(tree) == ["tag-edu"]
-    assert tree["tag-edu"]["display_name"] == "电子教材"
-    primary = tree["tag-edu"]["children"]["tag-primary"]
-    assert primary["display_name"] == "小学"
-    assert set(primary["children"]) >= {"tag-chinese", "tag-junior"} - {"tag-junior"}
+    assert tree["tag-edu"].display_name == "电子教材"
+    primary = tree["tag-edu"].children["tag-primary"]
+    assert primary.display_name == "小学"
+    assert set(primary.children) == {"tag-chinese", "tag-math"}
 
 
 def test_books_land_under_their_tag():
     helper, tree = build([book("b1", "语文一年级上册")])
-    chinese = tree["tag-edu"]["children"]["tag-primary"]["children"]["tag-chinese"]
-    assert "b1" in chinese["children"]
-    assert chinese["children"]["b1"]["display_name"] == "语文一年级上册"
+    chinese = tree["tag-edu"].children["tag-primary"].children["tag-chinese"]
+    assert "b1" in chinese.children
+    assert chinese.children["b1"].display_name == "语文一年级上册"
 
 
 def test_bad_entries_are_skipped_without_losing_the_tree(caplog):
@@ -121,7 +112,7 @@ def test_duplicate_titles_both_survive():
     helper, tree = build(books)
     found = leaves(tree)
     assert {book_id for book_id, _ in found} == {"dup-1", "dup-2"}
-    assert len({node["display_name"] for _, node in found}) == 1
+    assert len({node.display_name for _, node in found}) == 1
 
 
 def test_display_name_falls_back_to_name_then_id():
@@ -132,7 +123,7 @@ def test_display_name_falls_back_to_name_then_id():
     books[0].pop("title")
     books[1].pop("title")
     helper, tree = build(books)
-    names = {book_id: node["display_name"] for book_id, node in leaves(tree)}
+    names = {book_id: node.display_name for book_id, node in leaves(tree)}
     assert names["only-name"] == "只有 name"
     assert names["neither"] == "(未知电子课本 neither)"
 
@@ -143,3 +134,68 @@ def test_lesson_list_is_not_fetched():
     urls = [url for url, _ in helper.client.session.calls]
     assert catalog.NATIONAL_LESSON_TAGS not in urls
     assert catalog.NATIONAL_LESSON_VERSION not in urls
+
+
+# ---- 任务 11：字段裁剪 ----
+
+KEPT_FIELDS = {"node_id", "display_name", "resource_type_code", "children"}
+DROPPED_FIELDS = ["global_description", "custom_properties", "update_time",
+                  "tag_paths", "title", "name", "id"]
+
+
+def test_every_node_keeps_only_the_whitelisted_fields():
+    """递归到叶子：整棵树上没有任何节点带着被裁掉的大字段。"""
+    books = [
+        book("b1", "语文一年级上册"),
+        book("b2", "数学一年级上册", tag_path="教材/tag-edu/tag-primary/tag-math"),
+        book("b3", "语文一年级下册"),
+    ]
+    helper, tree = build(books)
+
+    visited = 0
+    for node in catalog.iter_nodes(tree):
+        visited += 1
+        assert set(vars(node)) == KEPT_FIELDS, (node.node_id, sorted(vars(node)))
+        for dropped in DROPPED_FIELDS:
+            assert not hasattr(node, dropped), (node.node_id, dropped)
+    # 电子教材 + 小学 + 初中 + 语文 + 数学 + 3 本课本
+    assert visited == 8, visited
+    print("遍历节点总数:", visited)
+
+
+def test_trimmed_tree_is_far_smaller_than_the_raw_entries():
+    """裁剪要真的省下体积，而不只是换了个容器。"""
+    import json
+    import sys
+
+    books = [book("b%d" % i, "课本 %d" % i) for i in range(50)]
+    raw_size = len(json.dumps(books, ensure_ascii=False).encode("utf-8"))
+
+    helper, tree = build(books)
+    trimmed_size = len(json.dumps({k: v.to_dict() for k, v in tree.items()},
+                                  ensure_ascii=False).encode("utf-8"))
+    print("原始 %d 字节 -> 裁剪后 %d 字节" % (raw_size, trimmed_size))
+    assert trimmed_size * 4 < raw_size, (raw_size, trimmed_size)
+    assert sys.getsizeof(tree) > 0  # 树本身仍然可用
+
+
+def test_round_trip_through_dict_preserves_the_tree():
+    """to_dict / from_dict 用于缓存落盘，必须是等价变换。"""
+    helper, tree = build([book("b1", "语文一年级上册")])
+    restored = {k: catalog.CatalogNode.from_dict(v.to_dict()) for k, v in tree.items()}
+    assert restored == tree
+
+
+def test_leaf_resource_type_defaults_when_missing():
+    """resource_type_code 缺失时取默认值，不再 KeyError。"""
+    entry = book("b1", "语文一年级上册")
+    entry.pop("resource_type_code", None)
+    helper, tree = build([entry])
+    node = dict(leaves(tree))["b1"]
+    assert node.resource_type_code == catalog.DEFAULT_RESOURCE_TYPE
+
+
+def test_leaf_resource_type_is_kept_when_present():
+    helper, tree = build([book("b1", "专题", resource_type_code="thematic_course")])
+    node = dict(leaves(tree))["b1"]
+    assert node.resource_type_code == "thematic_course"
