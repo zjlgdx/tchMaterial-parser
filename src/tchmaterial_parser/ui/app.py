@@ -13,7 +13,7 @@ import pyperclip
 from .. import __version__
 from ..config import AppConfig, os_name
 from ..core import tokens
-from ..core.catalog import ResourceHelper
+from ..core.startup import load_catalog
 from ..core.downloader import DownloadManager, build_save_path
 from ..core.errors import ParserError
 from ..core.http import HttpClient
@@ -56,6 +56,7 @@ class App:
             on_finish=lambda dir_path, detail: self.root.after(0, partial(self.finish_downloads, dir_path, detail)))
 
         self.resource_list = {}
+        self.catalog_is_stale = False
         self.build_widgets()
         self.load_resource_list()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing) # 注册窗口关闭事件的处理函数
@@ -105,13 +106,14 @@ class App:
         self.progress_label.pack(side="bottom", padx=int(5 * scale), pady=int(5 * scale))
 
     def load_resource_list(self) -> None:
-        try:
-            self.resource_list = ResourceHelper(self.client).fetch_resource_list()
-        except Exception:
-            self.resource_list = {}
-            logger.warning("获取资源列表失败", exc_info=True)
+        self.resource_list, self.catalog_is_stale, failure = load_catalog(self.client)
+
+        if failure is not None:
+            logger.warning("获取资源列表失败：%s", failure)
             # 必须在 tk.Tk() 之后：没有 root 时 messagebox 会隐式建出第二个 root
-            messagebox.showwarning("警告", "获取资源列表失败，请手动填写资源链接，或重新打开本程序")
+            messagebox.showwarning("警告", f"获取资源列表失败：{failure}\n请手动填写资源链接，或重新打开本程序")
+        elif self.catalog_is_stale:
+            messagebox.showinfo("提示", "当前无法连接服务器，正在使用本地缓存的教材目录，内容可能不是最新的。")
 
         self.selector = CatalogSelector(self.dropdown_frame, self.root, self.resource_list,
                                         self.insert_url, scale=self.scale)

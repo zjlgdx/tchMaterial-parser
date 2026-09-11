@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 """抓取并构建资源目录树。"""
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# data_version.json 里承载版本号的候选键；上游没承诺过字段名，都取不到时
+# 退化成整份响应体的摘要——内容变则键变，在任何命名下都是对的
+VERSION_KEYS = ("version", "module_version", "data_version", "update_time")
 
 DEFAULT_RESOURCE_TYPE = "assets_document"
 
@@ -12,6 +18,14 @@ TCH_MATERIAL_TAGS = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/tch_materia
 TCH_MATERIAL_VERSION = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json"
 NATIONAL_LESSON_TAGS = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/national_lesson_tag.json"
 NATIONAL_LESSON_VERSION = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/national_lesson/teachingmaterials/version/data_version.json"
+
+
+@dataclass(frozen=True)
+class CatalogVersion:
+    """版本探测的结果：缓存键，外加四个列表文件的地址。"""
+
+    version: str
+    urls: tuple
 
 
 @dataclass
@@ -102,16 +116,38 @@ class ResourceHelper: # 获取网站上资源的数据
             resource_type_code=book.get("resource_type_code") or DEFAULT_RESOURCE_TYPE)
         return True
 
-    def fetch_book_list(self): # 获取课本列表
+    def fetch_version(self) -> CatalogVersion:
+        """只取 data_version.json 这一个小文件。
+
+        版本探测必须廉价到可以无条件执行，缓存才有机会在付出那四十余 MB
+        之前拦下这次加载。
+        """
+        payload = self.client.get_json(TCH_MATERIAL_VERSION)
+        urls = tuple(u for u in str(payload["urls"]).split(",") if u)
+
+        version = None
+        for key in VERSION_KEYS:
+            if payload.get(key):
+                version = str(payload[key])
+                break
+        if version is None:
+            digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+            version = digest.hexdigest()[:16]
+
+        return CatalogVersion(version=version, urls=urls)
+
+    def fetch_tree(self, version: CatalogVersion = None, progress_cb=None) -> dict:
+        """拉取四个列表文件并建树；只有缓存未命中时才会走到这里。"""
+        if version is None:
+            version = self.fetch_version()
+
         # 获取电子课本层级数据
         tags_data = self.client.get_json(TCH_MATERIAL_TAGS)
         parsed_hier = self.parse_hierarchy(tags_data["hierarchies"])
 
-        # 获取电子课本 URL 列表
-        list_data = self.client.get_json(TCH_MATERIAL_VERSION)["urls"].split(",")
-
+        total = len(version.urls)
         skipped = 0
-        for url in list_data:
+        for done, url in enumerate(version.urls, start=1):
             book_data = self.client.get_json(url)
             for book in book_data:
                 # 逐条容错：一条坏数据只该丢掉它自己，不该让整棵树报废、
@@ -122,6 +158,9 @@ class ResourceHelper: # 获取网站上资源的数据
                 except (KeyError, IndexError, TypeError, AttributeError) as e:
                     skipped += 1
                     logger.debug("跳过一条无法解析的课本数据：%s（%s）", book.get("id"), e)
+
+            if progress_cb is not None:
+                progress_cb(done, total)
 
         if skipped:
             logger.warning("资源目录构建完成，跳过 %d 条无法解析的条目", skipped)
@@ -159,7 +198,7 @@ class ResourceHelper: # 获取网站上资源的数据
 
         return parsed_hier
 
-    def fetch_resource_list(self): # 获取资源列表
-        book_hier = self.fetch_book_list()
+    def fetch_resource_list(self, progress_cb=None): # 获取资源列表
+        book_hier = self.fetch_tree(progress_cb=progress_cb)
         # lesson_hier = self.fetch_lesson_list() # 目前此函数代码存在问题
         return { **book_hier }
