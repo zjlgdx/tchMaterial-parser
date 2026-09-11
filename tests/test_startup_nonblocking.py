@@ -20,6 +20,20 @@ SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "src", "tchmaterial_parser", "ui", "app.py")
 
 
+@pytest.fixture(autouse=True, scope="module")
+def _requires_a_display():
+    """图形环境探测只做这一次。
+
+    把 App() 的 TclError 也当成「没有图形环境」会把真实的建窗缺陷伪装成 skip，
+    而 skip 的用例在 CI 上是绿的。
+    """
+    try:
+        probe = tk.Tk()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    probe.destroy()
+
+
 @pytest.fixture
 def gated_app(monkeypatch):
     """目录加载卡在一个闸门上，由用例决定什么时候放行。"""
@@ -35,11 +49,7 @@ def gated_app(monkeypatch):
 
     monkeypatch.setattr(app_module, "load_catalog", blocking_load)
 
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
-
+    app = app_module.App()
     app.root.withdraw()
     yield app, gate, entered, state
     gate.set()
@@ -111,10 +121,7 @@ def test_catalog_load_runs_off_the_main_thread(monkeypatch):
         return SAMPLE, False, None
 
     monkeypatch.setattr(app_module, "load_catalog", record_thread)
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
     app.root.update()
@@ -156,10 +163,7 @@ def test_result_arriving_before_mainloop_is_not_lost(monkeypatch):
         return SAMPLE, False, None
 
     monkeypatch.setattr(app_module, "load_catalog", instant_load)
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
 
     # 还没进 mainloop 就让加载线程跑完
@@ -191,10 +195,7 @@ def test_closing_actually_sets_both_cancel_flags(monkeypatch):
     """
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -217,10 +218,7 @@ def test_closing_asks_before_cancelling_live_downloads(monkeypatch):
     """还有任务在飞时要先问用户；用户说不，就什么都不该动。"""
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -252,10 +250,7 @@ def test_completion_gate_opens_only_after_the_whole_batch_is_submitted(monkeypat
     """
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -302,10 +297,7 @@ def test_poller_ignores_snapshots_while_the_gate_is_closed(monkeypatch):
     """闸门未开时，轮询器不该因为「此刻恰好没有在飞任务」就报完成。"""
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -342,10 +334,7 @@ def test_submit_loop_always_opens_the_gate_and_restores_the_button(monkeypatch, 
     """
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
     tmp_dir = tmp_path
@@ -388,10 +377,7 @@ def test_cancelling_the_save_dialog_restores_the_button(monkeypatch):
     """单链接时用户取消保存对话框，按钮同样要回来。"""
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -417,10 +403,7 @@ def test_poller_survives_an_exception_in_poll_downloads(monkeypatch):
     """
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -462,10 +445,7 @@ def test_the_next_tick_is_scheduled_before_anything_that_can_throw(monkeypatch):
     """
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -504,10 +484,7 @@ def test_one_bad_link_does_not_stop_the_rest_of_the_batch(monkeypatch, tmp_path)
     """
     monkeypatch.setattr(app_module, "load_catalog",
                         lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
-    try:
-        app = app_module.App()
-    except tk.TclError as exc:
-        pytest.skip("无可用的图形环境: %s" % exc)
+    app = app_module.App()
     app.root.withdraw()
     app.catalog_thread.join(timeout=5)
 
@@ -537,6 +514,10 @@ def test_one_bad_link_does_not_stop_the_rest_of_the_batch(monkeypatch, tmp_path)
     dialogs = []
     monkeypatch.setattr(app_module.messagebox, "showwarning",
                         lambda title, msg, *a, **k: dialogs.append(msg))
+    # showerror 也必须替掉：回归时代码若改回「弹 showerror」，没替的话用例不是
+    # 变红而是真的弹出模态框把整轮跑挂住，那等于没有这条用例
+    monkeypatch.setattr(app_module.messagebox, "showerror",
+                        lambda title, msg, *a, **k: dialogs.append(msg))
     monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
     monkeypatch.setattr(app_module.filedialog, "askdirectory", lambda *a, **k: str(tmp_path))
 
@@ -544,7 +525,8 @@ def test_one_bad_link_does_not_stop_the_rest_of_the_batch(monkeypatch, tmp_path)
 
     assert len(submitted) == 2, "坏的那条终止了整批，后面的没被投递：%r" % (submitted,)
     assert submitted == ["https://x/good-1.pdf", "https://x/good-2.pdf"], submitted
-    assert dialogs and "第二本的意外" in dialogs[0], dialogs
+    assert len(dialogs) == 1, "弹了不止一个模态框：%r" % (dialogs,)
+    assert "第二本的意外" in dialogs[0], dialogs
     assert app.download_session is True, "有任务在飞，闸门却没开"
     assert str(app.download_btn.cget("state")) == "disabled", \
         "还有任务在飞，按钮就被 finally 提前还回去了"

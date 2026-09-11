@@ -956,7 +956,8 @@ def _writes_to_validator(node) -> bool:
     """这个节点是否在给某个对象的 validator 赋值。
 
     要认全赋值的各种语法形态，漏一种这条守卫就形同虚设：属性赋值只是最常见
-    的一种，setattr、带注解的赋值、绕过 __setattr__ 直写 __dict__ 同样能改。
+    的一种，解包（part.validator, part.path = v, p 这种一行换掉身份和路径的
+    写法尤其该拦）、setattr、带注解的赋值、直写 __dict__ 同样能改。
     """
     import ast
 
@@ -967,12 +968,14 @@ def _writes_to_validator(node) -> bool:
         targets = [node.target]
 
     for target in targets:
-        if isinstance(target, ast.Attribute) and target.attr == "validator":
-            return True
-        # part.__dict__["validator"] = x / vars(part)["validator"] = x
-        if (isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant)
-                and target.slice.value == "validator"):
-            return True
+        # 解包目标是一棵树：a, (b, *c) = ... 里的每个叶子都是赋值点
+        for leaf in ast.walk(target):
+            if isinstance(leaf, ast.Attribute) and leaf.attr == "validator":
+                return True
+            # part.__dict__["validator"] = x / vars(part)["validator"] = x
+            if (isinstance(leaf, ast.Subscript) and isinstance(leaf.slice, ast.Constant)
+                    and leaf.slice.value == "validator"):
+                return True
 
     if isinstance(node, ast.Call):
         name = node.func.id if isinstance(node.func, ast.Name) else \
@@ -999,17 +1002,35 @@ def test_validator_is_only_assigned_inside_partfile():
 
     src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "src", "tchmaterial_parser")
-    offenders = []
-    for path in sorted(glob.glob(os.path.join(src_dir, "**", "*.py"), recursive=True)):
-        tree = ast.parse(open(path, encoding="utf-8").read())
-        part_cls = next((n for n in ast.walk(tree)
-                         if isinstance(n, ast.ClassDef) and n.name == "PartFile"), None)
-        inside = range(part_cls.lineno, part_cls.end_lineno + 1) if part_cls else ()
-        for node in ast.walk(tree):
-            if _writes_to_validator(node) and node.lineno not in inside:
-                offenders.append("%s:%d" % (os.path.basename(path), node.lineno))
+    downloader_path = os.path.join(src_dir, "core", "downloader.py")
+    tree = ast.parse(open(downloader_path, encoding="utf-8").read())
 
-    assert not offenders, "PartFile 之外有人在改 validator：%s" % offenders
+    part_cls = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.ClassDef) and n.name == "PartFile")
+    inside = range(part_cls.lineno, part_cls.end_lineno + 1)
+
+    offenders = [node.lineno for node in ast.walk(tree)
+                 if _writes_to_validator(node) and node.lineno not in inside]
+    assert not offenders, "downloader.py 里 PartFile 之外有人在改 validator，行号：%s" % offenders
+
+    # 上面只扫了一个文件，所以这里要保证不会有第二个文件需要扫：拿不到 PartFile
+    # 实例就改不了它的 validator。按名字去别处搜 ".validator" 是不行的——那会
+    # 把任何无关类的同名属性一并指认成续传身份被污染
+    users = []
+    for path in sorted(glob.glob(os.path.join(src_dir, "**", "*.py"), recursive=True)):
+        if os.path.samefile(path, downloader_path):
+            continue
+        for node in ast.walk(ast.parse(open(path, encoding="utf-8").read())):
+            if isinstance(node, ast.Name) and node.id == "PartFile":
+                users.append("%s:%d" % (os.path.basename(path), node.lineno))
+            elif isinstance(node, ast.Attribute) and node.attr == "PartFile":
+                users.append("%s:%d" % (os.path.basename(path), node.lineno))
+            elif isinstance(node, ast.ImportFrom):
+                if any(a.name == "PartFile" for a in node.names):
+                    users.append("%s:%d" % (os.path.basename(path), node.lineno))
+
+    assert not users, ("PartFile 被 downloader.py 之外的模块用上了，"
+                       "上面那次扫描已经不完整，请一并把这些文件纳入：%s" % users)
 
 
 # ---- R3-P2-1：Content-Range 的可信度判定 ----
