@@ -60,5 +60,5 @@ def log_dir() -> str:
     return os.path.join(base, APP_NAME)
 
 
-def legacy_linux_config_file() -> str: # v3.1 及以前固定写在这里，需要继续读得出来
+def legacy_linux_config_file() -> str: # 旧版本固定写在这里，需要继续读得出来
     return _home_subdir(".config", APP_NAME, "data.json")

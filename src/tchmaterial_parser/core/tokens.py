@@ -26,7 +26,7 @@ def data_file() -> str:
 def candidate_files() -> list:
     """按优先级列出可能存有 Token 的文件。"""
     paths = [data_file()]
-    legacy = config.legacy_linux_config_file() # v3.1 及以前固定写在这里
+    legacy = config.legacy_linux_config_file() # 旧版本固定写在这里
     if legacy not in paths:
         paths.append(legacy)
     return paths
