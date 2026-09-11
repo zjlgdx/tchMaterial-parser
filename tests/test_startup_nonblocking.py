@@ -244,31 +244,59 @@ def test_closing_asks_before_cancelling_live_downloads(monkeypatch):
     app.root.destroy()
 
 
-def test_completion_gate_opens_only_after_the_whole_batch_is_submitted():
-    """整批提交完了才允许轮询器判定。
+def test_completion_gate_opens_only_after_the_whole_batch_is_submitted(monkeypatch, tmp_path):
+    """开闸必须发生在整批提交之后。
 
-    若在循环里逐个开闸，只要循环中途跑过一次嵌套事件循环（模态对话框就会），
-    轮询器就可能看到「才登记了两个、而这两个恰好都跑完了」的半截快照。
+    检查赋值在 AST 的哪一层是测不出回归的——把它移到循环之前，那种检查照样绿，
+    而那正是 P0-1 复发的形态。这里改成真的跑一遍 download()：在提交过程中
+    每投递一个任务就让轮询器跑一次，断言它期间一次都不判定完成。
     """
-    import ast
-    import os as _os
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
 
-    path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                         "src", "tchmaterial_parser", "ui", "app.py")
-    tree = ast.parse(open(path, encoding="utf-8").read())
-    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "download")
+    finished = []
+    monkeypatch.setattr(app, "finish_downloads", lambda snapshot: finished.append(snapshot))
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(app_module.filedialog, "askdirectory", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(app_module, "parse",
+                        lambda client, url: ("https://x/a.pdf", "x", "书"))
 
-    loops = [n for n in ast.walk(fn) if isinstance(n, ast.For)]
-    assert loops, "download() 里没有投递循环"
-    in_loop = [n for loop in loops for n in ast.walk(loop)
-               if isinstance(n, ast.Assign)
-               and any(getattr(t, "attr", None) == "download_session" for t in n.targets)]
-    assert not in_loop, "开闸动作还在投递循环里"
+    # 每个任务一提交就「已经完成」，并在此刻让轮询器跑一次：
+    # 若开闸在循环里，这时它就会看到一个只有一两条的半截快照并判定完成
+    during = []
 
-    after_loop = [n for n in ast.walk(fn)
-                  if isinstance(n, ast.Assign)
-                  and any(getattr(t, "attr", None) == "download_session" for t in n.targets)]
-    assert after_loop, "找不到开闸动作"
+    def submit_and_poll(url, save_path):
+        app.downloads._states.append({"download_url": url, "save_path": save_path,
+                                      "downloaded_size": 8, "total_size": 8,
+                                      "finished": True, "failed_reason": None})
+        app.poll_downloads()
+        during.append(len(finished))
+
+    monkeypatch.setattr(app.downloads, "submit", submit_and_poll)
+
+    app.url_text.insert("1.0", "\n".join(
+        "https://basic.smartedu.cn/tchMaterial/detail?contentId=%d" % i for i in range(4)))
+    app.download()
+
+    assert during == [0, 0, 0, 0], "提交过程中就判定了完成：%s" % during
+    assert finished == [], "提交还没结束就弹了完成提示"
+
+    # 整批提交完之后，轮询器应当恰好判定一次完成并把按钮还回来
+    app.poll_downloads()
+    assert len(finished) == 1, "整批提交完之后没有判定完成"
+    assert finished[0].total == 4
+    # 按钮的恢复由 finish_downloads 负责，这里它被替身接管了，
+    # 那条链路另有 test_poller_ignores_snapshots_while_the_gate_is_closed 覆盖
+
+    monkeypatch.undo()
+    app.downloads._states.clear()
+    app.root.destroy()
 
 
 def test_poller_ignores_snapshots_while_the_gate_is_closed(monkeypatch):
@@ -304,4 +332,65 @@ def test_poller_ignores_snapshots_while_the_gate_is_closed(monkeypatch):
 
     monkeypatch.undo()
     app.downloads._states.clear()
+    app.root.destroy()
+
+
+def test_submit_loop_always_opens_the_gate_and_restores_the_button(monkeypatch, tmp_path):
+    """投递循环里任何一个意外异常都不该让按钮永久卡死（R2 P1-2）。
+
+    没有 finally 的话：开闸语句被跳过 -> 轮询器不判定 -> finish_downloads
+    永远不来 -> 按钮停在 disabled，用户只能重启程序。
+    """
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+    tmp_dir = tmp_path
+
+    # 两条链接才会走「选文件夹」分支；单条会弹保存对话框，那是个真模态窗口
+    app.url_text.insert("1.0", "https://basic.smartedu.cn/tchMaterial/detail?contentId=x\n"
+                               "https://basic.smartedu.cn/tchMaterial/detail?contentId=y")
+    monkeypatch.setattr(app_module, "parse",
+                        lambda client, url: ("https://x/a.pdf", "x", "标题"))
+    monkeypatch.setattr(app_module, "build_save_path",
+                        lambda d, t: (_ for _ in ()).throw(RuntimeError("造出来的意外")))
+    monkeypatch.setattr(app_module.messagebox, "showerror", lambda *a, **k: None)
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(app_module.filedialog, "askdirectory", lambda *a, **k: str(tmp_dir))
+
+    app.download()
+
+    assert str(app.download_btn.cget("state")) == "normal", "按钮卡在 disabled 上"
+    assert app.download_session is False
+
+    monkeypatch.undo()
+    app.root.destroy()
+
+
+def test_cancelling_the_save_dialog_restores_the_button(monkeypatch):
+    """单链接时用户取消保存对话框，按钮同样要回来。"""
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    app.url_text.insert("1.0", "https://basic.smartedu.cn/tchMaterial/detail?contentId=x")
+    monkeypatch.setattr(app_module, "parse",
+                        lambda client, url: ("https://x/a.pdf", "x", "标题"))
+    monkeypatch.setattr(app_module.filedialog, "asksaveasfilename", lambda *a, **k: "")
+
+    app.download()
+
+    assert str(app.download_btn.cget("state")) == "normal", "取消保存对话框后按钮没回来"
+    assert app.download_session is False
+
+    monkeypatch.undo()
     app.root.destroy()

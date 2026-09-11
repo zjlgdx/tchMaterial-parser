@@ -261,3 +261,27 @@ def test_pdf_item_without_storages_is_a_format_error():
                              FakeResponse(200, json_data=body)})
         with pytest.raises(UpstreamFormatError):
             parser.parse(client, PAGE)
+
+
+@pytest.mark.parametrize("raw_title, expected", [
+    (2024, None),
+    (True, None),
+    (["列表"], None),
+    ({"k": "v"}, None),
+    (None, None),
+    ("正常标题", "正常标题"),
+])
+def test_title_is_normalised_to_str_or_none(raw_title, expected):
+    """让「parse() 返回的 title 一定是 str 或 None」成为可依赖的契约。
+
+    否则每个消费点都得自己防御，而漏掉一个就会让异常穿透到界面。
+    """
+    body = {"id": CONTENT_ID, "title": raw_title,
+            "ti_items": [{"lc_ti_format": "pdf",
+                          "ti_storages": ["https://x/%s.pdf" % CONTENT_ID]}]}
+    client = client_for({parser.TCH_MATERIAL_DETAIL.format(content_id=CONTENT_ID):
+                         FakeResponse(200, json_data=body)})
+
+    title = parser.parse(client, PAGE)[2]
+    assert title == expected
+    assert title is None or isinstance(title, str)

@@ -296,43 +296,47 @@ class App:
         else:
             dir_path = None
 
-        for url in urls:
-            try:
-                resource_url, _content_id, title = parse(self.client, url)
-            except ParserError as e:
-                logger.info("解析失败：%s（%s）", url, e.message)
-                failed_links.append((url, e.message)) # 添加到失败链接
-                continue
-
-            if dir_path:
-                save_path = build_save_path(dir_path, title)
-            else:
-                # 建议名只做清洗：拿 build_save_path 取名字会在当前工作目录登记一条
-                # 预留，而用户取消或改名之后这条预留永远回不来，下次下载同一本书
-                # 建议名就变成了 xxx (2).pdf
-                save_path = filedialog.asksaveasfilename(
-                    defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
-                    initialfile=sanitize_filename(title)) # 选择保存路径
-                if not save_path: # 用户取消了文件保存操作
-                    if submitted == 0:
-                        self.download_btn.config(state="normal")
-                    return
-                if os_name == "Windows":
-                    save_path = save_path.replace("/", "\\")
-
-            self.downloads.submit(resource_url, save_path)
-            submitted += 1
-
         # 整批提交完了才开闸让轮询器判定。放在循环里开的话，只要循环中途跑过
         # 一次嵌套事件循环（模态对话框就会），轮询器就可能看到「才登记了两个、
-        # 而这两个恰好都跑完了」的半截快照，把它当成整批结束
-        self.download_session = submitted > 0
+        # 而这两个恰好都跑完了」的半截快照，把它当成整批结束。
+        # 而 finally 是必须的：循环里任何一个意外异常都会跳过开闸，于是轮询器
+        # 不刷进度也不弹完成框，按钮永远停在 disabled 上——用户只能重启程序
+        try:
+            for url in urls:
+                try:
+                    resource_url, _content_id, title = parse(self.client, url)
+                except ParserError as e:
+                    logger.info("解析失败：%s（%s）", url, e.message)
+                    failed_links.append((url, e.message)) # 添加到失败链接
+                    continue
+
+                if dir_path:
+                    save_path = build_save_path(dir_path, title)
+                else:
+                    # 建议名只做清洗：拿 build_save_path 取名字会在当前工作目录登记一条
+                    # 预留，而用户取消或改名之后这条预留永远回不来，下次下载同一本书
+                    # 建议名就变成了 xxx (2).pdf
+                    save_path = filedialog.asksaveasfilename(
+                        defaultextension=".pdf",
+                        filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")],
+                        initialfile=sanitize_filename(title)) # 选择保存路径
+                    if not save_path: # 用户取消了文件保存操作
+                        return
+                    if os_name == "Windows":
+                        save_path = save_path.replace("/", "\\")
+
+                self.downloads.submit(resource_url, save_path)
+                submitted += 1
+        except Exception:
+            logger.exception("投递下载任务时出错")
+            messagebox.showerror("错误", "准备下载任务时出错，请查看日志了解详情。")
+        finally:
+            self.download_session = submitted > 0
+            if submitted == 0: # 没有任何线程在飞，完成回调不会到来，只能在这里解禁
+                self.download_btn.config(state="normal")
 
         if failed_links:
             messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + format_failures(failed_links))
-
-        if submitted == 0: # 没有任何线程在飞，完成回调不会到来，只能在这里解禁
-            self.download_btn.config(state="normal")
 
     def on_closing(self) -> None: # 处理窗口关闭事件
         if not self.downloads.all_finished(): # 当正在下载时，询问用户

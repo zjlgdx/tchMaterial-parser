@@ -11,7 +11,10 @@ MAX_FILENAME_BYTES = 200 # 文件系统的上限是单个文件名 255 字节，
 
 def sanitize_filename(title: str) -> str:
     """把接口返回的标题变成安全的文件名。"""
-    name = "".join("_" if (ch in INVALID_FILENAME_CHARS or ord(ch) < 32) else ch for ch in title or "")
+    # 非字符串一律当没有标题：上游偶尔把 title 写成数字，而 for ch in 2024
+    # 会直接抛 TypeError，一路穿透到界面
+    source = title if isinstance(title, str) else ""
+    name = "".join("_" if (ch in INVALID_FILENAME_CHARS or ord(ch) < 32) else ch for ch in source)
     name = name.strip().strip(".").strip() # 首尾的空白与点在 Windows 上会被静默丢弃，导致文件名与预期不符
     if name.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
         name = "_" + name

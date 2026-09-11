@@ -104,4 +104,12 @@ def parse(client, url: str):
     if not resource_url:
         raise ResourceNotFoundError("这个页面里没有可下载的 PDF 资源")
 
-    return resource_url, content_id, data.get("title")
+    # 让「title 一定是 str 或 None」成为可依赖的契约：上游把它写成数字时，
+    # 下游每一个消费点都得自己防御，代价比在这里归一化高得多
+    title = data.get("title")
+    if not isinstance(title, str):
+        if title is not None:
+            logger.info("详情接口返回的 title 不是字符串（%r），按无标题处理", type(title).__name__)
+        title = None
+
+    return resource_url, content_id, title

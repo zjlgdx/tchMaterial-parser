@@ -137,3 +137,9 @@ def test_truncation_does_not_reexpose_trailing_space_or_dot(raw, label):
 def test_string_that_becomes_empty_after_trimming_falls_back():
     assert naming.sanitize_filename("." * 300) == "download"
     assert naming.sanitize_filename(" " * 300) == "download"
+
+
+@pytest.mark.parametrize("bad", [2024, True, 3.14, b"bytes", ["a"], {"x": 1}, object()])
+def test_non_string_titles_do_not_raise(bad):
+    """上游偶尔把 title 写成数字：for ch in 2024 会直接抛 TypeError。"""
+    assert naming.sanitize_filename(bad) == "download"
