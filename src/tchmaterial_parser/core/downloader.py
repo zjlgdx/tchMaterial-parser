@@ -7,6 +7,7 @@
 
 import logging
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -49,6 +50,20 @@ def response_validator(response):
         if value:
             return header, value
     return None
+
+
+def content_range_starts_at(response, expected_start: int) -> bool:
+    """确认 206 的 Content-Range 确实从我们要的位置开始。
+
+    头缺失时按可信处理：不是所有服务端都给，而真正的防线是 If-Range 校验子。
+    """
+    raw = response.headers.get("Content-Range")
+    if not raw:
+        return True
+    match = re.match(r"\s*bytes\s+(\d+)-", raw)
+    if not match:
+        return False
+    return int(match.group(1)) == expected_start
 
 
 @dataclass(frozen=True)
@@ -206,9 +221,26 @@ class DownloadManager:
         if headers is None:
             return response, 0
 
+        if response.status_code == 200:
+            # 服务端按 HTTP 规范拒绝了 If-Range，直接把完整的新文件发了过来。
+            # 它就是我们要的东西，从头写下去即可，不必关掉再重下一遍
+            return response, 0
+
+        if response.status_code == 416:
+            # 416 是对「我们要的区间」的回答，不是对这个资源的回答：
+            # .part 比远端还长。丢掉它整份重下才是对的，判永久失败会让一次
+            # 本可成功的重下变成失败
+            logger.info("续传区间无效（416），改为整份重下：%s", url)
+            response.close()
+            return self._stream(url), 0
+
+        if response.status_code >= 400:
+            # 其余错误响应原样交给调用方分类：在这里吞掉再重发一次，会让
+            # 「4xx 不重试」在续传路径上失效，还平白多出一个出站请求
+            return response, 0
+
         if response.status_code != 206:
-            # 服务端不接受续传（或文件已变），从零重来。416 说明 .part 比远端
-            # 还长，同样只能整份重下，否则每次重试都会再撞一次 416
+            logger.info("续传返回了非预期状态码 %d，改为整份重下：%s", response.status_code, url)
             response.close()
             return self._stream(url), 0
 
@@ -223,6 +255,14 @@ class DownloadManager:
             response.close()
             return self._stream(url), 0
 
+        # 206 也要确认它续的是我们要的那一段：服务端回 206 却给 bytes 0-...
+        # 时接着 append，拼出来的文件会带一段重复的前缀
+        if not content_range_starts_at(response, resume_from):
+            logger.info("续传的 Content-Range 起点与预期不符（%r，期望 %d），改为整份重下：%s",
+                        response.headers.get("Content-Range"), resume_from, url)
+            response.close()
+            return self._stream(url), 0
+
         return response, resume_from
 
     def _download_once(self, url: str, part_path: str, current_state: dict,
@@ -230,16 +270,22 @@ class DownloadManager:
         response, start = self._open_stream(url, resume_from, ctx.get("validator"))
 
         # 校验子要在拿到响应头的当下就记住：中途断流时这一轮不会走到结尾，
-        # 而那恰恰是下一轮需要拿它去续传的场合
+        # 而那恰恰是下一轮需要拿它去续传的场合。
+        # 从零重下时必须无条件覆盖，包括覆盖成 None——否则 .part 里换成了这一轮的
+        # 字节，ctx 里却留着上一轮的 ETag，下次续传三项检查全过，直接拼出损坏文件
         seen = response_validator(response)
-        if seen is not None and (start == 0 or ctx.get("validator") is None):
+        if start == 0:
+            ctx["validator"] = seen
+        elif ctx.get("validator") is None and seen is not None:
             ctx["validator"] = seen
 
-        if response.status_code == 401 or response.status_code == 403:
-            raise PermanentDownloadError("授权失败，Access Token 可能已过期或无效，请重新设置")
-        if response.status_code in RETRYABLE_STATUS:
-            raise RetryableDownloadError(f"服务器返回状态码 {response.status_code}")
         if response.status_code >= 400:
+            # stream=True 的响应不消费也不关闭，连接要等 GC 才归还
+            response.close()
+            if response.status_code in (401, 403):
+                raise PermanentDownloadError("授权失败，Access Token 可能已过期或无效，请重新设置")
+            if response.status_code in RETRYABLE_STATUS:
+                raise RetryableDownloadError(f"服务器返回状态码 {response.status_code}")
             # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
             raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
 
@@ -316,8 +362,12 @@ class DownloadManager:
                 current_state["failed_reason"] = failed_reason
                 if failed_reason is not None:
                     current_state["downloaded_size"], current_state["total_size"] = 0, 0
-                else:
+                elif current_state["total_size"]:
                     current_state["downloaded_size"] = current_state["total_size"]
+                else:
+                    # 服务端没给 Content-Length：已写入的字节数就是总大小，
+                    # 反过来把它抹成 0 会让完成瞬间的进度条掉回 0%
+                    current_state["total_size"] = current_state["downloaded_size"]
 
         # 完成判定不在这里做：工作线程看不到「调用方还打算提交几个」，
         # 只有主线程知道一批下载什么时候算结束

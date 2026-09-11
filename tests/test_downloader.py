@@ -444,19 +444,27 @@ def test_build_save_path_sanitises_and_dedupes(tmp_path):
 
 # ---- P0-2：续传校验必须严格 ----
 
-@pytest.mark.parametrize("resume_headers, label", [
-    ({}, "206 不带任何校验子"),
-    ({"Content-Length": "8"}, "206 只带与首次不同类型的校验子"),
+@pytest.mark.parametrize("first_headers, resume_headers, label", [
+    ({"ETag": "v1"}, {}, "206 不带任何校验子"),
+    # 值也不同，走的是值检查那一半
+    ({"ETag": "v1"}, {"Last-Modified": "Sun, 18 May 2025 12:00:00 GMT"},
+     "206 只带另一种校验子且值也不同"),
+    # 值相同但头不同：只有类型检查拦得住它。
+    # 不能拿 Content-Length 当「不同类型」——它已不在 VALIDATOR_HEADERS 里，
+    # response_validator 对它返回 None，走的还是第一格的 current is None 分支
+    ({"ETag": "same-token"}, {"Last-Modified": "same-token"},
+     "206 换了一种校验子却给了相同的值"),
 ])
-def test_resume_without_matching_validator_restarts(tmp_path, monkeypatch, resume_headers, label):
+def test_resume_without_matching_validator_restarts(tmp_path, monkeypatch,
+                                                    first_headers, resume_headers, label):
     """服务端接受 Range 却忽略 If-Range 时，必须丢弃 .part 从零重下。"""
     monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
     save_path = str(tmp_path / "书.pdf")
 
     first = FakeResponse(200, [b"OLDOLDOL", b"DXXX"], boom_after=1,
-                         headers={"ETag": "v1", "Content-Length": "12"})
-    stale = FakeResponse(206, [b"NEWTAIL!"], headers=dict(resume_headers))
-    stale.headers.pop("Content-Length", None)
+                         headers=dict(first_headers, **{"Content-Length": "12"}))
+    stale = FakeResponse(206, [b"NEWTAIL!"])
+    stale.headers.clear()
     stale.headers.update(resume_headers)
     fresh = FakeResponse(200, [b"NEWNEWNE", b"WFULL!!!"],
                          headers={"ETag": "v2", "Content-Length": "16"})
@@ -646,3 +654,146 @@ def test_suggested_name_does_not_reserve_a_path(tmp_path):
     title = "义务教育教科书/数学一年级上册"
     assert sanitize_filename(title) == sanitize_filename(title)
     assert naming.reserved_paths() == set(), "取建议名登记了预留"
+
+
+# ---- R2-P1-1：跨重试的校验子不许留成陈旧值 ----
+
+def test_stale_validator_is_cleared_on_a_full_restart(tmp_path, monkeypatch):
+    """整份重下且这一轮没有校验子时，必须把记着的校验子清掉。
+
+    否则 .part 里换成了这一轮的字节，而记着的还是上一轮的 ETag，下次续传
+    三项检查全过，直接拼出一个「看起来成功」的损坏文件。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    no_validator = FakeResponse(200, [b"CCCC", b"XXXX"], boom_after=1)
+    no_validator.headers.clear()
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "8"}),
+        FakeResponse(206, [b"ZZZZ"], headers={"ETag": "v2", "Content-Length": "4"}),
+        no_validator,
+        FakeResponse(200, [b"FINAL!!!"], headers={"Content-Length": "8"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    content = open(save_path, "rb").read()
+    assert b"CCCC" not in content or content == b"CCCC", "拼出了两份响应的组合：%r" % content
+    assert content == b"FINAL!!!", content
+    # 第 4 个请求不该再带那个陈旧的 v1
+    assert session.calls[3][1] == {}, "拿陈旧的校验子去续传了：%r" % (session.calls[3][1],)
+
+
+# ---- R2-P1-3：非 206 先分类 ----
+
+@pytest.mark.parametrize("code", [404, 410, 451])
+def test_client_error_during_resume_is_classified_not_reissued(tmp_path, monkeypatch, code):
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "8"}),
+        FakeResponse(code),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    # 首次 + 一次续传，就该停下：错误响应要走永久失败分类，而不是再发一个整份请求
+    assert len(session.calls) == 2, "续传路径上的 %d 被吞掉后重发了：%s" % (code, session.calls)
+    assert str(code) in manager.states()[0]["failed_reason"]
+    assert os.listdir(tmp_path) == []
+
+
+def test_server_falling_back_to_200_on_a_range_request_is_consumed(tmp_path, monkeypatch):
+    """设计点名的用例：服务端对 Range 回 200 时从头重写，而不是关掉再下一遍。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    first = FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                         headers={"ETag": "v1", "Content-Length": "8"})
+    full_again = FakeResponse(200, [b"NEWNEWNE"], headers={"ETag": "v2", "Content-Length": "8"})
+
+    session = ScriptedSession([first, full_again])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert len(session.calls) == 2, "把一个合法的 200 关掉又重下了一遍：%s" % session.calls
+    assert session.calls[1][1]["Range"] == "bytes=4-"
+    assert open(save_path, "rb").read() == b"NEWNEWNE", "没有从头重写"
+    assert full_again.closed is False
+    assert manager.states()[0]["failed_reason"] is None
+
+
+# ---- R2-P2-4：206 的 Content-Range 起点 ----
+
+def test_206_with_wrong_content_range_restarts(tmp_path, monkeypatch):
+    """服务端回 206 却给了 bytes 0-，接着 append 会拼出带重复前缀的文件。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    liar = FakeResponse(206, [b"AAAABBBB"],
+                        headers={"ETag": "v1", "Content-Length": "8",
+                                 "Content-Range": "bytes 0-7/8"})
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "8"}),
+        liar,
+        FakeResponse(200, [b"AAAABBBB"], headers={"ETag": "v1", "Content-Length": "8"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert open(save_path, "rb").read() == b"AAAABBBB"
+    assert liar.closed is True, "没有关掉那个起点不符的响应"
+    assert session.calls[2][1] == {}
+
+
+def test_206_with_matching_content_range_is_accepted(tmp_path, monkeypatch):
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "8"}),
+        FakeResponse(206, [b"BBBB"],
+                     headers={"ETag": "v1", "Content-Length": "4",
+                              "Content-Range": "bytes 4-7/8"}),
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert open(save_path, "rb").read() == b"AAAABBBB"
+    assert manager.states()[0]["failed_reason"] is None
+
+
+# ---- R2-P2-3：抛错前关闭响应 ----
+
+@pytest.mark.parametrize("code", [401, 404, 500])
+def test_error_responses_are_closed(tmp_path, code):
+    """stream=True 的响应不关掉，连接要等 GC 才归还。"""
+    bad = FakeResponse(code)
+    session = ScriptedSession([bad] + [FakeResponse(code) for _ in range(8)])
+    manager = make_manager(session, config=AppConfig(chunk_size=8, max_retries=0))
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+
+    assert bad.closed is True, "%d 的响应没有被关闭" % code
+
+
+# ---- R2-P2-5：没有 Content-Length 时进度不掉回 0 ----
+
+def test_progress_survives_a_missing_content_length(tmp_path):
+    response = FakeResponse(200, [b"abcd", b"efgh"])
+    response.headers.clear() # 服务端不给 Content-Length
+
+    manager = make_manager(FakeSession(default=response))
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+
+    snapshot = manager.snapshot()
+    assert snapshot.total_size == 8, snapshot
+    assert snapshot.downloaded_size == 8, snapshot
+    assert snapshot.percent == 100.0
+    assert "0.0 字节/0.0 字节" not in snapshot.progress_text()
