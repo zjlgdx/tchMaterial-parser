@@ -199,11 +199,21 @@ def parse_and_copy() -> None: # 解析并复制链接
 def download() -> None: # 下载资源文件
     global completion_notified
     download_btn.config(state="disabled") # 设置下载按钮为禁用状态
-    with download_states_lock: # 就地清空而非重新绑定，工作线程持有的是同一个列表对象
-        download_states.clear() # 初始化下载状态
-        completion_notified = False
+
+    # 有线程在飞时清空状态会丢掉它们的进度与完成判定，进度与完成提示随之全乱
+    with download_states_lock:
+        busy = any(not state["finished"] for state in download_states)
+        if not busy:
+            download_states.clear() # 初始化下载状态
+            completion_notified = False
+
+    if busy: # 对话框不能在持锁时弹出，否则工作线程会被一起卡住
+        messagebox.showinfo("提示", "仍有下载任务未完成，请等待其结束。")
+        return
+
     urls = [line.strip() for line in url_text.get("1.0", tk.END).splitlines() if line.strip()] # 获取所有非空行
     failed_links = []
+    submitted = 0 # 已投递的下载线程数；只要不为 0，解禁按钮的权力就归完成回调
 
     if len(urls) > 1:
         messagebox.showinfo("提示", "您选择了多个链接，将在选定的文件夹中使用教材名称作为文件名进行下载。")
@@ -229,18 +239,19 @@ def download() -> None: # 下载资源文件
             default_filename = title or "download"
             save_path = filedialog.asksaveasfilename(defaultextension=".pdf", filetypes=[("PDF 文件", "*.pdf"), ("所有文件", "*.*")], initialfile = default_filename) # 选择保存路径
             if not save_path: # 用户取消了文件保存操作
-                download_btn.config(state="normal") # 设置下载按钮为启用状态
+                if submitted == 0:
+                    download_btn.config(state="normal") # 设置下载按钮为启用状态
                 return
             if os_name == "Windows":
                 save_path = save_path.replace("/", "\\")
 
         thread_it(download_file, (resource_url, save_path)) # 开始下载（多线程，防止窗口卡死）
+        submitted += 1
 
     if failed_links:
         messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + "\n".join(failed_links)) # 显示警告对话框
-        download_btn.config(state="normal") # 设置下载按钮为启用状态
 
-    if not urls and not failed_links:
+    if submitted == 0: # 没有任何线程在飞，完成回调不会到来，只能在这里解禁
         download_btn.config(state="normal") # 设置下载按钮为启用状态
 
 def show_access_token_window() -> None: # 打开输入 Access Token 的窗口
