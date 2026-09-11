@@ -14,6 +14,7 @@ NATIONAL_LESSON_VERSION = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/national_l
 class ResourceHelper: # 获取网站上资源的数据
     def __init__(self, client):
         self.client = client
+        self.skipped_entries = 0
 
     def parse_hierarchy(self, hierarchy): # 解析层级数据
         if not hierarchy: # 如果没有层级数据，返回空
@@ -25,6 +26,31 @@ class ResourceHelper: # 获取网站上资源的数据
                 parsed[ch["tag_id"]] = { "display_name": ch["tag_name"], "children": self.parse_hierarchy(ch["hierarchies"]) }
         return parsed
 
+    def place_book(self, parsed_hier, book) -> bool:
+        """把一本课本挂到层级树上；这条数据挂不上去时返回 False。"""
+        if len(book["tag_paths"]) == 0: # 某些非课本资料的 tag_paths 属性为空数组
+            return False
+
+        # 解析课本层级数据；电子课本 tag_paths 的前两项为“教材”、“电子教材”
+        tag_paths = book["tag_paths"][0].split("/")[2:]
+
+        # 如果课本层级数据不在层级数据中，跳过
+        temp_hier = parsed_hier[book["tag_paths"][0].split("/")[1]]
+        if not tag_paths or tag_paths[0] not in temp_hier["children"]:
+            return False
+
+        # 分别解析课本层级
+        for p in tag_paths:
+            if temp_hier["children"] and temp_hier["children"].get(p):
+                temp_hier = temp_hier["children"].get(p)
+        if not temp_hier["children"]:
+            temp_hier["children"] = {}
+
+        book["display_name"] = book["title"] if "title" in book else book["name"] if "name" in book else f"(未知电子课本 {book['id']})"
+
+        temp_hier["children"][book["id"]] = book
+        return True
+
     def fetch_book_list(self): # 获取课本列表
         # 获取电子课本层级数据
         tags_data = self.client.get_json(TCH_MATERIAL_TAGS)
@@ -33,30 +59,23 @@ class ResourceHelper: # 获取网站上资源的数据
         # 获取电子课本 URL 列表
         list_data = self.client.get_json(TCH_MATERIAL_VERSION)["urls"].split(",")
 
-        # 获取电子课本列表
+        skipped = 0
         for url in list_data:
             book_data = self.client.get_json(url)
             for book in book_data:
-                if len(book["tag_paths"]) > 0: # 某些非课本资料的 tag_paths 属性为空数组
-                    # 解析课本层级数据
-                    tag_paths = book["tag_paths"][0].split("/")[2:] # 电子课本 tag_paths 的前两项为“教材”、“电子教材”
+                # 逐条容错：一条坏数据只该丢掉它自己，不该让整棵树报废、
+                # 让用户失去全部选择功能
+                try:
+                    if not self.place_book(parsed_hier, book):
+                        skipped += 1
+                except (KeyError, IndexError, TypeError, AttributeError) as e:
+                    skipped += 1
+                    logger.debug("跳过一条无法解析的课本数据：%s（%s）", book.get("id"), e)
 
-                    # 如果课本层级数据不在层级数据中，跳过
-                    temp_hier = parsed_hier[book["tag_paths"][0].split("/")[1]]
-                    if not tag_paths[0] in temp_hier["children"]:
-                        continue
+        if skipped:
+            logger.warning("资源目录构建完成，跳过 %d 条无法解析的条目", skipped)
 
-                    # 分别解析课本层级
-                    for p in tag_paths:
-                        if temp_hier["children"] and temp_hier["children"].get(p):
-                            temp_hier = temp_hier["children"].get(p)
-                    if not temp_hier["children"]:
-                        temp_hier["children"] = {}
-
-                    book["display_name"] = book["title"] if "title" in book else book["name"] if "name" in book else f"(未知电子课本 {book['id']})"
-
-                    temp_hier["children"][book["id"]] = book
-
+        self.skipped_entries = skipped
         return parsed_hier
 
     def fetch_lesson_list(self): # 获取课件列表

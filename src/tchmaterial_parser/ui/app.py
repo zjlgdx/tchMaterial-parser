@@ -15,6 +15,7 @@ from ..config import AppConfig, os_name
 from ..core import tokens
 from ..core.catalog import ResourceHelper
 from ..core.downloader import DownloadManager, build_save_path
+from ..core.errors import ParserError
 from ..core.http import HttpClient
 from ..core.parser import parse
 from ..logging_setup import setup_logging
@@ -31,6 +32,11 @@ DESCRIPTION = """\
 📝 您也可以直接在下方的选项卡中选择教材。
 📥 点击 “下载” 按钮后，程序会解析并下载资源。
 ⚠️ 注：为了更可靠地下载，建议点击 “设置 Token” 按钮，参照里面的说明完成设置。"""
+
+
+def format_failures(failed_links: list) -> str:
+    """每一行都带上它自己的失败原因，而不是一句笼统的“无法解析”。"""
+    return "\n".join(f"{url}\n    原因：{reason}" for url, reason in failed_links)
 
 
 class App:
@@ -147,14 +153,14 @@ class App:
         failed_links = []
 
         for url in self.input_urls():
-            resource_url = parse(self.client, url)[0]
-            if not resource_url:
-                failed_links.append(url) # 添加到失败链接
-                continue
-            resource_links.append(resource_url)
+            try:
+                resource_links.append(parse(self.client, url)[0])
+            except ParserError as e:
+                logger.info("解析失败：%s（%s）", url, e.message)
+                failed_links.append((url, e.message)) # 连同原因一起记下
 
         if failed_links:
-            messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + "\n".join(failed_links))
+            messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + format_failures(failed_links))
 
         if resource_links:
             pyperclip.copy("\n".join(resource_links)) # 将链接复制到剪贴板
@@ -184,9 +190,11 @@ class App:
             dir_path = None
 
         for url in urls:
-            resource_url, content_id, title = parse(self.client, url)
-            if not resource_url:
-                failed_links.append(url) # 添加到失败链接
+            try:
+                resource_url, content_id, title = parse(self.client, url)
+            except ParserError as e:
+                logger.info("解析失败：%s（%s）", url, e.message)
+                failed_links.append((url, e.message)) # 添加到失败链接
                 continue
 
             if dir_path:
@@ -206,7 +214,7 @@ class App:
             submitted += 1
 
         if failed_links:
-            messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + "\n".join(failed_links))
+            messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + format_failures(failed_links))
 
         if submitted == 0: # 没有任何线程在飞，完成回调不会到来，只能在这里解禁
             self.download_btn.config(state="normal")

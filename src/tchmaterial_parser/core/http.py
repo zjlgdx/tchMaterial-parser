@@ -6,6 +6,7 @@ import logging
 import requests
 
 from ..config import AppConfig
+from .errors import AuthError, NetworkError, UpstreamFormatError
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,31 @@ class HttpClient:
             self.session.headers["X-ND-AUTH"] = ANONYMOUS_AUTH
 
     def get(self, url: str, **kwargs):
+        """发起请求；只把传输层故障翻译成 NetworkError，状态码交给调用方判断。"""
         kwargs.setdefault("timeout", self.config.timeout)
-        return self.session.get(url, **kwargs)
+        try:
+            return self.session.get(url, **kwargs)
+        except requests.Timeout as e:
+            logger.warning("请求超时：%s", url)
+            raise NetworkError(f"请求超时，服务器在 {self.config.read_timeout:.0f} 秒内没有响应", e) from e
+        except requests.RequestException as e:
+            logger.warning("网络请求失败：%s（%s）", url, e)
+            raise NetworkError(f"网络请求失败：{e}", e) from e
 
     def get_json(self, url: str):
-        return self.get(url).json()
+        response = self.get(url)
+
+        if response.status_code in (401, 403):
+            raise AuthError("授权失败，Access Token 可能已过期或无效，请重新设置")
+        if response.status_code >= 400:
+            raise NetworkError(f"服务器返回状态码 {response.status_code}")
+
+        try:
+            return response.json()
+        except ValueError as e:
+            logger.warning("响应不是合法 JSON：%s", url)
+            raise UpstreamFormatError("服务器返回的内容不是合法的 JSON，接口可能已变更", e) from e
 
     def stream(self, url: str, headers: dict = None):
+        """流式下载；状态码由下载器自行处理，以便把失败原因记进任务状态。"""
         return self.get(url, stream=True, headers=headers)

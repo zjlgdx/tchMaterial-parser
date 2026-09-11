@@ -4,6 +4,8 @@
 import logging
 import re
 
+from .errors import InvalidUrlError, ResourceNotFoundError, UpstreamFormatError
+
 logger = logging.getLogger(__name__)
 
 BASIC_WORK_PATTERN = re.compile(r"^https?://([^/]+)/syncClassroom/basicWork/detail")
@@ -52,29 +54,38 @@ def detail_url(url: str, content_id: str, content_type: str) -> str:
 
 
 def parse(client, url: str):
-    """返回 (PDF 地址, contentId, 标题)；解析不出来时三个都是 None。"""
+    """返回 (PDF 地址, contentId, 标题)。
+
+    失败时抛出 errors 里的具体异常，调用方据此告诉用户到底哪一步出了问题。
+    """
+    content_id = query_value(url, "contentId")
+    if not content_id:
+        raise InvalidUrlError("这一行里找不到 contentId，请确认粘贴的是资源页面的完整网址")
+
+    content_type = query_value(url, "contentType") or "assets_document"
+
+    # 详情接口返回的 $.ti_items 每一项对应一个资源，其中 ti_storages 是文件地址列表
+    data = client.get_json(detail_url(url, content_id, content_type))
+    if not isinstance(data, dict):
+        raise UpstreamFormatError("详情接口返回的结构与预期不符")
+
     try:
-        content_id = query_value(url, "contentId")
-        if not content_id:
-            return None, None, None
-
-        content_type = query_value(url, "contentType") or "assets_document"
-
-        # 详情接口返回的 $.ti_items 每一项对应一个资源，其中 ti_storages 是文件地址列表
-        data = client.get_json(detail_url(url, content_id, content_type))
         resource_url = pick_pdf_url(data.get("ti_items"), client.access_token)
+    except (KeyError, IndexError, TypeError) as e:
+        raise UpstreamFormatError("详情接口里的资源条目缺少文件地址", e) from e
 
-        if not resource_url and content_type == "thematic_course": # 专题课程的 PDF 挂在子资源上
-            resources_data = client.get_json(THEMATIC_COURSE_LIST.format(content_id=content_id))
+    if not resource_url and content_type == "thematic_course": # 专题课程的 PDF 挂在子资源上
+        resources_data = client.get_json(THEMATIC_COURSE_LIST.format(content_id=content_id))
+        try:
             for resource in list(resources_data):
                 if resource.get("resource_type_code") == "assets_document":
                     resource_url = pick_pdf_url(resource.get("ti_items"), client.access_token)
                     if resource_url:
                         break
+        except (KeyError, IndexError, TypeError) as e:
+            raise UpstreamFormatError("专题课程的资源列表结构与预期不符", e) from e
 
-        if not resource_url:
-            return None, None, None
+    if not resource_url:
+        raise ResourceNotFoundError("这个页面里没有可下载的 PDF 资源")
 
-        return resource_url, content_id, data.get("title")
-    except Exception:
-        return None, None, None # 如果解析失败，返回 None
+    return resource_url, content_id, data.get("title")
