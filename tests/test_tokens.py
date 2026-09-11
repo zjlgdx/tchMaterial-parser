@@ -167,3 +167,34 @@ def test_failure_prefix_is_a_shared_constant(home, monkeypatch):
 
     monkeypatch.undo()
     assert not tokens.save_token("tok-abc").startswith(tokens.SAVE_FAILED_PREFIX)
+
+
+@posix_only
+@pytest.mark.parametrize("content, label", [
+    ("[]", "顶层是列表"),
+    ('"just a string"', "顶层是字符串"),
+    ("null", "顶层是 null"),
+    ("123", "顶层是数字"),
+    ('{"access_token": 123}', "token 字段不是字符串"),
+    ('{"access_token": null}', "token 字段是 null"),
+])
+def test_structurally_broken_file_is_treated_as_unset(home, content, label):
+    """这段跑在 tk.Tk() 之前：放任何异常出去，双击运行的用户连错误都看不到。"""
+    target = tokens.data_file()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    assert tokens.load_token() is None, label
+
+
+@posix_only
+def test_broken_file_does_not_block_a_later_save(home):
+    target = tokens.data_file()
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("[]")
+
+    assert tokens.load_token() is None
+    assert "已保存" in tokens.save_token("tok-new")
+    assert tokens.load_token() == "tok-new"

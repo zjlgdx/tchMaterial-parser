@@ -202,3 +202,64 @@ def test_timeout_is_always_injected():
     parser.parse(client, PAGE)
     for url, kwargs in client.session.calls:
         assert kwargs.get("timeout") == AppConfig().timeout, url
+
+
+# ---- R1 P1-6：畸形输入不得逃出领域异常 ----
+
+@pytest.mark.parametrize("url, label", [
+    ("https://basic.smartedu.cn/tchMaterial/detail?contentId", "参数没有等号"),
+    ("https://basic.smartedu.cn/tchMaterial/detail?", "查询串为空"),
+    ("https://basic.smartedu.cn/tchMaterial/detail", "根本没有查询串"),
+    ("?contentId", "只有一个残缺参数"),
+    ("", "空行"),
+    ("不是网址", "不是网址"),
+])
+def test_malformed_urls_raise_invalid_url_error(url, label):
+    client = client_for({})
+    with pytest.raises(InvalidUrlError):
+        parser.parse(client, url)
+
+
+@pytest.mark.parametrize("url", [
+    "https://basic.smartedu.cn/tchMaterial/detail?contentId",
+    "https://x/d?a",
+    "https://x/d?=value",
+])
+def test_query_value_never_raises(url):
+    assert parser.query_value(url, "contentId") in (None, "")
+
+
+@pytest.mark.parametrize("ti_items, label", [
+    ([None], "条目是 null"),
+    ([None, {"lc_ti_format": "pdf", "ti_storages": ["https://x/a.pdf"]}], "null 混在中间"),
+    (["字符串", 42], "条目是标量"),
+])
+def test_malformed_items_do_not_leak_attribute_errors(ti_items, label):
+    """上游偶尔混进 null，不该变成没人接得住的 AttributeError。"""
+    body = {"id": CONTENT_ID, "title": "坏数据", "ti_items": ti_items}
+    client = client_for({parser.TCH_MATERIAL_DETAIL.format(content_id=CONTENT_ID):
+                         FakeResponse(200, json_data=body)})
+    try:
+        parser.parse(client, PAGE)
+    except ParserError:
+        pass # 可辨的领域异常，符合预期
+    except Exception as exc:
+        raise AssertionError("%s 逃出了领域异常：%r" % (label, exc))
+
+
+def test_ti_items_not_a_list_is_a_format_error():
+    body = {"id": CONTENT_ID, "title": "坏数据", "ti_items": {"lc_ti_format": "pdf"}}
+    client = client_for({parser.TCH_MATERIAL_DETAIL.format(content_id=CONTENT_ID):
+                         FakeResponse(200, json_data=body)})
+    with pytest.raises(UpstreamFormatError):
+        parser.parse(client, PAGE)
+
+
+def test_pdf_item_without_storages_is_a_format_error():
+    for storages in (None, [], "not-a-list"):
+        body = {"id": CONTENT_ID, "title": "坏数据",
+                "ti_items": [{"lc_ti_format": "pdf", "ti_storages": storages}]}
+        client = client_for({parser.TCH_MATERIAL_DETAIL.format(content_id=CONTENT_ID):
+                             FakeResponse(200, json_data=body)})
+        with pytest.raises(UpstreamFormatError):
+            parser.parse(client, PAGE)

@@ -26,8 +26,11 @@ def query_value(url: str, key: str) -> str:
     宽松地按 & 与 = 切分反而比严格解析更不容易整条失败。
     """
     for q in url[url.find("?") + 1:].split("&"):
-        if q.split("=")[0] == key:
-            return q.split("=")[1]
+        name, sep, value = q.partition("=")
+        # 用 partition 而不是 split("=")[1]：形如 ?contentId（没有等号）的
+        # 畸形链接会让下标越界，异常一路穿透到 Tk 回调，用户看不到任何提示
+        if name == key and sep:
+            return value
     return None
 
 
@@ -39,9 +42,19 @@ def public_url(resource_url: str, access_token: str) -> str:
 
 
 def pick_pdf_url(ti_items, access_token: str) -> str:
-    for item in list(ti_items or []):
+    if ti_items is None:
+        return None
+    if not isinstance(ti_items, list):
+        raise UpstreamFormatError("详情接口的 ti_items 不是列表")
+
+    for item in ti_items:
+        if not isinstance(item, dict): # 上游偶尔会混进 null
+            continue
         if item.get("lc_ti_format") == "pdf": # 找到存有 PDF 链接列表的项
-            return public_url(item["ti_storages"][0], access_token)
+            storages = item.get("ti_storages")
+            if not isinstance(storages, list) or not storages:
+                raise UpstreamFormatError("详情接口里的 PDF 条目没有文件地址")
+            return public_url(storages[0], access_token)
     return None
 
 
@@ -58,6 +71,9 @@ def parse(client, url: str):
 
     失败时抛出 errors 里的具体异常，调用方据此告诉用户到底哪一步出了问题。
     """
+    if not isinstance(url, str) or "?" not in url:
+        raise InvalidUrlError("这一行不是带查询参数的资源页面网址")
+
     content_id = query_value(url, "contentId")
     if not content_id:
         raise InvalidUrlError("这一行里找不到 contentId，请确认粘贴的是资源页面的完整网址")

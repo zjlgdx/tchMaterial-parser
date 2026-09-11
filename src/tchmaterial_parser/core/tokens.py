@@ -51,11 +51,16 @@ def load_token() -> str:
             if not os.path.exists(path):
                 continue
             with open(path, "r", encoding="utf-8") as f:
-                token = json.load(f).get("access_token")
-            if token:
+                data = json.load(f)
+            # 「JSON 合法但结构不对」和「文件读不出来」是同一档：都按没有 Token 处理。
+            # 这段跑在 tk.Tk() 之前，放任何异常出去，双击运行的用户连错误都看不到
+            if not isinstance(data, dict):
+                raise ValueError("配置文件的顶层不是对象")
+            token = data.get("access_token")
+            if isinstance(token, str) and token:
                 return token
-        except (OSError, ValueError):
-            logger.warning("读取 %s 里的 Access Token 失败", path, exc_info=True)
+        except (OSError, ValueError, TypeError):
+            logger.warning("读取 %s 里的 Access Token 失败，按未设置处理", path, exc_info=True)
 
     return None
 
