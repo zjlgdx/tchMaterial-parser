@@ -146,7 +146,8 @@ def download_file(url: str, save_path: str) -> None: # 下载文件
 
         failed_states = [state for state in download_states if state["failed_reason"]]
         if len(failed_states) > 0:
-            messagebox.showwarning("下载完成", f"文件已下载到：{os.path.dirname(save_path)}\n以下链接下载失败：\n{"\n".join(f"{state["download_url"]}，原因：{state["failed_reason"]}" for state in failed_states)}")
+            failed_detail = "\n".join(f"{state['download_url']}，原因：{state['failed_reason']}" for state in failed_states)
+            messagebox.showwarning("下载完成", f"文件已下载到：{os.path.dirname(save_path)}\n以下链接下载失败：\n{failed_detail}")
         else:
             messagebox.showinfo("下载完成", f"文件已下载到：{os.path.dirname(save_path)}") # 显示完成对话框
 
@@ -387,7 +388,7 @@ class resource_helper: # 获取网站上资源的数据
                     if not temp_hier["children"]:
                         temp_hier["children"] = {}
 
-                    book["display_name"] = book["title"] if "title" in book else book["name"] if "name" in book else f"(未知电子课本 {book["id"]})"
+                    book["display_name"] = book["title"] if "title" in book else book["name"] if "name" in book else f"(未知电子课本 {book['id']})"
 
                     temp_hier["children"][book["id"]] = book
 
@@ -420,7 +421,7 @@ class resource_helper: # 获取网站上资源的数据
                     if not temp_hier["children"]:
                         temp_hier["children"] = {}
 
-                    lesson["display_name"] = lesson["title"] if "title" in lesson else lesson["name"] if "name" in lesson else f"(未知课件 {lesson["id"]})"
+                    lesson["display_name"] = lesson["title"] if "title" in lesson else lesson["name"] if "name" in lesson else f"(未知课件 {lesson['id']})"
 
                     temp_hier["children"][lesson["id"]] = lesson
 

@@ -1,6 +1,6 @@
 # [国家中小学智慧教育平台 电子课本](https://basic.smartedu.cn/tchMaterial/)下载工具
 
-![Python Version](https://img.shields.io/badge/Python-3.x-blue.svg)
+![Python Version](https://img.shields.io/badge/Python-3.10%2B-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Made With Love❤️](https://img.shields.io/badge/Made_With-%E2%9D%A4-red.svg)
 
