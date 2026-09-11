@@ -3,10 +3,10 @@
 
 a = Analysis(
     ['src/tchMaterial-parser.pyw'],
-    pathex=[],
+    pathex=['src'],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[('src/tchmaterial_parser/assets', 'tchmaterial_parser/assets')],
+    hiddenimports=['tchmaterial_parser'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -36,5 +36,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version='version.txt',
-    icon=['src/favicon_48x48.ico'],
+    icon=['src/tchmaterial_parser/assets/favicon_48x48.ico'],
 )
