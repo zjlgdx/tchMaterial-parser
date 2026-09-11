@@ -518,13 +518,6 @@ def set_access_token(token: str) -> str: # 设置并更新 Access Token
 # 立即尝试加载已存的 Access Token（如果有的话）
 load_access_token()
 
-# 获取资源列表
-try:
-    resource_list = resource_helper().fetch_resource_list()
-except Exception:
-    resource_list = {}
-    messagebox.showwarning("警告", "获取资源列表失败，请手动填写资源链接，或重新打开本程序") # 弹出警告窗口
-
 # GUI
 root = tk.Tk()
 
@@ -544,6 +537,13 @@ else: # 在非 Windows 操作系统上，通过 Tkinter 估算缩放因子
         scale = 1.0
 
 root.tk.call("tk", "scaling", scale / 0.75) # 设置缩放因子
+
+# 获取资源列表；必须在 tk.Tk() 之后，否则失败时的 messagebox 会隐式建出第二个 root
+try:
+    resource_list = resource_helper().fetch_resource_list()
+except Exception:
+    resource_list = {}
+    messagebox.showwarning("警告", "获取资源列表失败，请手动填写资源链接，或重新打开本程序") # 弹出警告窗口
 
 root.title("国家中小学智慧教育平台 资源下载工具 v3.1") # 设置窗口标题
 # root.geometry("900x600") # 设置窗口大小
