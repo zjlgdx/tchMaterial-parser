@@ -3,7 +3,9 @@
 
 import logging
 import os
+import queue
 import sys
+import threading
 import tkinter as tk
 from functools import partial
 from tkinter import ttk, messagebox, filedialog
@@ -15,6 +17,7 @@ from ..config import AppConfig, os_name
 from ..core import tokens
 from ..core.startup import load_catalog
 from ..core.downloader import DownloadManager, build_save_path
+from ..core.catalog import CatalogCancelled, ResourceHelper
 from ..core.errors import ParserError
 from ..core.http import HttpClient
 from ..core.parser import parse
@@ -33,6 +36,8 @@ DESCRIPTION = """\
 📥 点击 “下载” 按钮后，程序会解析并下载资源。
 ⚠️ 注：为了更可靠地下载，建议点击 “设置 Token” 按钮，参照里面的说明完成设置。"""
 
+LOADING_TEXT = "正在加载教材目录…"
+
 
 def format_failures(failed_links: list) -> str:
     """每一行都带上它自己的失败原因，而不是一句笼统的“无法解析”。"""
@@ -50,16 +55,19 @@ class App:
         set_window_icon(self.root)
 
         # 工作线程只交出纯数据，投递回主线程由这里负责——Tkinter 非线程安全
+        self.ui_queue = queue.Queue()
         self.downloads = DownloadManager(
             self.client, config=self.config,
-            on_progress=lambda progress, text: self.root.after(0, partial(self.update_progress, progress, text)),
-            on_finish=lambda dir_path, detail: self.root.after(0, partial(self.finish_downloads, dir_path, detail)))
+            on_progress=lambda progress, text: self.post_to_ui(partial(self.update_progress, progress, text)),
+            on_finish=lambda dir_path, detail: self.post_to_ui(partial(self.finish_downloads, dir_path, detail)))
 
         self.resource_list = {}
         self.catalog_is_stale = False
+        self.catalog_helper = ResourceHelper(self.client, config=self.config)
         self.build_widgets()
-        self.load_resource_list()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing) # 注册窗口关闭事件的处理函数
+        self.root.after(self.config.progress_poll_ms, self.drain_ui_queue) # 由主线程排期，合法
+        self.start_catalog_load()
 
     # ---- 构建界面 ----
 
@@ -140,8 +148,56 @@ class App:
         self.root.update_idletasks()
         self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight()) # 不让用户把窗口缩到内容被裁切
 
-    def load_resource_list(self) -> None:
-        self.resource_list, self.catalog_is_stale, failure = load_catalog(self.client)
+    def start_catalog_load(self) -> None:
+        """目录加载放后台：它可能要拉四十余 MB，放在主线程上就是「双击图标后毫无反应」。"""
+        self.selector.show_placeholder(LOADING_TEXT)
+        thread = threading.Thread(target=self._load_catalog_worker, name="catalog-load", daemon=True)
+        thread.start()
+        self.catalog_thread = thread
+
+    def post_to_ui(self, callback) -> None:
+        """把一个回调排进队列，由主线程的轮询器执行。
+
+        不直接用 root.after：它只能由主线程、或在主线程已进入 mainloop 之后
+        调用。命中缓存时目录加载可能比 mainloop 起得还早，那一次投递会直接失败，
+        界面就永远停在加载占位上了。
+        """
+        self.ui_queue.put(callback)
+
+    def drain_ui_queue(self) -> None: # 只在主线程执行
+        while True:
+            try:
+                callback = self.ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                logger.exception("界面更新回调执行失败")
+
+        try:
+            self.root.after(self.config.progress_poll_ms, self.drain_ui_queue)
+        except tk.TclError:
+            pass # 窗口已销毁，轮询到此为止
+
+    def _load_catalog_worker(self) -> None: # 在后台线程中执行
+        try:
+            result = load_catalog(self.client, helper=self.catalog_helper,
+                                  progress_cb=self._report_catalog_progress)
+        except CatalogCancelled:
+            return # 关窗了，界面已经不在了
+        except Exception as e:
+            logger.exception("资源目录加载线程异常退出")
+            result = ({}, False, str(e))
+
+        self.post_to_ui(partial(self.apply_catalog, *result)) # 结果交回主线程
+
+    def _report_catalog_progress(self, done: int, total: int) -> None: # 在后台线程中执行
+        self.post_to_ui(partial(self.selector.show_placeholder,
+                                f"{LOADING_TEXT}（{done}/{total}）"))
+
+    def apply_catalog(self, resource_list, is_stale: bool, failure) -> None: # 只在主线程执行
+        self.resource_list, self.catalog_is_stale = resource_list, is_stale
 
         if failure is not None:
             logger.warning("获取资源列表失败：%s", failure)
@@ -150,7 +206,7 @@ class App:
             messagebox.showwarning("警告", f"获取资源列表失败：{failure}\n请手动填写资源链接，或重新打开本程序")
             return
 
-        note = "（离线缓存，内容可能不是最新的）" if self.catalog_is_stale else None
+        note = "（离线缓存，内容可能不是最新的）" if is_stale else None
         self.selector.set_catalog(self.resource_list, note=note)
 
     # ---- 界面回调，只在主线程执行 ----
@@ -263,6 +319,7 @@ class App:
         # 线程池的工作线程不是守护线程，解释器退出时会等它们；必须显式置位取消标志。
         # 正阻塞在网络读取上的线程要等到读取超时才看得到标志，退出延迟的上界即读取超时
         self.downloads.cancel_all()
+        self.catalog_helper.cancel() # 目录加载线程也要能退
         self.root.destroy()
 
     def run(self) -> None:

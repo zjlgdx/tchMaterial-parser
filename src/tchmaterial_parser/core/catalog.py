@@ -4,7 +4,11 @@
 import hashlib
 import json
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+
+from ..config import AppConfig
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +73,23 @@ def iter_nodes(tree):
         yield from iter_nodes(node.children)
 
 
+class CatalogCancelled(Exception):
+    """关窗时置位取消标志，正在加载目录的线程据此提前退出。"""
+
+
 class ResourceHelper: # 获取网站上资源的数据
-    def __init__(self, client):
+    def __init__(self, client, config=None):
         self.client = client
+        self.config = config or AppConfig()
         self.skipped_entries = 0
+        self.cancelled = threading.Event()
+
+    def cancel(self) -> None:
+        self.cancelled.set()
+
+    def _check_cancelled(self) -> None:
+        if self.cancelled.is_set():
+            raise CatalogCancelled("资源目录加载已取消")
 
     def parse_hierarchy(self, hierarchy) -> dict: # 解析层级数据
         if not hierarchy: # 如果没有层级数据，返回空
@@ -134,6 +151,32 @@ class ResourceHelper: # 获取网站上资源的数据
 
         return CatalogVersion(version=version, urls=urls)
 
+    def parse_and_merge(self, url: str, response, parsed_hier: dict) -> int:
+        """解析一个列表文件并挂到树上，返回跳过的条目数。
+
+        调用方必须持有解析锁：解析出来的对象比原始字节大一个数量级，
+        同时存在几份会把内存峰值顶上去；建树也在改同一棵树。
+        """
+        book_data = self.client.parse_json(url, response)
+        skipped = 0
+        for book in book_data:
+            # 逐条容错：一条坏数据只该丢掉它自己，不该让整棵树报废、
+            # 让用户失去全部选择功能
+            try:
+                if not self.place_book(parsed_hier, book):
+                    skipped += 1
+            except (KeyError, IndexError, TypeError, AttributeError) as e:
+                skipped += 1
+                logger.debug("跳过一条无法解析的课本数据：%s（%s）", book.get("id"), e)
+        return skipped
+
+    def _load_one_list(self, url: str, parsed_hier: dict, parse_lock) -> int:
+        self._check_cancelled()
+        response = self.client.get(url) # 传输：并行，瓶颈在网络
+        self._check_cancelled()
+        with parse_lock: # 解析 + 裁剪 + 挂树：串行，同一时刻只存在一份中间对象
+            return self.parse_and_merge(url, response, parsed_hier)
+
     def fetch_tree(self, version: CatalogVersion = None, progress_cb=None) -> dict:
         """拉取四个列表文件并建树；只有缓存未命中时才会走到这里。"""
         if version is None:
@@ -145,20 +188,24 @@ class ResourceHelper: # 获取网站上资源的数据
 
         total = len(version.urls)
         skipped = 0
-        for done, url in enumerate(version.urls, start=1):
-            book_data = self.client.get_json(url)
-            for book in book_data:
-                # 逐条容错：一条坏数据只该丢掉它自己，不该让整棵树报废、
-                # 让用户失去全部选择功能
-                try:
-                    if not self.place_book(parsed_hier, book):
-                        skipped += 1
-                except (KeyError, IndexError, TypeError, AttributeError) as e:
-                    skipped += 1
-                    logger.debug("跳过一条无法解析的课本数据：%s（%s）", book.get("id"), e)
+        done = 0
+        parse_lock = threading.Lock()
+        workers = max(1, min(self.config.max_catalog_workers, total or 1))
 
-            if progress_cb is not None:
-                progress_cb(done, total)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="catalog") as pool:
+            futures = {pool.submit(self._load_one_list, url, parsed_hier, parse_lock): url
+                       for url in version.urls}
+            try:
+                for future in as_completed(futures):
+                    skipped += future.result()
+                    done += 1
+                    if progress_cb is not None:
+                        progress_cb(done, total)
+            except BaseException:
+                self.cancelled.set() # 让还没开始传输的任务立刻退出，不必等它们跑完
+                for future in futures:
+                    future.cancel()
+                raise
 
         if skipped:
             logger.warning("资源目录构建完成，跳过 %d 条无法解析的条目", skipped)

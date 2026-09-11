@@ -8,20 +8,22 @@ cache 依赖 catalog 的 CatalogNode，所以这段同时用到两者的编排�
 import logging
 
 from . import cache
-from .catalog import ResourceHelper
+from .catalog import CatalogCancelled, ResourceHelper
 
 logger = logging.getLogger(__name__)
 
 
-def load_catalog(client, progress_cb=None):
+def load_catalog(client, helper: ResourceHelper = None, progress_cb=None):
     """加载资源目录，返回 (树, 是否为离线缓存, 失败原因)。
 
     先花一个小请求探版本；命中缓存就直接用，热启动完全不碰上游那四十余 MB。
     """
-    helper = ResourceHelper(client)
+    helper = helper or ResourceHelper(client)
 
     try:
         version = helper.fetch_version()
+    except CatalogCancelled:
+        raise
     except Exception as e: # 多半是离线；旧缓存也好过一个空白面板
         logger.info("版本探测失败，尝试回退到本地缓存：%s", e)
         found = cache.load_any()
@@ -36,6 +38,8 @@ def load_catalog(client, progress_cb=None):
 
     try:
         tree = helper.fetch_tree(version, progress_cb=progress_cb)
+    except CatalogCancelled:
+        raise
     except Exception as e:
         logger.warning("资源目录拉取失败：%s", e)
         found = cache.load_any()

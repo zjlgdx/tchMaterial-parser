@@ -42,9 +42,12 @@ class HttpClient:
             logger.warning("网络请求失败：%s（%s）", url, e)
             raise NetworkError(f"网络请求失败：{e}", e) from e
 
-    def get_json(self, url: str):
-        response = self.get(url)
+    def parse_json(self, url: str, response):
+        """把已经传输完成的响应体解析成 JSON。
 
+        与 get 分开是为了让调用方可以并行传输、串行解析：解析出来的对象比
+        原始字节大一个数量级，同时存在几份会把内存峰值顶上去。
+        """
         if response.status_code in (401, 403):
             raise AuthError("授权失败，Access Token 可能已过期或无效，请重新设置")
         if response.status_code >= 400:
@@ -55,6 +58,9 @@ class HttpClient:
         except ValueError as e:
             logger.warning("响应不是合法 JSON：%s", url)
             raise UpstreamFormatError("服务器返回的内容不是合法的 JSON，接口可能已变更", e) from e
+
+    def get_json(self, url: str):
+        return self.parse_json(url, self.get(url))
 
     def stream(self, url: str, headers: dict = None):
         """流式下载；状态码由下载器自行处理，以便把失败原因记进任务状态。"""

@@ -1,0 +1,184 @@
+# -*- coding: utf-8 -*-
+"""启动不阻塞：建窗与目录加载互不等待（A3、任务 9）。需要 Tk，缺 Tk 时跳过。"""
+
+import ast
+import os
+import threading
+
+import pytest
+
+tk = pytest.importorskip("tkinter")
+
+from tchmaterial_parser.core.catalog import CatalogNode  # noqa: E402
+import tchmaterial_parser.ui.app as app_module  # noqa: E402
+
+SAMPLE = {"tag-edu": CatalogNode("tag-edu", "电子教材", children={
+    "book-1": CatalogNode("book-1", "语文一年级上册", "assets_document")})}
+
+SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   "src", "tchmaterial_parser", "ui", "app.py")
+
+
+@pytest.fixture
+def gated_app(monkeypatch):
+    """目录加载卡在一个闸门上，由用例决定什么时候放行。"""
+    gate = threading.Event()
+    entered = threading.Event()
+    state = {"calls": 0}
+
+    def blocking_load(client, helper=None, progress_cb=None):
+        state["calls"] += 1
+        entered.set()
+        gate.wait(timeout=10)
+        return SAMPLE, False, None
+
+    monkeypatch.setattr(app_module, "load_catalog", blocking_load)
+
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+
+    app.root.withdraw()
+    yield app, gate, entered, state
+    gate.set()
+    app.catalog_helper.cancel()
+    if app.catalog_thread.is_alive():
+        app.catalog_thread.join(timeout=5)
+    try:
+        app.root.destroy()
+    except tk.TclError:
+        pass # 用例里可能已经自己关掉了
+
+
+def test_constructor_returns_before_the_catalog_is_loaded(gated_app):
+    app, gate, entered, state = gated_app
+
+    # 构造函数已经返回，但加载线程还卡在闸门上
+    assert entered.wait(timeout=5), "后台加载线程没有启动"
+    assert app.catalog_thread.is_alive()
+    assert app.resource_list == {}, "构造函数等到了目录加载完成"
+
+    # 此刻窗口已经建好并且可交互
+    app.root.update()
+    assert app.root.winfo_exists()
+    assert app.download_btn.winfo_exists()
+    labels = [app.selector.tree.item(i, "text") for i in app.selector.tree.get_children("")]
+    assert labels == [app_module.LOADING_TEXT], labels
+
+
+def test_tree_is_filled_after_the_result_arrives(gated_app):
+    app, gate, entered, state = gated_app
+    assert entered.wait(timeout=5)
+
+    # 后台线程用 root.after 交回结果，那要求主线程确实在 mainloop 里；
+    # 所以先进事件循环，再从循环内部放行闸门
+    def watch():
+        if app.resource_list:
+            app.root.quit()
+        else:
+            app.root.after(20, watch)
+
+    app.root.after(10, gate.set)
+    app.root.after(30, watch)
+    app.root.after(5000, app.root.quit) # 兜底，别把用例挂死
+    app.root.mainloop()
+
+    assert app.resource_list == SAMPLE
+    labels = [app.selector.tree.item(i, "text") for i in app.selector.tree.get_children("")]
+    assert labels == ["电子教材"], labels
+
+
+def test_result_is_dropped_when_the_window_is_already_gone(gated_app):
+    """关窗后目录才加载完：丢弃这次界面更新，而不是让线程带着异常死掉。"""
+    app, gate, entered, state = gated_app
+    assert entered.wait(timeout=5)
+
+    app.root.destroy() # 用户先关了窗
+    gate.set()
+    app.catalog_thread.join(timeout=5)
+
+    assert not app.catalog_thread.is_alive(), "加载线程没有正常结束"
+
+
+def test_catalog_load_runs_off_the_main_thread(monkeypatch):
+    seen = {}
+
+    def record_thread(client, helper=None, progress_cb=None):
+        seen["thread"] = threading.current_thread()
+        seen["is_main"] = threading.current_thread() is threading.main_thread()
+        return SAMPLE, False, None
+
+    monkeypatch.setattr(app_module, "load_catalog", record_thread)
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+    app.root.update()
+
+    assert seen["is_main"] is False, "目录加载跑在主线程上"
+    assert seen["thread"].daemon is True
+    app.root.destroy()
+
+
+def test_constructor_does_not_fetch_anything_itself():
+    """静态兜底：__init__ 里不得出现任何目录抓取调用。"""
+    tree = ast.parse(open(SRC, encoding="utf-8").read())
+    app_cls = next(n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.name == "App")
+    init = next(n for n in app_cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+
+    calls = {ast.unparse(n.func) for n in ast.walk(init) if isinstance(n, ast.Call)}
+    for forbidden in ("load_catalog", "self.catalog_helper.fetch_tree",
+                      "self.catalog_helper.fetch_version", "self.load_resource_list"):
+        assert forbidden not in calls, "__init__ 里直接调用了 %s" % forbidden
+    assert "self.start_catalog_load" in calls
+
+
+def test_closing_cancels_the_catalog_helper():
+    tree = ast.parse(open(SRC, encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == "on_closing")
+    calls = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    assert "self.catalog_helper.cancel" in calls, calls
+    assert "self.downloads.cancel_all" in calls, calls
+
+
+def test_result_arriving_before_mainloop_is_not_lost(monkeypatch):
+    """命中缓存时加载可能比 mainloop 起得还早，这一次结果绝不能丢。
+
+    直接用 root.after 从工作线程投递会在这种时序下抛 RuntimeError，
+    界面就永远停在加载占位上。
+    """
+    done = threading.Event()
+
+    def instant_load(client, helper=None, progress_cb=None):
+        return SAMPLE, False, None
+
+    monkeypatch.setattr(app_module, "load_catalog", instant_load)
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+
+    # 还没进 mainloop 就让加载线程跑完
+    app.catalog_thread.join(timeout=5)
+    assert not app.catalog_thread.is_alive()
+    assert app.resource_list == {}, "结果不该在 mainloop 之前就被应用"
+
+    def watch():
+        if app.resource_list:
+            app.root.quit()
+        else:
+            app.root.after(20, watch)
+
+    app.root.after(20, watch)
+    app.root.after(5000, app.root.quit)
+    app.root.mainloop()
+
+    assert app.resource_list == SAMPLE, "mainloop 起来之后结果丢了"
+    labels = [app.selector.tree.item(i, "text") for i in app.selector.tree.get_children("")]
+    assert labels == ["电子教材"], labels
+    app.root.destroy()
