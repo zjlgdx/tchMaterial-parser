@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 from ..core import tokens
+from ..core.tokens import SAVE_FAILED_PREFIX
 from .platform_ui import ui_font
 
 HELP_TEXT = """\
@@ -103,11 +104,18 @@ def show_access_token_window(root, client, on_saved=None) -> None: # 打开输�
 
     def save_token():
         user_token = token_text.get("1.0", tk.END).strip()
-        client.set_access_token(user_token)
+        client.set_access_token(user_token) # 本次运行内立即生效
         tip_info = tokens.save_token(user_token)
-        if on_saved is not None:
-            on_saved()
-        messagebox.showinfo("提示", tip_info)
+
+        # 落盘失败时文案已经说了实话，呈现方式也得跟上：用警告图标，
+        # 并且不执行「保存成功之后」才该做的事
+        if tip_info.startswith(SAVE_FAILED_PREFIX):
+            messagebox.showwarning("警告", tip_info)
+        else:
+            if on_saved is not None:
+                on_saved()
+            messagebox.showinfo("提示", tip_info)
+
         token_window.destroy()
 
     def return_save_token(event): # 按下 Enter 键即可保存，并屏蔽换行

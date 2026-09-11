@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 REGISTRY_KEY = "Software\\tchMaterial-parser"
 REGISTRY_VALUE = "AccessToken"
 DATA_FILENAME = "data.json"
+SAVE_FAILED_PREFIX = "Access Token 保存失败："
 FILE_MODE = 0o600 # Token 是凭据，同机其他用户不该读得到
 DIR_MODE = 0o700
 
@@ -96,4 +97,4 @@ def save_token(token: str) -> str:
         return f"Access Token 已保存！\n已写入文件：{target}"
     except Exception as e:
         logger.error("保存 Access Token 失败", exc_info=True)
-        return f"Access Token 保存失败：{e}\n本次运行仍可使用，重启后需要重新输入。"
+        return f"{SAVE_FAILED_PREFIX}{e}\n本次运行仍可使用，重启后需要重新输入。"

@@ -247,8 +247,9 @@ class App:
             messagebox.showinfo("下载完成", f"文件已下载到：{snapshot.last_dir}") # 显示完成对话框
 
     def open_token_window(self) -> None:
-        show_access_token_window(self.root, self.client,
-                                 on_saved=lambda: self.download_btn.config(state="normal"))
+        # 不在这里解禁下载按钮：按钮的恢复只能由「没有任务在飞」派生，
+        # 否则下载进行中保存一次 Token 就能把它解禁
+        show_access_token_window(self.root, self.client)
 
     # ---- 动作 ----
 

@@ -154,3 +154,16 @@ def test_no_temp_file_left_behind_on_failure(home, monkeypatch):
     assert "保存失败" in message
     directory = os.path.dirname(target)
     assert [n for n in os.listdir(directory) if n.endswith(".tmp")] == []
+
+
+@posix_only
+def test_failure_prefix_is_a_shared_constant(home, monkeypatch):
+    """界面靠这个前缀区分成功与失败，两处不能各写一份文案。"""
+    def boom(*args, **kwargs):
+        raise OSError("只读文件系统")
+
+    monkeypatch.setattr(tokens, "write_private_json", boom)
+    assert tokens.save_token("tok-abc").startswith(tokens.SAVE_FAILED_PREFIX)
+
+    monkeypatch.undo()
+    assert not tokens.save_token("tok-abc").startswith(tokens.SAVE_FAILED_PREFIX)

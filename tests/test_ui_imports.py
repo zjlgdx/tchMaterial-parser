@@ -42,3 +42,35 @@ def test_closing_cancels_the_download_pool(monkeypatch):
     calls = [ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)]
     assert "self.downloads.cancel_all" in calls, calls
     assert "self.root.destroy" in calls, calls
+
+
+def source_of(module_name, func_name):
+    import ast
+    import os as _os
+
+    path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                         "src", "tchmaterial_parser", "ui", module_name)
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == func_name)
+    return ast, fn
+
+
+def test_token_dialog_does_not_reenable_the_download_button():
+    """按钮的恢复只能由「没有任务在飞」派生（R1 P1-1）。"""
+    ast, fn = source_of("app.py", "open_token_window")
+    body = ast.unparse(fn)
+    assert "download_btn" not in body, body
+
+
+def test_token_dialog_warns_on_failure():
+    """保存失败要用警告图标，且不执行 on_saved（R1 P1-9）。"""
+    ast, fn = source_of("token_dialog.py", "save_token")
+    branches = [n for n in ast.walk(fn) if isinstance(n, ast.If)]
+    assert branches, "save_token 里没有区分成功与失败"
+
+    failure_branch = "\n".join(ast.unparse(stmt) for stmt in branches[0].body)
+    success_branch = "\n".join(ast.unparse(stmt) for stmt in branches[0].orelse)
+    assert "showwarning" in failure_branch, failure_branch
+    assert "on_saved" not in failure_branch, failure_branch
+    assert "on_saved" in success_branch, success_branch
