@@ -16,8 +16,6 @@ DEFAULT_RESOURCE_TYPE = "assets_document"
 
 TCH_MATERIAL_TAGS = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/tch_material_tag.json"
 TCH_MATERIAL_VERSION = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json"
-NATIONAL_LESSON_TAGS = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/national_lesson_tag.json"
-NATIONAL_LESSON_VERSION = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/national_lesson/teachingmaterials/version/data_version.json"
 
 
 @dataclass(frozen=True)
@@ -168,37 +166,5 @@ class ResourceHelper: # 获取网站上资源的数据
         self.skipped_entries = skipped
         return parsed_hier
 
-    def fetch_lesson_list(self): # 获取课件列表
-        # 获取课件层级数据
-        tags_data = self.client.get_json(NATIONAL_LESSON_TAGS)
-        parsed_hier = self.parse_hierarchy([{ "children": [{ "tag_id": "__internal_national_lesson", "hierarchies": tags_data["hierarchies"], "tag_name": "课件资源" }] }])
-
-        # 获取课件 URL 列表
-        list_data = self.client.get_json(NATIONAL_LESSON_VERSION)["urls"]
-
-        # 获取课件列表
-        for url in list_data:
-            lesson_data = self.client.get_json(url)
-            for lesson in lesson_data:
-                if len(lesson["tag_list"]) > 0:
-                    # 解析课件层级数据
-                    tag_paths = [tag["tag_id"] for tag in sorted(lesson["tag_list"], key=lambda tag: tag["order_num"])]
-
-                    # 分别解析课件层级
-                    temp_hier = parsed_hier["__internal_national_lesson"]
-                    for p in tag_paths:
-                        if temp_hier["children"] and temp_hier["children"].get(p):
-                            temp_hier = temp_hier["children"].get(p)
-                    if not temp_hier["children"]:
-                        temp_hier["children"] = {}
-
-                    lesson["display_name"] = lesson["title"] if "title" in lesson else lesson["name"] if "name" in lesson else f"(未知课件 {lesson['id']})"
-
-                    temp_hier["children"][lesson["id"]] = lesson
-
-        return parsed_hier
-
     def fetch_resource_list(self, progress_cb=None): # 获取资源列表
-        book_hier = self.fetch_tree(progress_cb=progress_cb)
-        # lesson_hier = self.fetch_lesson_list() # 目前此函数代码存在问题
-        return { **book_hier }
+        return self.fetch_tree(progress_cb=progress_cb)

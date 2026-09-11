@@ -128,12 +128,12 @@ def test_display_name_falls_back_to_name_then_id():
     assert names["neither"] == "(未知电子课本 neither)"
 
 
-def test_lesson_list_is_not_fetched():
-    """fetch_resource_list 不该触碰课件接口。"""
+def test_only_the_textbook_endpoints_are_touched():
+    """目录构建只碰电子课本那三个接口，不该有别的。"""
     helper, tree = build([book("b1", "语文一年级上册")])
     urls = [url for url, _ in helper.client.session.calls]
-    assert catalog.NATIONAL_LESSON_TAGS not in urls
-    assert catalog.NATIONAL_LESSON_VERSION not in urls
+    assert set(urls) == {catalog.TCH_MATERIAL_VERSION, catalog.TCH_MATERIAL_TAGS, LIST_A}, urls
+    assert not any("national_lesson" in u for u in urls)
 
 
 # ---- 任务 11：字段裁剪 ----
