@@ -63,5 +63,12 @@ class HttpClient:
         return self.parse_json(url, self.get(url))
 
     def stream(self, url: str, headers: dict = None):
-        """流式下载；状态码由下载器自行处理，以便把失败原因记进任务状态。"""
+        """流式下载；状态码由下载器自行处理，以便把失败原因记进任务状态。
+
+        明确拒绝内容编码：写进文件的是解码后的字节，而 Content-Length 与
+        Range 区间都是对着编码后的表示算的。放任链路上出现 gzip，续传的
+        偏移和完整性判断会同时失真，而 PDF 本身已经压缩过，这里没有可省的流量。
+        """
+        headers = dict(headers or {})
+        headers.setdefault("Accept-Encoding", "identity")
         return self.get(url, stream=True, headers=headers)

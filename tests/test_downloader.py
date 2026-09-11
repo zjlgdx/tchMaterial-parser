@@ -38,6 +38,15 @@ class ScriptedSession:
         return item
 
 
+def range_headers(call) -> dict:
+    """一次请求里的续传头。
+
+    每个下载请求都固定带 Accept-Encoding: identity，断言「这次没续传」时要看的
+    是 Range / If-Range 有没有出现，而不是整个头字典空不空。
+    """
+    return {k: v for k, v in call[1].items() if k in ("Range", "If-Range")}
+
+
 def make_manager(session, config=None):
     config = config or AppConfig(chunk_size=8, max_retries=3)
     client = HttpClient(config=config, session=session)
@@ -114,7 +123,7 @@ def test_retry_sends_range_and_if_range(tmp_path, monkeypatch):
     assert manager.states()[0]["failed_reason"] is None
     assert manager.states()[0]["attempts"] == 2
 
-    assert session.calls[0][1] == {}                       # 首次不带 Range
+    assert range_headers(session.calls[0]) == {}          # 首次不带 Range
     resume_headers = session.calls[1][1]
     assert resume_headers["Range"] == "bytes=8-"           # 已落盘 8 字节
     assert resume_headers["If-Range"] == "v1"
@@ -150,7 +159,7 @@ def test_changed_etag_restarts_from_scratch(tmp_path, monkeypatch):
     # 结果对还不够，路径也要对：必须是「发现校验子不符 -> 当场丢弃 -> 无 Range 重下」，
     # 而不是靠又一次重试碰巧撞对
     assert session.calls[1][1]["If-Range"] == "v1"
-    assert session.calls[2][1] == {}, "重下时不该再带 Range"
+    assert range_headers(session.calls[2]) == {}, "重下时不该再带 Range"
     assert stale.closed is True, "过期的续传响应没有被关掉"
     assert manager.states()[0]["attempts"] == 2, "重下不该额外消耗一次重试"
 
@@ -171,7 +180,7 @@ def test_missing_validator_degrades_to_full_restart(tmp_path, monkeypatch):
     manager.download_file(URL, save_path)
 
     assert response_validator(second) is None, "这个响应本不该有校验子"
-    assert session.calls[1][1] == {}, "没有校验子却仍然发了 Range"
+    assert range_headers(session.calls[1]) == {}, "没有校验子却仍然发了 Range"
     assert open(save_path, "rb").read() == b"AAAABBBB"
     assert manager.states()[0]["failed_reason"] is None
 
@@ -507,7 +516,7 @@ def test_resume_without_matching_validator_restarts(tmp_path, monkeypatch,
     assert b"OLD" not in content, "%s：拼出了旧文件前缀 + 新文件后缀" % label
     assert content == b"NEWNEWNEWFULL!!!", content
     assert stale.closed is True, "%s：没有关掉那个不可信的续传响应" % label
-    assert session.calls[2][1] == {}, "%s：重下时仍带着 Range" % label
+    assert range_headers(session.calls[2]) == {}, "%s：重下时仍带着 Range" % label
 
 
 def test_416_restarts_from_scratch(tmp_path, monkeypatch):
@@ -526,7 +535,7 @@ def test_416_restarts_from_scratch(tmp_path, monkeypatch):
 
     assert open(save_path, "rb").read() == b"CCCC"
     assert manager.states()[0]["failed_reason"] is None
-    assert session.calls[2][1] == {}, "416 之后仍带着 Range"
+    assert range_headers(session.calls[2]) == {}, "416 之后仍带着 Range"
     assert too_long.closed is True
 
 
@@ -717,7 +726,8 @@ def test_stale_validator_is_cleared_on_a_full_restart(tmp_path, monkeypatch):
     assert b"CCCC" not in content or content == b"CCCC", "拼出了两份响应的组合：%r" % content
     assert content == b"FINAL!!!", content
     # 第 4 个请求不该再带那个陈旧的 v1
-    assert session.calls[3][1] == {}, "拿陈旧的校验子去续传了：%r" % (session.calls[3][1],)
+    assert range_headers(session.calls[3]) == {}, \
+        "拿陈旧的校验子去续传了：%r" % (session.calls[3][1],)
 
 
 # ---- R2-P1-3：非 206 先分类 ----
@@ -783,7 +793,7 @@ def test_206_with_wrong_content_range_restarts(tmp_path, monkeypatch):
 
     assert open(save_path, "rb").read() == b"AAAABBBB"
     assert liar.closed is True, "没有关掉那个起点不符的响应"
-    assert session.calls[2][1] == {}
+    assert range_headers(session.calls[2]) == {}
 
 
 def test_206_with_matching_content_range_is_accepted(tmp_path, monkeypatch):
@@ -1055,7 +1065,8 @@ def test_a_206_without_content_range_is_not_trusted(tmp_path, monkeypatch):
     manager.download_file(URL, save_path)
 
     assert len(session.calls) == 3, "没有整份重下：%s" % (session.calls,)
-    assert session.calls[2][1] == {}, "重下这一次不该再带续传头：%r" % (session.calls[2][1],)
+    assert range_headers(session.calls[2]) == {}, \
+        "重下这一次不该再带续传头：%r" % (session.calls[2][1],)
     assert open(save_path, "rb").read() == b"AAAABBBB"
 
 
@@ -1286,3 +1297,119 @@ def test_headers_are_read_case_insensitively(tmp_path, monkeypatch):
         "小写的 etag 没被认出来：%r" % (session.calls[1][1],)
     assert open(save_path, "rb").read() == b"AAAABBBB"
     assert manager.states()[0]["failed_reason"] is None
+
+
+# ---- R6-P1-1：「文件该有多长」只能有一个判据 ----
+
+def test_a_chunked_resume_is_not_mistaken_for_a_short_transfer(tmp_path, monkeypatch):
+    """RFC 9110 §8.6：分块传输的响应严禁带 Content-Length。
+
+    拿「起点 + 声明长度」当全长的话，缺省的 0 会让期望值恰好等于起点，
+    于是每一次收全的续传都被判成短传，整份 40 MB 白下一遍。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    chunked = FakeResponse(206, [b"BBBBBBBB"],
+                           headers={"ETag": "v1", "Content-Range": "bytes 8-15/16"})
+    chunked.headers.pop("Content-Length", None)
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
+                     headers={"ETag": "v1", "Content-Length": "16"}),
+        chunked,
+    ])
+    manager = make_manager(session)
+    manager.download_file(URL, save_path)
+
+    assert len(session.calls) == 2, "收全的续传被判成短传，又重下了一遍：%d 次" % len(session.calls)
+    assert open(save_path, "rb").read() == b"AAAAAAAABBBBBBBB"
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_content_encoding_does_not_make_every_download_fail(tmp_path, monkeypatch):
+    """Content-Length 数的是线路上的字节，写进文件的是解码之后的。
+
+    拿前者去核后者，链路上一旦出现 gzip 就每次下载都失败，还要退避 1+2+4 秒。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    # 声明 8 字节（压缩后），解码后是 20 字节
+    encoded = FakeResponse(200, [b"A" * 20],
+                           headers={"ETag": "v1", "Content-Length": "8",
+                                    "Content-Encoding": "gzip"})
+    session = ScriptedSession([encoded])
+    manager = make_manager(session, config=AppConfig(chunk_size=20, max_retries=3))
+    manager.download_file(URL, save_path)
+
+    assert len(session.calls) == 1, "为一个本该成功的下载重试了 %d 次" % len(session.calls)
+    assert open(save_path, "rb").read() == b"A" * 20
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_downloads_ask_for_no_content_encoding(tmp_path):
+    """从源头避开编码前后长度不一致：按字节续传本来也要求不做内容编码。"""
+    session = ScriptedSession([FakeResponse(200, [b"AAAA"], headers={"Content-Length": "4"})])
+    manager = make_manager(session)
+    manager.download_file(URL, str(tmp_path / "书.pdf"))
+
+    assert session.calls[0][1].get("Accept-Encoding") == "identity", session.calls[0][1]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("bytes 8-15/16", (8, 16)),
+    ("Bytes 8-15/16", (8, 16)),
+    ("bytes 0-0/1", (0, 1)),
+    ("bytes 8-15/*", (8, None)), # 总长未知，但起点是确定的
+    ("bytes */16", None),
+    ("items 8-15/16", None),
+    ("8-15/16", None),
+    ("", None),
+])
+def test_parse_content_range(raw, expected):
+    from tchmaterial_parser.core.downloader import parse_content_range
+
+    response = FakeResponse(206, headers={"Content-Range": raw} if raw else {})
+    response.headers.pop("Content-Length", None)
+    assert parse_content_range(response) == expected
+
+
+@pytest.mark.parametrize("headers, start, expected, why", [
+    ({"Content-Length": "16"}, 0, 16, "首次下载：Content-Length 就是全长"),
+    ({}, 0, None, "首次下载但没给长度：不知道"),
+    ({"Content-Range": "bytes 8-15/16"}, 8, 16, "续传：全长取 Content-Range 的 /Z"),
+    ({"Content-Length": "8"}, 8, None, "续传却没有 Content-Range：不知道"),
+    ({"Content-Range": "bytes 8-15/*"}, 8, None, "服务端自己也不知道总长"),
+    ({"Content-Length": "16", "Content-Encoding": "gzip"}, 0,
+     None, "声明的长度描述的不是要写进文件的那些字节"),
+    ({"Content-Length": "不是数字"}, 0, None, "长度不是数字"),
+])
+def test_expected_file_size(headers, start, expected, why):
+    """「不知道」必须是 None：0 一旦参与算术就会变成一个看起来合理的错数。"""
+    from tchmaterial_parser.core.downloader import expected_file_size
+
+    response = FakeResponse(200, headers=headers)
+    if "Content-Length" not in headers:
+        response.headers.pop("Content-Length", None)
+    assert expected_file_size(response, start) == expected, why
+
+
+# ---- R6-P2-1：起点对不上就丢掉残件 ----
+
+def test_a_tampered_part_file_is_discarded_together_with_its_identity(tmp_path):
+    """文件内容变了，身份就不该再留着描述它。"""
+    from tchmaterial_parser.core.downloader import PartFile, RetryableDownloadError
+
+    part = PartFile(str(tmp_path / "x.part"))
+    with part.open_fresh(("ETag", "v1")) as f:
+        f.write(b"AAAAAAAA")
+
+    with open(part.path, "wb") as f: # 外部把它截短了
+        f.write(b"AA")
+
+    with pytest.raises(RetryableDownloadError):
+        part.open_append(8)
+
+    assert part.size == 0, "被篡改的残件留了下来，下一轮会接着它往下写"
+    assert part.validator is None, "身份还留着，下一轮会带旧校验子去续传"

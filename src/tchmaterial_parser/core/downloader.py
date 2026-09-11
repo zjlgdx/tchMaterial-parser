@@ -63,6 +63,26 @@ def response_validator(response):
     return None
 
 
+# RFC 9110 §14.4：range-unit 大小写不敏感，Bytes 4-7/8 也是合法的 206
+CONTENT_RANGE_RE = re.compile(r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
+
+
+def parse_content_range(response):
+    """解析 206 的 Content-Range，返回 (起点, 资源总长)。
+
+    头缺失或形如 bytes */8 这种没说清区间的，一律返回 None——这个响应证明不了
+    正文是从我们请求的偏移开始的。总长写成 * 时元组第二项为 None。
+    """
+    raw = response.headers.get("Content-Range")
+    if not raw:
+        return None
+    match = CONTENT_RANGE_RE.match(raw)
+    if not match:
+        return None
+    complete = match.group(3)
+    return int(match.group(1)), (None if complete == "*" else int(complete))
+
+
 def content_range_starts_at(response, expected_start: int) -> bool:
     """确认 206 的 Content-Range 确实从我们要的位置开始。
 
@@ -70,14 +90,40 @@ def content_range_starts_at(response, expected_start: int) -> bool:
     我们请求的偏移开始的——接着 append 一段起点不对的正文，拼出来的是一个
     「看起来成功」的损坏文件。整份重下只是慢一点。
     """
-    raw = response.headers.get("Content-Range")
-    if not raw:
-        return False
-    # RFC 9110 §14.4：range-unit 大小写不敏感，Bytes 4-7/8 也是合法的 206
-    match = re.match(r"\s*bytes\s+(\d+)-", raw, re.IGNORECASE)
-    if not match:
-        return False
-    return int(match.group(1)) == expected_start
+    parsed = parse_content_range(response)
+    return parsed is not None and parsed[0] == expected_start
+
+
+def expected_file_size(response, start: int):
+    """这一轮写完之后文件应当有多长；服务端没说清就返回 None。
+
+    「不知道」必须是 None 而不是 0。0 一旦参与 start + declared 的加法就会变成
+    一个看起来合理的错数：分块传输的 206 按 RFC 9110 §8.6 严禁带 Content-Length，
+    于是每一次收全的续传都会被判成短传。
+
+    内容编码是同一个陷阱的另一面：Content-Length 数的是线路上的字节，而写进
+    文件的是 iter_content 解码之后的字节。两者在开了 gzip 的链路上必然不等，
+    而且此时按字节续传本身也是错的——区间是对着编码后的表示算的。所以只要
+    出现内容编码就宣告「不知道」，由下载请求侧的 Accept-Encoding: identity
+    从源头避免这种局面。
+    """
+    if response.headers.get("Content-Encoding"):
+        return None
+
+    parsed = parse_content_range(response)
+    if parsed is not None:
+        return parsed[1] # /Z 是资源总长，与是否分块传输无关
+
+    if start: # 续上了一段却没有 Content-Range，无从知道整份有多长
+        return None
+
+    declared = response.headers.get("Content-Length")
+    if declared is None:
+        return None
+    try:
+        return int(declared)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -183,7 +229,10 @@ class PartFile:
         handle = open(self.path, "ab")
         actual = os.fstat(handle.fileno()).st_size
         if actual != expected_size:
+            # 文件内容变了，身份就不再描述它——留着残件会让下一轮带着旧校验子
+            # 从一个被篡改过的偏移继续往下接
             handle.close()
+            self.discard()
             raise RetryableDownloadError(
                 f"续传起点已失效（预期 {expected_size} 字节，实际 {actual} 字节）")
         return handle
@@ -366,17 +415,17 @@ class DownloadManager:
                 # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
                 raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
 
-            declared = int(response.headers.get("Content-Length", 0))
+            # 「这个文件最终该有多长」只由这一处回答，进度条与完整性校验共用它。
+            # 拿不到就是 None，绝不退化成一个能参与算术的 0
+            expected = expected_file_size(response, start)
             if start == 0:
-                total = declared
                 # 校验子在这里、也只在这里设置：它描述的就是紧接着写进去的字节
                 handle = part.open_fresh(response_validator(response))
             else:
-                total = start + declared
                 handle = part.open_append(start)
 
             with self._lock:
-                current_state["total_size"] = total
+                current_state["total_size"] = expected or 0
                 current_state["downloaded_size"] = start
 
             with handle as file:
@@ -387,11 +436,11 @@ class DownloadManager:
                     with self._lock: # 只改自己那一条；聚合由 snapshot() 在读的时候做
                         current_state["downloaded_size"] += len(chunk)
 
-        # 服务端声明了长度就核一遍。少收的字节同样会被 promote() 当成完整文件
+        # 服务端说清了全长就核一遍。少收的字节同样会被 promote() 当成完整文件
         # 交出去，而截断的 PDF 是「看起来成功」的那一类失败
-        if total and part.size != total:
+        if expected is not None and part.size != expected:
             raise RetryableDownloadError(
-                f"收到的字节数与服务端声明的不符（{part.size}/{total}）")
+                f"收到的字节数与服务端声明的不符（{part.size}/{expected}）")
 
     def download_file(self, url: str, save_path: str, current_state: dict = None) -> None: # 在工作线程中执行
         if current_state is None: # 直接调用（测试）时也要登记，保持与 submit 一致
