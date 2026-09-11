@@ -98,58 +98,77 @@ def parse(url: str) -> tuple[str, str, str] | tuple[None, None, None]: # 解析 
     except Exception:
         return None, None, None # 如果解析失败，返回 None
 
-def download_file(url: str, save_path: str) -> None: # 下载文件
-    global download_states
+def ui_update_progress(progress: float, text: str) -> None: # 只允许在 Tk 主线程中执行
+    download_progress_bar["value"] = progress
+    progress_label.config(text=text)
+
+def ui_finish_downloads(dir_path: str, failed_detail: str) -> None: # 只允许在 Tk 主线程中执行
+    download_progress_bar["value"] = 0 # 重置进度条
+    progress_label.config(text="等待下载") # 清空进度标签
+    download_btn.config(state="normal") # 设置下载按钮为启用状态
+
+    if failed_detail:
+        messagebox.showwarning("下载完成", f"文件已下载到：{dir_path}\n以下链接下载失败：\n{failed_detail}")
+    else:
+        messagebox.showinfo("下载完成", f"文件已下载到：{dir_path}") # 显示完成对话框
+
+def download_file(url: str, save_path: str) -> None: # 下载文件（在工作线程中执行）
+    global completion_notified
     current_state = { "download_url": url, "save_path": save_path, "downloaded_size": 0, "total_size": 0, "finished": False, "failed_reason": None }
-    download_states.append(current_state)
+    with download_states_lock:
+        download_states.append(current_state)
 
     response = session.get(url, stream=True, timeout=DEFAULT_TIMEOUT)
 
     # 服务器返回 401 或 403 状态码
     if response.status_code == 401 or response.status_code == 403:
-        current_state["finished"] = True
-        current_state["failed_reason"] = "授权失败，Access Token 可能已过期或无效，请重新设置"
+        with download_states_lock:
+            current_state["finished"] = True
+            current_state["failed_reason"] = "授权失败，Access Token 可能已过期或无效，请重新设置"
     elif response.status_code >= 400:
-        current_state["finished"] = True
-        current_state["failed_reason"] = f"服务器返回状态码 {response.status_code}"
+        with download_states_lock:
+            current_state["finished"] = True
+            current_state["failed_reason"] = f"服务器返回状态码 {response.status_code}"
     else:
-        current_state["total_size"] = int(response.headers.get("Content-Length", 0))
+        with download_states_lock:
+            current_state["total_size"] = int(response.headers.get("Content-Length", 0))
 
         try:
             with open(save_path, "wb") as file:
                 for chunk in response.iter_content(chunk_size=131072): # 分块下载，每次下载 131072 字节（128 KB）
                     file.write(chunk)
-                    current_state["downloaded_size"] += len(chunk)
-                    all_downloaded_size = sum(state["downloaded_size"] for state in download_states)
-                    all_total_size = sum(state["total_size"] for state in download_states)
-                    downloaded_number = len([state for state in download_states if state["finished"]])
-                    total_number = len(download_states)
+                    with download_states_lock: # 汇总值必须在同一临界区内一次取齐，否则会读到别的线程写到一半的状态
+                        current_state["downloaded_size"] += len(chunk)
+                        all_downloaded_size = sum(state["downloaded_size"] for state in download_states)
+                        all_total_size = sum(state["total_size"] for state in download_states)
+                        downloaded_number = len([state for state in download_states if state["finished"]])
+                        total_number = len(download_states)
 
                     if all_total_size > 0: # 防止下面一行代码除以 0 而报错
                         download_progress = (all_downloaded_size / all_total_size) * 100
-                        # 更新进度条
-                        download_progress_bar["value"] = download_progress
-                        # 更新标签以显示当前下载进度
-                        progress_label.config(text=f"{format_bytes(all_downloaded_size)}/{format_bytes(all_total_size)} ({download_progress:.2f}%) 已下载 {downloaded_number}/{total_number}") # 更新标签
+                        progress_text = f"{format_bytes(all_downloaded_size)}/{format_bytes(all_total_size)} ({download_progress:.2f}%) 已下载 {downloaded_number}/{total_number}"
+                        root.after(0, partial(ui_update_progress, download_progress, progress_text)) # Tkinter 非线程安全，控件只能由主线程改
 
-            current_state["downloaded_size"] = current_state["total_size"]
-            current_state["finished"] = True
+            with download_states_lock:
+                current_state["downloaded_size"] = current_state["total_size"]
+                current_state["finished"] = True
         except Exception as e:
-            current_state["downloaded_size"], current_state["total_size"] = 0, 0
-            current_state["finished"] = True
-            current_state["failed_reason"] = str(e)
+            with download_states_lock:
+                current_state["downloaded_size"], current_state["total_size"] = 0, 0
+                current_state["finished"] = True
+                current_state["failed_reason"] = str(e)
 
-    if all(state["finished"] for state in download_states):
-        download_progress_bar["value"] = 0 # 重置进度条
-        progress_label.config(text="等待下载") # 清空进度标签
-        download_btn.config(state="normal") # 设置下载按钮为启用状态
-
-        failed_states = [state for state in download_states if state["failed_reason"]]
-        if len(failed_states) > 0:
+    # 完成判定与“是否已通知”的置位必须在同一临界区内完成：
+    # 否则最后两个线程可能同时看到“全部完成”，把完成对话框弹两次
+    with download_states_lock:
+        should_notify = all(state["finished"] for state in download_states) and not completion_notified
+        if should_notify:
+            completion_notified = True
+            failed_states = [state for state in download_states if state["failed_reason"]]
             failed_detail = "\n".join(f"{state['download_url']}，原因：{state['failed_reason']}" for state in failed_states)
-            messagebox.showwarning("下载完成", f"文件已下载到：{os.path.dirname(save_path)}\n以下链接下载失败：\n{failed_detail}")
-        else:
-            messagebox.showinfo("下载完成", f"文件已下载到：{os.path.dirname(save_path)}") # 显示完成对话框
+
+    if should_notify:
+        root.after(0, partial(ui_finish_downloads, os.path.dirname(save_path), failed_detail))
 
 def format_bytes(size: float) -> str: # 将数据单位进行格式化，返回以 KB、MB、GB、TB 为单位的数据大小
     for x in ["字节", "KB", "MB", "GB", "TB"]:
@@ -178,9 +197,11 @@ def parse_and_copy() -> None: # 解析并复制链接
         messagebox.showinfo("提示", "资源链接已复制到剪贴板")
 
 def download() -> None: # 下载资源文件
-    global download_states
+    global completion_notified
     download_btn.config(state="disabled") # 设置下载按钮为禁用状态
-    download_states = [] # 初始化下载状态
+    with download_states_lock: # 就地清空而非重新绑定，工作线程持有的是同一个列表对象
+        download_states.clear() # 初始化下载状态
+        completion_notified = False
     urls = [line.strip() for line in url_text.get("1.0", tk.END).splitlines() if line.strip()] # 获取所有非空行
     failed_links = []
 
@@ -444,8 +465,10 @@ DEFAULT_TIMEOUT = (10, 30)
 
 # 初始化请求
 session = requests.Session()
-# 初始化下载状态
+# 初始化下载状态；download_states 与 completion_notified 由多个下载线程共享，一律经锁访问
 download_states = []
+download_states_lock = threading.Lock()
+completion_notified = False
 # 设置请求头部，包含认证信息
 access_token = None
 # 鉴权头挂在 session 上，详情接口与下载接口才会共用同一份凭据
@@ -560,7 +583,10 @@ def set_icon() -> None: # 设置窗口图标
 set_icon() # 设置窗口图标
 
 def on_closing() -> None: # 处理窗口关闭事件
-    if not all(state["finished"] for state in download_states): # 当正在下载时，询问用户
+    with download_states_lock:
+        all_finished = all(state["finished"] for state in download_states)
+
+    if not all_finished: # 当正在下载时，询问用户
         if not messagebox.askokcancel("提示", "下载任务未完成，是否退出？"):
             return
 
