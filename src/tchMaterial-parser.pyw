@@ -11,7 +11,7 @@ import os, platform
 import sys
 from functools import partial
 import base64, tempfile, pyperclip
-import threading, requests, psutil
+import threading, requests
 import json, re
 
 os_name = platform.system() # 获取操作系统类型
@@ -467,7 +467,7 @@ class resource_helper: # 获取网站上资源的数据
 def thread_it(func, args: tuple = ()) -> None: # args 为元组，且默认值是空元组
     # 打包函数到线程
     t = threading.Thread(target=func, args=args)
-    # t.daemon = True
+    t.daemon = True # 非守护线程会阻止解释器退出，关窗后进程残留
     t.start()
 
 # 连接超时 10 秒 / 读取超时 30 秒；读取超时是“两次收到数据之间”的间隔而非总时长，
@@ -601,16 +601,7 @@ def on_closing() -> None: # 处理窗口关闭事件
         if not messagebox.askokcancel("提示", "下载任务未完成，是否退出？"):
             return
 
-    current_process = psutil.Process(os.getpid()) # 获取自身的进程 ID
-    child_processes = current_process.children(recursive=True) # 获取自身的所有子进程
-
-    for child in child_processes: # 结束所有子进程
-        try:
-            child.terminate() # 结束进程
-        except Exception: # 进程可能已经结束
-            pass
-
-    # 结束自身进程
+    # 结束自身进程；下载线程均为守护线程，不会阻止解释器退出
     sys.exit(0)
 
 root.protocol("WM_DELETE_WINDOW", on_closing) # 注册窗口关闭事件的处理函数
