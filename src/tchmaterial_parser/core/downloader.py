@@ -116,6 +116,22 @@ class DownloadSnapshot:
         return "\n".join(f"{url}，原因：{reason}" for url, reason in self.failures)
 
 
+class DownloadCancelled(Exception):
+    """关窗时置位取消标志，正在下载的任务据此提前退出。"""
+
+
+class PermanentDownloadError(Exception):
+    """重试也不会变好的失败：授权被拒、资源不存在、本地写盘失败。"""
+
+
+class RetryableDownloadError(Exception):
+    """值得再试一次的失败：服务端 5xx、限流、请求超时。"""
+
+
+# 这些状态码重试才有意义：服务端临时故障、限流、请求超时
+RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
 class PartFile:
     """下载中的 .part 文件，以及它里面那些字节的身份。
 
@@ -156,30 +172,26 @@ class PartFile:
         self.validator = validator
         return handle
 
-    def open_append(self):
-        """续写：文件里已有的字节仍然属于 self.validator 描述的那份资源。"""
-        return open(self.path, "ab")
+    def open_append(self, expected_size: int):
+        """续写：文件里已有的字节仍然属于 self.validator 描述的那份资源。
+
+        打开之后复核一次大小。采样续传起点与真正打开之间隔着一整个网络往返，
+        .part 若在这期间被外部删掉或截断（用户清理、杀毒软件），"ab" 会新建
+        一个空文件，把服务端发来的后半段当成整份写下去，promote() 再把它当
+        完整文件交出去——一个看起来成功的截断 PDF。
+        """
+        handle = open(self.path, "ab")
+        actual = os.fstat(handle.fileno()).st_size
+        if actual != expected_size:
+            handle.close()
+            raise RetryableDownloadError(
+                f"续传起点已失效（预期 {expected_size} 字节，实际 {actual} 字节）")
+        return handle
 
     def promote(self, save_path: str) -> None:
         """完整写完了，原子改名到目标位置。"""
         os.replace(self.path, save_path)
         self.validator = None
-
-
-class DownloadCancelled(Exception):
-    """关窗时置位取消标志，正在下载的任务据此提前退出。"""
-
-
-class PermanentDownloadError(Exception):
-    """重试也不会变好的失败：授权被拒、资源不存在、本地写盘失败。"""
-
-
-class RetryableDownloadError(Exception):
-    """值得再试一次的失败：服务端 5xx、限流、请求超时。"""
-
-
-# 这些状态码重试才有意义：服务端临时故障、限流、请求超时
-RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
 class DownloadManager:
@@ -350,7 +362,7 @@ class DownloadManager:
                 handle = part.open_fresh(response_validator(response))
             else:
                 total = start + declared
-                handle = part.open_append()
+                handle = part.open_append(start)
 
             with self._lock:
                 current_state["total_size"] = total
@@ -363,6 +375,12 @@ class DownloadManager:
                     file.write(chunk)
                     with self._lock: # 只改自己那一条；聚合由 snapshot() 在读的时候做
                         current_state["downloaded_size"] += len(chunk)
+
+        # 服务端声明了长度就核一遍。少收的字节同样会被 promote() 当成完整文件
+        # 交出去，而截断的 PDF 是「看起来成功」的那一类失败
+        if total and part.size != total:
+            raise RetryableDownloadError(
+                f"收到的字节数与服务端声明的不符（{part.size}/{total}）")
 
     def download_file(self, url: str, save_path: str, current_state: dict = None) -> None: # 在工作线程中执行
         if current_state is None: # 直接调用（测试）时也要登记，保持与 submit 一致

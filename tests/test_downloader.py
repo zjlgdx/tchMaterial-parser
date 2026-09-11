@@ -907,7 +907,7 @@ def test_part_file_binds_bytes_and_identity(tmp_path):
     assert part.size == 4
 
     # 续写不改身份：文件里的字节仍属于同一份资源
-    with part.open_append() as f:
+    with part.open_append(4) as f:
         f.write(b"BBBB")
     assert part.validator == ("ETag", "v1")
     assert part.size == 8
@@ -1148,3 +1148,74 @@ def test_no_test_hand_builds_a_download_state():
                 offenders.append("%s:%d" % (os.path.basename(path), node.lineno))
 
     assert not offenders, "手拼的下载状态字典：%s（改用 new_download_state）" % offenders
+
+
+# ---- R5-P2-3：续传起点与真正打开的那个文件必须是同一件事 ----
+
+def test_part_file_vanishing_before_the_append_does_not_produce_a_truncated_file(
+        tmp_path, monkeypatch):
+    """采样续传起点与打开文件之间隔着一整个网络往返。
+
+    .part 在这期间被外部删掉（用户清理、杀毒软件），"ab" 会新建一个空文件，
+    把后半段当成整份写下去，最后改名交出去——一个看起来成功的截断 PDF。
+    """
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+    part_path = save_path + ".part"
+
+    first = FakeResponse(200, [b"AAAAAAAA", b"XXXXXXXX"], boom_after=1,
+                         headers={"ETag": "v1", "Content-Length": "16"})
+    stolen = FakeResponse(206, [b"BBBBBBBB"],
+                          headers={"ETag": "v1", "Content-Length": "8",
+                                   "Content-Range": "bytes 8-15/16"})
+    full = FakeResponse(200, [b"AAAAAAAA", b"BBBBBBBB"],
+                        headers={"ETag": "v1", "Content-Length": "16"})
+
+    session = ScriptedSession([first, stolen, full])
+    manager = make_manager(session)
+
+    original = manager._stream
+
+    def stream_then_steal(url, headers=None):
+        response = original(url, headers=headers)
+        if headers: # 续传请求已经发出，此刻外部把 .part 删掉
+            os.remove(part_path)
+        return response
+
+    manager._stream = stream_then_steal
+    manager.download_file(URL, save_path)
+
+    content = open(save_path, "rb").read()
+    assert content != b"BBBBBBBB", "把后半段当成整份文件交出去了"
+    assert content == b"AAAAAAAABBBBBBBB", content
+    assert manager.states()[0]["failed_reason"] is None
+
+
+def test_open_append_refuses_a_file_that_is_no_longer_the_expected_size(tmp_path):
+    """PartFile 自身的不变量：续写的起点必须是文件此刻真实的长度。"""
+    from tchmaterial_parser.core.downloader import PartFile, RetryableDownloadError
+
+    part = PartFile(str(tmp_path / "x.part"))
+    with part.open_fresh(("ETag", "v1")) as f:
+        f.write(b"AAAAAAAA")
+
+    with part.open_append(8) as f: # 对得上就照常续写
+        f.write(b"BB")
+
+    with pytest.raises(RetryableDownloadError) as excinfo:
+        part.open_append(99)
+    assert "续传起点已失效" in str(excinfo.value)
+
+
+def test_a_short_transfer_is_not_promoted_as_a_complete_file(tmp_path, monkeypatch):
+    """服务端声明 16 字节却只给了 8：截断的 PDF 属于「看起来成功」的那类失败。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    short = FakeResponse(200, [b"AAAAAAAA"], headers={"ETag": "v1", "Content-Length": "16"})
+    session = ScriptedSession([short])
+    manager = make_manager(session, config=AppConfig(chunk_size=8, max_retries=0))
+    manager.download_file(URL, save_path)
+
+    assert not os.path.exists(save_path), "截断的文件被当成完整下载交出去了"
+    assert "与服务端声明的不符" in manager.states()[0]["failed_reason"]

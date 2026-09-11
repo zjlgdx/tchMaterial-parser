@@ -280,34 +280,34 @@ class App:
             messagebox.showinfo("提示", "资源链接已复制到剪贴板")
 
     def download(self) -> None: # 下载资源文件
-        self.download_btn.config(state="disabled") # 设置下载按钮为禁用状态
-
-        # 有线程在飞时清空状态会丢掉它们的进度与完成判定，进度与完成提示随之全乱
+        # 这一步在置灰之前：有线程在飞时清空状态会丢掉它们的进度与完成判定，
+        # 而此刻按钮本就是那一批置灰的，轮到它们跑完时自会还回来
         if not self.downloads.reset():
             messagebox.showinfo("提示", "仍有下载任务未完成，请等待其结束。")
             return
+
+        self.download_btn.config(state="disabled") # 设置下载按钮为禁用状态
 
         urls = self.input_urls()
         failed_links = []
         submitted = 0 # 已投递的下载线程数；只要不为 0，解禁按钮的权力就归完成回调
 
-        if len(urls) > 1:
-            messagebox.showinfo("提示", "您选择了多个链接，将在选定的文件夹中使用教材名称作为文件名进行下载。")
-            dir_path = filedialog.askdirectory() # 选择文件夹
-            if os_name == "Windows":
-                dir_path = dir_path.replace("/", "\\")
-            if not dir_path:
-                self.download_btn.config(state="normal")
-                return
-        else:
-            dir_path = None
-
-        # 整批提交完了才开闸让轮询器判定。放在循环里开的话，只要循环中途跑过
+        # try 从置灰的下一行就开始：选目录对话框在某些桌面环境会抛，异常被 Tk
+        # 的回调处理器吞掉只记一行日志，按钮就永远停在 disabled 上。
+        # 整批提交完了才开闸让轮询器判定——放在循环里开的话，只要循环中途跑过
         # 一次嵌套事件循环（模态对话框就会），轮询器就可能看到「才登记了两个、
-        # 而这两个恰好都跑完了」的半截快照，把它当成整批结束。
-        # 而 finally 是必须的：循环里任何一个意外异常都会跳过开闸，于是轮询器
-        # 不刷进度也不弹完成框，按钮永远停在 disabled 上——用户只能重启程序
+        # 而这两个恰好都跑完了」的半截快照，把它当成整批结束
         try:
+            if len(urls) > 1:
+                messagebox.showinfo("提示", "您选择了多个链接，将在选定的文件夹中使用教材名称作为文件名进行下载。")
+                dir_path = filedialog.askdirectory() # 选择文件夹
+                if os_name == "Windows":
+                    dir_path = dir_path.replace("/", "\\")
+                if not dir_path: # 用户取消了选择文件夹
+                    return
+            else:
+                dir_path = None
+
             for url in urls:
                 # 兜底包的是循环体而不是整个循环：包整个循环的话，第 3 条链接上的
                 # 意外异常会让第 4 条之后根本不被投递，而同一循环里的解析失败是

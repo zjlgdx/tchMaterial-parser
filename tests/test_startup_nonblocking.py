@@ -20,6 +20,22 @@ SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "src", "tchmaterial_parser", "ui", "app.py")
 
 
+@pytest.fixture(autouse=True)
+def _no_leftover_tk_root():
+    """用例失败时也要把 Tk 根窗口收掉。
+
+    漏一个根窗口，下一条用例建的图标就属于另一个解释器，报出来的是
+    「can't use pyimage2 as iconphoto」——真正的失败原因被这串级联淹没。
+    """
+    yield
+    root = getattr(tk, "_default_root", None)
+    if root is not None:
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass # 用例自己已经关掉了
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _requires_a_display():
     """图形环境探测只做这一次。
@@ -538,6 +554,65 @@ def test_one_bad_link_does_not_stop_the_rest_of_the_batch(monkeypatch, tmp_path)
 
     assert str(app.download_btn.cget("state")) == "normal", "整批结束后按钮没回来"
     assert app.download_session is False
+
+    monkeypatch.undo()
+    app.downloads._states.clear()
+    app.root.destroy()
+
+
+@pytest.mark.parametrize("victim, boom", [
+    ("showinfo", "多链接提示弹不出来"),
+    ("askdirectory", "选目录对话框抛了"),
+])
+def test_a_dialog_blowing_up_before_the_loop_still_frees_the_button(monkeypatch, victim, boom):
+    """置灰之后、投递之前的那几个模态调用同样要被兜底盖住（R5 P2-4）。
+
+    它们抛出的异常会被 Tk 的回调处理器吞掉只记一行日志，按钮就永远停在
+    disabled 上——用户只能重启程序，正是这个兜底要根治的场景。
+    """
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    app = app_module.App()
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    app.url_text.insert("1.0", "https://basic.smartedu.cn/tchMaterial/detail?contentId=x\n"
+                               "https://basic.smartedu.cn/tchMaterial/detail?contentId=y")
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(app_module.filedialog, "askdirectory", lambda *a, **k: "/tmp")
+
+    target = app_module.messagebox if victim == "showinfo" else app_module.filedialog
+    monkeypatch.setattr(target, victim,
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError(boom)))
+
+    with pytest.raises(RuntimeError):
+        app.download()
+
+    assert str(app.download_btn.cget("state")) == "normal", \
+        "%s 抛异常之后按钮卡在 disabled 上" % victim
+    assert app.download_session is False
+
+    monkeypatch.undo()
+    app.root.destroy()
+
+
+def test_refusing_a_second_batch_does_not_disturb_the_running_one(monkeypatch):
+    """还有任务在飞时再点下载：那一批的闸门与按钮都不该被这次调用动到。"""
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    app = app_module.App()
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    app.downloads._states.append(new_download_state("u", "/tmp/x.pdf")) # 还没跑完
+    app.download_session = True
+    app.download_btn.config(state="disabled")
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
+
+    app.download()
+
+    assert app.download_session is True, "在飞的那一批被这次调用关掉了闸门"
+    assert str(app.download_btn.cget("state")) == "disabled", "任务还在飞，按钮却被解禁了"
 
     monkeypatch.undo()
     app.downloads._states.clear()
