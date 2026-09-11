@@ -1486,6 +1486,7 @@ def test_downloads_ask_for_no_content_encoding(tmp_path):
     ("bytes 0-0/1", (0, 0, 1)),
     ("bytes 8-15/*", (8, 15, None)), # 总长未知，但起点与终点都是确定的
     ("bytes */16", None),
+    ("bytes 15-8/16", None), # 自相矛盾的区间
     ("items 8-15/16", None),
     ("8-15/16", None),
     ("", None),
@@ -1504,7 +1505,7 @@ def test_parse_content_range(raw, expected):
     ({"Content-Range": "bytes 8-15/16"}, 8, 16, "续传：全长取 Content-Range 的 /Z"),
     ({"Content-Length": "8"}, 8, None, "续传却没有 Content-Range：不知道"),
     ({"Content-Range": "bytes 8-15/*"}, 8, 16,
-     "总长写成 * 也还有终点：我们请求的是开区间，终点加一就是全长"),
+     "总长写成 * 时退到这一段的终点：够检出本段短传，但不等于全长"),
     ({"Content-Length": "16", "Content-Encoding": "gzip"}, 0,
      None, "声明的长度描述的不是要写进文件的那些字节"),
     ({"Content-Length": "16", "Content-Encoding": "identity"}, 0, 16,
@@ -1513,14 +1514,14 @@ def test_parse_content_range(raw, expected):
      "头值大小写与空白都不该改变结论"),
     ({"Content-Length": "不是数字"}, 0, None, "长度不是数字"),
 ])
-def test_expected_file_size(headers, start, expected, why):
+def test_expected_bytes_on_disk(headers, start, expected, why):
     """「不知道」必须是 None：0 一旦参与算术就会变成一个看起来合理的错数。"""
-    from tchmaterial_parser.core.downloader import expected_file_size
+    from tchmaterial_parser.core.downloader import expected_bytes_on_disk
 
     response = FakeResponse(200, headers=headers)
     if "Content-Length" not in headers:
         response.headers.pop("Content-Length", None)
-    assert expected_file_size(response, start) == expected, why
+    assert expected_bytes_on_disk(response, start) == expected, why
 
 
 # ---- R6-P2-1：起点对不上就丢掉残件 ----
@@ -1591,8 +1592,14 @@ def test_a_range_without_a_known_total_still_detects_a_short_transfer(tmp_path, 
     assert "与服务端声明的不符" in manager.states()[0]["failed_reason"]
 
 
-def test_a_complete_range_without_a_known_total_succeeds(tmp_path, monkeypatch):
-    """同一条路径上，收全了就该成功——别把「总长未知」变成「一律失败」。"""
+def test_a_range_that_delivers_what_it_promised_is_accepted(tmp_path, monkeypatch):
+    """负对照：这一段承诺多少就发了多少，不许被判成短传。
+
+    上一版这条写成「收全了就该成功」，而旧实现（总长为 * 就完全不校验）同样
+    让它绿——它测不出任何回归。它真正的职责是防「把段级判据收得过严」那一类
+    改动（变异成 last + 2 会红）；「少发了要判短传」由上面那条邻居负责，
+    别把两者写成同一个用例。
+    """
     monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
     save_path = str(tmp_path / "书.pdf")
 

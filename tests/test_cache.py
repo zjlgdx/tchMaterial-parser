@@ -126,7 +126,7 @@ def test_store_overwrites_and_leaves_no_temp_file():
     assert [n for n in os.listdir(directory) if n.endswith(".tmp")] == []
 
 
-# ---- 启动加载流程：缓存命中就完全不拉那四十余 MB ----
+# ---- 启动加载流程：缓存命中就完全不拉那几个列表文件 ----
 
 def load_catalog_with(client, **kwargs):
     from tchmaterial_parser.core.startup import load_catalog

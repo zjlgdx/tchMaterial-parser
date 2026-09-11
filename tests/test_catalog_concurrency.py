@@ -172,7 +172,7 @@ def test_cancellation_is_not_swallowed_by_the_page_level_tolerance():
     传输结束后的那次 _check_cancelled() 就在整页容错的 try 里。
     CatalogCancelled 现在不是 NetworkError / UpstreamFormatError 的子类所以
     穿得过去，但一旦有人把 except 放宽成 Exception，取消就会被记成「这一页
-    不可用」然后接着拉下一页——关窗之后目录线程还在闷头拉那四十余 MB。
+    不可用」然后接着拉下一页——关窗之后目录线程还在闷头拉剩下的列表文件。
 
     直接调 _load_one_list，而不是走 fetch_tree：循环外还有一次
     _check_cancelled()，它会在下一页补上，把「吞掉」这件事整个掩盖过去。

@@ -71,9 +71,9 @@ CONTENT_RANGE_RE = re.compile(r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 def parse_content_range(response):
     """解析 206 的 Content-Range，返回 (起点, 终点, 资源总长)。
 
-    头缺失或形如 bytes */8 这种没说清区间的，一律返回 None——这个响应证明不了
-    正文是从我们请求的偏移开始的。总长写成 * 时第三项为 None，但起点与终点
-    仍然是服务端明确承诺的。
+    头缺失、形如 bytes */8 这种没说清区间的、或者起点晚于终点的，一律返回
+    None——这个响应证明不了正文是从我们请求的偏移开始的。总长写成 * 时第三项
+    为 None，但起点与终点仍然是服务端明确承诺的。
     """
     raw = response.headers.get("Content-Range")
     if not raw:
@@ -81,9 +81,11 @@ def parse_content_range(response):
     match = CONTENT_RANGE_RE.match(raw)
     if not match:
         return None
+    first, last = int(match.group(1)), int(match.group(2))
+    if first > last: # bytes 15-8/16 这种自相矛盾的头，当它不存在
+        return None
     complete = match.group(3)
-    return (int(match.group(1)), int(match.group(2)),
-            None if complete == "*" else int(complete))
+    return first, last, (None if complete == "*" else int(complete))
 
 
 def content_range_starts_at(response, expected_start: int) -> bool:
@@ -97,8 +99,17 @@ def content_range_starts_at(response, expected_start: int) -> bool:
     return parsed is not None and parsed[0] == expected_start
 
 
-def expected_file_size(response, start: int):
-    """这一轮写完之后文件应当有多长；服务端没说清就返回 None。
+def expected_bytes_on_disk(response, start: int):
+    """这一轮写完之后 .part 应当有多长；服务端没说清就返回 None。
+
+    两种来源，强弱不同，别把它们混成一个说法：
+
+    - `Content-Range` 的 `/Z`，或首次下载时 200 的 `Content-Length`：**整份
+      文件的长度**，收齐了就是收齐了。
+    - `/Z` 写成 `*` 时退到**这一段的终点加一**。它只说明「这一段发完之后盘上
+      该到哪个偏移」，不能当成全长：RFC 9110 §15.3.7 允许 206 只满足所请求
+      区间的一部分（CDN 按块切分就会这样）。所以它够检出这一段的短传，不足以
+      证明整份文件已经完整——总长真正未知时，整份完整性本就无从验证。
 
     「不知道」必须是 None 而不是 0。0 一旦参与加法就会变成一个看起来合理的
     错数：分块传输的 206 按 RFC 9110 §8.6 严禁带 Content-Length，拿
@@ -117,12 +128,10 @@ def expected_file_size(response, start: int):
 
     parsed = parse_content_range(response)
     if parsed is not None:
-        first, last, complete = parsed
-        # 总长写成 * 时终点仍然算数：我们请求的是开区间 bytes=N-，一个守规矩的
-        # 206 覆盖到结尾，终点加一就是全长。丢掉它等于连本段短传都不再检测
+        _first, last, complete = parsed
         return complete if complete is not None else last + 1
 
-    if start: # 续上了一段却没有 Content-Range，无从知道整份有多长
+    if start: # 续上了一段却没有 Content-Range，无从知道这一轮该写到哪
         return None
 
     declared = response.headers.get("Content-Length")
@@ -435,9 +444,9 @@ class DownloadManager:
                 # 404 这类结果重试三次也还是同一个答案，白等 1+2+4 秒
                 raise PermanentDownloadError(f"服务器返回状态码 {response.status_code}")
 
-            # 「这个文件最终该有多长」只由这一处回答，进度条与完整性校验共用它。
-            # 拿不到就是 None，绝不退化成一个能参与算术的 0
-            expected = expected_file_size(response, start)
+            # 「这一轮写完之后盘上该有多少字节」只由这一处回答，进度条与短传
+            # 校验共用它。拿不到就是 None，绝不退化成一个能参与算术的 0
+            expected = expected_bytes_on_disk(response, start)
             if start == 0:
                 # 校验子在这里、也只在这里设置：它描述的就是紧接着写进去的字节
                 handle = part.open_fresh(response_validator(response))
