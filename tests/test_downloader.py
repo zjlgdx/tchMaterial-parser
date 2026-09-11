@@ -917,6 +917,21 @@ def test_part_file_binds_bytes_and_identity(tmp_path):
     assert part.validator is None and part.size == 0
 
 
+def test_open_fresh_leaves_no_identity_when_the_file_cannot_be_created(tmp_path):
+    """建不出文件就不该留下身份：磁盘满、无写权限时 open() 会抛。
+
+    否则这个对象短暂地描述着一个并不存在的文件——修法的全部价值就在于
+    身份与字节一体，类内部不该先破一次再指望外面兜底。
+    """
+    from tchmaterial_parser.core.downloader import PartFile
+
+    part = PartFile(str(tmp_path / "没有这个目录" / "x.part"))
+    with pytest.raises(OSError):
+        part.open_fresh(("ETag", "v1"))
+
+    assert part.validator is None, "文件没建出来，身份却留下了：%r" % (part.validator,)
+
+
 def test_part_file_promote_clears_identity(tmp_path):
     from tchmaterial_parser.core.downloader import PartFile
 
@@ -931,34 +946,64 @@ def test_part_file_promote_clears_identity(tmp_path):
     assert not os.path.exists(part.path)
 
 
+def _writes_to_validator(node) -> bool:
+    """这个节点是否在给某个对象的 validator 赋值。
+
+    要认全赋值的各种语法形态，漏一种这条守卫就形同虚设：属性赋值只是最常见
+    的一种，setattr、带注解的赋值、绕过 __setattr__ 直写 __dict__ 同样能改。
+    """
+    import ast
+
+    targets = []
+    if isinstance(node, ast.Assign):
+        targets = list(node.targets)
+    elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+        targets = [node.target]
+
+    for target in targets:
+        if isinstance(target, ast.Attribute) and target.attr == "validator":
+            return True
+        # part.__dict__["validator"] = x / vars(part)["validator"] = x
+        if (isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant)
+                and target.slice.value == "validator"):
+            return True
+
+    if isinstance(node, ast.Call):
+        name = node.func.id if isinstance(node.func, ast.Name) else \
+            node.func.attr if isinstance(node.func, ast.Attribute) else ""
+        if name in ("setattr", "__setattr__") and len(node.args) >= 2:
+            key = node.args[1]
+            if isinstance(key, ast.Constant) and key.value == "validator":
+                return True
+    return False
+
+
 def test_validator_is_only_assigned_inside_partfile():
-    """结构性保证：校验子只有 PartFile 能改。
+    """静态守卫：源码里不存在 PartFile 之外给 validator 赋值的写法。
 
     赋值点一旦散出去，「记着的身份」与「文件里的字节」就能各自变化，续传随时
     可能把两份不同版本拼在一起。守住「赋值点全在 PartFile 内部」这条，就不必
     逐个分支去检查有没有漏掉同步。
+
+    这条只管语法形态，不能替代行为回归：错误响应污染校验子的那两条端到端用例
+    仍然是主要防线，别因为有了这条就把它们删掉。
     """
     import ast
+    import glob
 
-    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                        "src", "tchmaterial_parser", "core", "downloader.py")
-    tree = ast.parse(open(path, encoding="utf-8").read())
-
-    part_cls = next(n for n in ast.walk(tree)
-                    if isinstance(n, ast.ClassDef) and n.name == "PartFile")
-    inside = range(part_cls.lineno, part_cls.end_lineno + 1)
-
+    src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "src", "tchmaterial_parser")
     offenders = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.Assign, ast.AugAssign)):
-            continue
-        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        for target in targets:
-            if isinstance(target, ast.Attribute) and target.attr == "validator":
-                if node.lineno not in inside:
-                    offenders.append(node.lineno)
+    for path in sorted(glob.glob(os.path.join(src_dir, "**", "*.py"), recursive=True)):
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        part_cls = next((n for n in ast.walk(tree)
+                         if isinstance(n, ast.ClassDef) and n.name == "PartFile"), None)
+        inside = range(part_cls.lineno, part_cls.end_lineno + 1) if part_cls else ()
+        for node in ast.walk(tree):
+            if _writes_to_validator(node) and node.lineno not in inside:
+                offenders.append("%s:%d" % (os.path.basename(path), node.lineno))
 
-    assert not offenders, "PartFile 之外有人在改 validator，行号：%s" % offenders
+    assert not offenders, "PartFile 之外有人在改 validator：%s" % offenders
 
 
 # ---- R3-P2-1：Content-Range 的可信度判定 ----
@@ -1063,10 +1108,15 @@ def test_no_test_hand_builds_a_download_state():
     for path in sorted(glob.glob(os.path.join(tests_dir, "*.py"))):
         tree = ast.parse(open(path, encoding="utf-8").read())
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Dict):
+            if isinstance(node, ast.Dict):
+                keys = {k.value for k in node.keys
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                    and node.func.id == "dict":
+                # dict(download_url=..., save_path=...) 与字面量等价，一并拦下
+                keys = {kw.arg for kw in node.keywords}
+            else:
                 continue
-            keys = {k.value for k in node.keys
-                    if isinstance(k, ast.Constant) and isinstance(k.value, str)}
             if "download_url" in keys and "save_path" in keys:
                 offenders.append("%s:%d" % (os.path.basename(path), node.lineno))
 

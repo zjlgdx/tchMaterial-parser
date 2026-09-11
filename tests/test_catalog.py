@@ -278,7 +278,6 @@ def test_pages_that_parse_but_place_nothing_are_a_format_error():
 
     单页跳过与「整棵树是空的」是两回事：前者可以容忍，后者必须响亮地失败。
     """
-    helper = None
     routes = {
         catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
         catalog.TCH_MATERIAL_VERSION: FakeResponse(200, json_data={"urls": LIST_A}),

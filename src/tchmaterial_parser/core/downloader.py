@@ -146,10 +146,15 @@ class PartFile:
         self.validator = None
 
     def open_fresh(self, validator):
-        """清空重写：文件内容与它的身份在同一步里一起换掉。"""
+        """清空重写：文件内容与它的身份在同一步里一起换掉。
+
+        身份等文件真的建出来再赋：open() 会因磁盘满、无写权限而抛，
+        先赋上就等于让这个对象短暂地描述一个并不存在的文件。
+        """
         self.discard()
+        handle = open(self.path, "wb")
         self.validator = validator
-        return open(self.path, "wb")
+        return handle
 
     def open_append(self):
         """续写：文件里已有的字节仍然属于 self.validator 描述的那份资源。"""

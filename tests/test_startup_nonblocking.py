@@ -494,3 +494,69 @@ def test_the_next_tick_is_scheduled_before_anything_that_can_throw(monkeypatch):
 
     monkeypatch.undo()
     app.root.destroy()
+
+
+def test_one_bad_link_does_not_stop_the_rest_of_the_batch(monkeypatch, tmp_path):
+    """部分成功、部分失败（R3 P2-3 的核心语义）。
+
+    坏的那条放在中间：放在末尾的话，「跳过它继续」与「就此终止整批」产生的
+    结果一模一样，用例就证明不了任何事。
+    """
+    monkeypatch.setattr(app_module, "load_catalog",
+                        lambda client, helper=None, progress_cb=None: (SAMPLE, False, None))
+    try:
+        app = app_module.App()
+    except tk.TclError as exc:
+        pytest.skip("无可用的图形环境: %s" % exc)
+    app.root.withdraw()
+    app.catalog_thread.join(timeout=5)
+
+    app.url_text.insert("1.0", "\n".join(
+        "https://basic.smartedu.cn/tchMaterial/detail?contentId=%s" % n
+        for n in ("good-1", "bad", "good-2")))
+    # 每条链接解析出各自的资源地址，才能看出投递的是哪一条
+    monkeypatch.setattr(app_module, "parse",
+                        lambda client, url: ("https://x/%s.pdf" % url.rsplit("=", 1)[1],
+                                             "cid", url.rsplit("=", 1)[1]))
+
+    def build_or_explode(dir_path, title):
+        if title == "bad":
+            raise RuntimeError("第二本的意外")
+        return str(tmp_path / ("%s.pdf" % title))
+
+    monkeypatch.setattr(app_module, "build_save_path", build_or_explode)
+
+    submitted = []
+
+    def fake_submit(url, save_path):
+        submitted.append(url)
+        app.downloads._states.append(new_download_state(url, save_path))
+
+    monkeypatch.setattr(app.downloads, "submit", fake_submit)
+
+    dialogs = []
+    monkeypatch.setattr(app_module.messagebox, "showwarning",
+                        lambda title, msg, *a, **k: dialogs.append(msg))
+    monkeypatch.setattr(app_module.messagebox, "showinfo", lambda *a, **k: None)
+    monkeypatch.setattr(app_module.filedialog, "askdirectory", lambda *a, **k: str(tmp_path))
+
+    app.download()
+
+    assert len(submitted) == 2, "坏的那条终止了整批，后面的没被投递：%r" % (submitted,)
+    assert submitted == ["https://x/good-1.pdf", "https://x/good-2.pdf"], submitted
+    assert dialogs and "第二本的意外" in dialogs[0], dialogs
+    assert app.download_session is True, "有任务在飞，闸门却没开"
+    assert str(app.download_btn.cget("state")) == "disabled", \
+        "还有任务在飞，按钮就被 finally 提前还回去了"
+
+    # 任务跑完，轮询器判定整批结束，按钮这时才该回来
+    for state in app.downloads._states:
+        state.update(finished=True, downloaded_size=8, total_size=8)
+    app.poll_downloads()
+
+    assert str(app.download_btn.cget("state")) == "normal", "整批结束后按钮没回来"
+    assert app.download_session is False
+
+    monkeypatch.undo()
+    app.downloads._states.clear()
+    app.root.destroy()
