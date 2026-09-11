@@ -62,12 +62,12 @@ def parse(url: str) -> tuple[str, str, str] | tuple[None, None, None]: # 解析 
         # 其中 $.ti_items 的每一项对应一个资源
 
         if re.search(r"^https?://([^/]+)/syncClassroom/basicWork/detail", url): # 对于 “基础性作业” 的解析
-            response = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/special_edu/resources/details/{content_id}.json")
+            response = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/special_edu/resources/details/{content_id}.json", timeout=DEFAULT_TIMEOUT)
         else: # 对于课本的解析
             if content_type == "thematic_course": # 对专题课程（含电子课本、视频等）的解析
-                response = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/special_edu/resources/details/{content_id}.json")
+                response = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/special_edu/resources/details/{content_id}.json", timeout=DEFAULT_TIMEOUT)
             else: # 对普通电子课本的解析
-                response = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/{content_id}.json")
+                response = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrv2/resources/tch_material/details/{content_id}.json", timeout=DEFAULT_TIMEOUT)
 
         data = response.json()
         for item in list(data["ti_items"]):
@@ -79,7 +79,7 @@ def parse(url: str) -> tuple[str, str, str] | tuple[None, None, None]: # 解析 
 
         if not resource_url:
             if content_type == "thematic_course": # 专题课程
-                resources_resp = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/special_edu/thematic_course/{content_id}/resources/list.json")
+                resources_resp = session.get(f"https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/special_edu/thematic_course/{content_id}/resources/list.json", timeout=DEFAULT_TIMEOUT)
                 resources_data = resources_resp.json()
                 for resource in list(resources_data):
                     if resource["resource_type_code"] == "assets_document":
@@ -103,7 +103,7 @@ def download_file(url: str, save_path: str) -> None: # 下载文件
     current_state = { "download_url": url, "save_path": save_path, "downloaded_size": 0, "total_size": 0, "finished": False, "failed_reason": None }
     download_states.append(current_state)
 
-    response = session.get(url, headers=headers, stream=True)
+    response = session.get(url, stream=True, timeout=DEFAULT_TIMEOUT)
 
     # 服务器返回 401 或 403 状态码
     if response.status_code == 401 or response.status_code == 403:
@@ -359,17 +359,17 @@ class resource_helper: # 获取网站上资源的数据
 
     def fetch_book_list(self): # 获取课本列表
         # 获取电子课本层级数据
-        tags_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/tch_material_tag.json")
+        tags_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/tch_material_tag.json", timeout=DEFAULT_TIMEOUT)
         tags_data = tags_resp.json()
         parsed_hier = self.parse_hierarchy(tags_data["hierarchies"])
 
         # 获取电子课本 URL 列表
-        list_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json")
+        list_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json", timeout=DEFAULT_TIMEOUT)
         list_data: list[str] = list_resp.json()["urls"].split(",")
 
         # 获取电子课本列表
         for url in list_data:
-            book_resp = session.get(url)
+            book_resp = session.get(url, timeout=DEFAULT_TIMEOUT)
             book_data: list[dict] = book_resp.json()
             for book in book_data:
                 if len(book["tag_paths"]) > 0: # 某些非课本资料的 tag_paths 属性为空数组
@@ -396,17 +396,17 @@ class resource_helper: # 获取网站上资源的数据
 
     def fetch_lesson_list(self): # 获取课件列表
         # 获取课件层级数据
-        tags_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/national_lesson_tag.json")
+        tags_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/national_lesson_tag.json", timeout=DEFAULT_TIMEOUT)
         tags_data = tags_resp.json()
         parsed_hier = self.parse_hierarchy([{ "children": [{ "tag_id": "__internal_national_lesson", "hierarchies": tags_data["hierarchies"], "tag_name": "课件资源" }] }])
 
         # 获取课件 URL 列表
-        list_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/national_lesson/teachingmaterials/version/data_version.json")
+        list_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/national_lesson/teachingmaterials/version/data_version.json", timeout=DEFAULT_TIMEOUT)
         list_data: list[str] = list_resp.json()["urls"]
 
         # 获取课件列表
         for url in list_data:
-            lesson_resp = session.get(url)
+            lesson_resp = session.get(url, timeout=DEFAULT_TIMEOUT)
             lesson_data: list[dict] = lesson_resp.json()
             for lesson in lesson_data:
                 if len(lesson["tag_list"]) > 0:
@@ -438,13 +438,18 @@ def thread_it(func, args: tuple = ()) -> None: # args 为元组，且默认值�
     # t.daemon = True
     t.start()
 
+# 连接超时 10 秒 / 读取超时 30 秒；读取超时是“两次收到数据之间”的间隔而非总时长，
+# 因此对大文件下载同样适用，且能让服务端不响应时线程在半分钟内结束而不是永久挂起
+DEFAULT_TIMEOUT = (10, 30)
+
 # 初始化请求
 session = requests.Session()
 # 初始化下载状态
 download_states = []
 # 设置请求头部，包含认证信息
 access_token = None
-headers = { "X-ND-AUTH": 'MAC id="0",nonce="0",mac="0"' } # “MAC id”等同于“access_token”，“nonce”和“mac”不可缺省但无需有效
+# 鉴权头挂在 session 上，详情接口与下载接口才会共用同一份凭据
+session.headers["X-ND-AUTH"] = 'MAC id="0",nonce="0",mac="0"' # “MAC id”等同于“access_token”，“nonce”和“mac”不可缺省但无需有效
 session.proxies = { "http": None, "https": None } # 全局忽略代理
 
 def load_access_token() -> None: # 读取本地存储的 Access Token
@@ -456,7 +461,7 @@ def load_access_token() -> None: # 读取本地存储的 Access Token
                 if token:
                     access_token = token
                     # 更新请求头
-                    headers["X-ND-AUTH"] = f'MAC id="{access_token}",nonce="0",mac="0"'
+                    session.headers["X-ND-AUTH"] = f'MAC id="{access_token}",nonce="0",mac="0"'
         elif os_name == "Linux": # 在 Linux 上，从 ~/.config/tchMaterial-parser/data.json 文件读取
             # 构建文件路径
             target_file = os.path.join(
@@ -480,7 +485,7 @@ def load_access_token() -> None: # 读取本地存储的 Access Token
 def set_access_token(token: str) -> str: # 设置并更新 Access Token
     global access_token
     access_token = token
-    headers["X-ND-AUTH"] = f'MAC id="{access_token}",nonce="0",mac="0"'
+    session.headers["X-ND-AUTH"] = f'MAC id="{access_token}",nonce="0",mac="0"'
 
     try:
         if os_name == "Windows": # 在 Windows 上，将 Access Token 写入注册表
