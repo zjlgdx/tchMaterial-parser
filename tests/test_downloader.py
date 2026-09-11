@@ -11,7 +11,8 @@ import pytest
 from conftest import FakeResponse, FakeSession
 from tchmaterial_parser.config import AppConfig
 from tchmaterial_parser.core import naming
-from tchmaterial_parser.core.downloader import (DownloadManager, content_range_starts_at,
+from tchmaterial_parser.core.downloader import (DownloadManager, build_save_path,
+                                                 content_range_starts_at,
                                                  new_download_state, response_validator)
 from tchmaterial_parser.core.http import HttpClient
 
@@ -1219,3 +1220,69 @@ def test_a_short_transfer_is_not_promoted_as_a_complete_file(tmp_path, monkeypat
 
     assert not os.path.exists(save_path), "截断的文件被当成完整下载交出去了"
     assert "与服务端声明的不符" in manager.states()[0]["failed_reason"]
+
+
+# ---- R5-P2-7：登记之后投递失败，不许留下永远跑不完的幽灵状态 ----
+
+def test_a_failed_submit_does_not_leave_an_unfinishable_task(tmp_path, monkeypatch):
+    """线程起不来时那条状态必须就地判死。
+
+    否则 all_finished 恒假：按钮永久置灰、关窗永远弹「下载任务未完成」，
+    而且没有任何一条线程会来把它翻成完成。
+    """
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
+    save_path = str(tmp_path / "书.pdf")
+
+    class RefusingExecutor:
+        def submit(self, *a, **kw):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(manager, "_ensure_executor", lambda: RefusingExecutor())
+
+    with pytest.raises(RuntimeError):
+        manager.submit(URL, save_path)
+
+    assert manager.all_finished() is True, "留下了一条永远跑不完的任务"
+    state = manager.states()[0]
+    assert state["finished"] is True
+    assert "can't start new thread" in state["failed_reason"]
+    assert manager.snapshot().all_finished is True
+
+
+def test_a_failed_submit_gives_the_reserved_name_back(tmp_path, monkeypatch):
+    """投递失败后重试同一本教材，仍要拿回不带序号的原名。"""
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
+    first = build_save_path(str(tmp_path), "语文一年级上册")
+
+    class RefusingExecutor:
+        def submit(self, *a, **kw):
+            raise RuntimeError("池已关闭")
+
+    monkeypatch.setattr(manager, "_ensure_executor", lambda: RefusingExecutor())
+    with pytest.raises(RuntimeError):
+        manager.submit(URL, first)
+
+    assert build_save_path(str(tmp_path), "语文一年级上册") == first, "预留没有归还"
+
+
+# ---- R5-P2-8：头名大小写不敏感 ----
+
+def test_headers_are_read_case_insensitively(tmp_path, monkeypatch):
+    """真实服务端发的是 content-range:，替身也得照这个行为走。"""
+    monkeypatch.setattr("tchmaterial_parser.core.downloader.RETRY_BACKOFF", (0, 0, 0))
+    save_path = str(tmp_path / "书.pdf")
+
+    session = ScriptedSession([
+        FakeResponse(200, [b"AAAA", b"XXXX"], boom_after=1,
+                     headers={"etag": "v1", "content-length": "8"}),
+        FakeResponse(206, [b"BBBB"],
+                     headers={"etag": "v1", "content-length": "4",
+                              "content-range": "bytes 4-7/8"}),
+    ])
+    manager = make_manager(session, config=AppConfig(chunk_size=4, max_retries=3))
+    manager.download_file(URL, save_path)
+
+    assert session.calls[1][1].get("If-Range") == "v1", \
+        "小写的 etag 没被认出来：%r" % (session.calls[1][1],)
+    assert open(save_path, "rb").read() == b"AAAABBBB"
+    assert manager.states()[0]["failed_reason"] is None

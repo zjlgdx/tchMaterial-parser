@@ -11,7 +11,9 @@ class FakeResponse:
         self.status_code = status_code
         self._chunks = list(chunks)
         self._json = json_data
-        self.headers = dict(headers or {})
+        # requests.Response.headers 是 CaseInsensitiveDict；替身用普通 dict
+        # 的话，真实流量里 content-range: 这种写法在测试里从没被走到过
+        self.headers = requests.structures.CaseInsensitiveDict(headers or {})
         self.headers.setdefault("Content-Length", str(sum(len(c) for c in self._chunks)))
         self._boom_after = boom_after
         self._on_chunk = on_chunk

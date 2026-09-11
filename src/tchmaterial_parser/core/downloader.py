@@ -260,7 +260,18 @@ class DownloadManager:
         state = new_download_state(url, save_path)
         with self._lock:
             self._states.append(state)
-        return self._ensure_executor().submit(self.download_file, url, save_path, state)
+        try:
+            return self._ensure_executor().submit(self.download_file, url, save_path, state)
+        except Exception as e:
+            # 登记在前、投递在后，中间出岔子（线程起不来、池已关闭）就会留下一条
+            # 永远翻不成 finished 的幽灵状态：all_finished 恒假，按钮永久置灰，
+            # 关窗永远弹「下载任务未完成」。就地判它失败，再把异常交出去
+            logger.warning("下载任务投递失败：%s（%s）", url, e)
+            with self._lock:
+                state["finished"] = True
+                state["failed_reason"] = str(e)
+            naming.release_path(save_path)
+            raise
 
     def cancel_all(self) -> None:
         """关窗时调用。
