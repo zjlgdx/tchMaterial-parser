@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from ..config import AppConfig
-from .errors import UpstreamFormatError
+from .errors import NetworkError, UpstreamFormatError
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +74,7 @@ class PageOutcome:
     usable: bool
     placed: int = 0
     skipped: int = 0
+    reason: str = "" # 整页不可用时留下原因，全都不可用时要报给用户
 
 
 def iter_nodes(tree):
@@ -173,7 +174,7 @@ class ResourceHelper: # 获取网站上资源的数据
             # 只丢这一页，另外几页照常建树——「一条坏数据不该让整棵树报废」
             # 同样适用于「一页坏数据」，何况用户失去的是整个选择功能
             logger.warning("课本列表不是数组，整页跳过：%s", url)
-            return PageOutcome(usable=False)
+            return PageOutcome(usable=False, reason="课本列表不是数组")
 
         placed = 0
         skipped = 0
@@ -194,10 +195,19 @@ class ResourceHelper: # 获取网站上资源的数据
 
     def _load_one_list(self, url: str, parsed_hier: dict, parse_lock) -> PageOutcome:
         self._check_cancelled()
-        response = self.client.get(url) # 传输：并行，瓶颈在网络
-        self._check_cancelled()
-        with parse_lock: # 解析 + 裁剪 + 挂树：串行，同一时刻只存在一份中间对象
-            return self.parse_and_merge(url, response, parsed_hier)
+        try:
+            response = self.client.get(url) # 传输：并行，瓶颈在网络
+            self._check_cancelled()
+            with parse_lock: # 解析 + 裁剪 + 挂树：串行，同一时刻只存在一份中间对象
+                return self.parse_and_merge(url, response, parsed_hier)
+        except (NetworkError, UpstreamFormatError) as e:
+            # 整页不可用有好几种形态——连不上、5xx、正文不是 JSON、不是数组——
+            # 对用户来说结论是同一个：这一页没有课本可用。只丢这一页，其余几页
+            # 照常建树；全都不可用时由 placed == 0 那道下界响亮地失败。
+            # AuthError 不在这里拦：Token 失效四页都会失败，而那句「请重新设置
+            # Token」是用户唯一能据以行动的信息，不该被降级成一句格式错误
+            logger.warning("课本列表整页跳过：%s（%s）", url, e)
+            return PageOutcome(usable=False, reason=str(e))
 
     def fetch_tree(self, version: CatalogVersion = None, progress_cb=None) -> dict:
         """拉取四个列表文件并建树；只有缓存未命中时才会走到这里。"""
@@ -212,6 +222,7 @@ class ResourceHelper: # 获取网站上资源的数据
         placed = 0
         skipped = 0
         skipped_pages = 0
+        page_reasons = []
         done = 0
         parse_lock = threading.Lock()
         workers = max(1, min(self.config.max_catalog_workers, total or 1))
@@ -224,7 +235,9 @@ class ResourceHelper: # 获取网站上资源的数据
                     outcome = future.result()
                     placed += outcome.placed
                     skipped += outcome.skipped
-                    skipped_pages += 0 if outcome.usable else 1
+                    if not outcome.usable:
+                        skipped_pages += 1
+                        page_reasons.append(outcome.reason)
                     done += 1
                     if progress_cb is not None:
                         progress_cb(done, total)
@@ -248,9 +261,10 @@ class ResourceHelper: # 获取网站上资源的数据
         # 覆盖掉上一份能用的离线缓存——用户逐层展开全是空的，重启也不自愈。
         # 响亮地失败，缓存回退才接得住
         if placed == 0:
+            detail = page_reasons[0] if page_reasons else f"另有 {skipped} 条条目被跳过"
             raise UpstreamFormatError(
                 f"课本列表里没有任何一本课本可以挂上层级树"
-                f"（{skipped_pages}/{total} 个列表文件整页跳过，另有 {skipped} 条条目被跳过）")
+                f"（{skipped_pages}/{total} 个列表文件整页跳过：{detail}）")
 
         return parsed_hier
 

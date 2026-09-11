@@ -204,7 +204,7 @@ tchMaterial-parser/
 - `fetch_version(client) -> CatalogVersion`：只取 `data_version.json` 这一个小文件，返回 `dataclass(version, urls)`——`version` 是缓存键，`urls` 是四个列表文件的地址。这一步的代价是一次小请求，**任何启动路径都付得起**。
 - `fetch_tree(client, version, urls, progress_cb=None) -> CatalogNode`：取标签层级，拉取四个列表文件并建树。只有缓存未命中时才会被调用。
 - 建树时**逐条目 try/except**，坏条目 `logger.debug` 记录并跳过，最后汇总一条 WARNING「跳过 N 条无法解析的条目」，绝不让一条坏数据毁掉整棵树（C2）。
-- 容错分**条目**与**整页**两级，两级都计数并在末尾各汇总一条 WARNING。但容错有下界：四个列表文件出自同一个接口，真实的格式变更是四页同时变形，此时「每页都跳过」会退化成一棵只有分类、没有课本的树。**一本课本都没挂上就抛 `UpstreamFormatError`**——否则 `load_catalog` 会把这棵空树当成好数据写进缓存，覆盖掉上一份能用的离线缓存，用户逐层展开全是空的且重启不自愈。响亮地失败，任务 10 的缓存回退才接得住。
+- 容错分**条目**与**整页**两级，两级都计数并在末尾各汇总一条 WARNING。「整页不可用」包含连不上、HTTP 错、正文不是 JSON、不是数组这几种形态——对用户来说结论相同：这一页没有课本可用。`AuthError` 例外，它不降级：Token 失效四页都会中，而「请重新设置 Token」是用户唯一能据以行动的信息。但容错有下界：四个列表文件出自同一个接口，真实的格式变更是四页同时变形，此时「每页都跳过」会退化成一棵只有分类、没有课本的树。**一本课本都没挂上就抛 `UpstreamFormatError`**——否则 `load_catalog` 会把这棵空树当成好数据写进缓存，覆盖掉上一份能用的离线缓存，用户逐层展开全是空的且重启不自愈。响亮地失败，任务 10 的缓存回退才接得住。
 - `CatalogNode` 是 `dataclass(node_id, display_name, resource_type_code, children)`，**只保留这四个字段**，`global_description` 等大字段在建树时丢弃（A3、任务 11）。`resource_type_code` 用 `.get(...) or "assets_document"` 取，缺字段不再 KeyError（C2 的 `:661` / `:691`）。
 - `progress_cb` 是一个接受 `(done, total)` 的纯回调，由 UI 侧包装成线程安全的状态写入——`catalog.py` 本身对 UI 一无所知。
 - 拉取与解析的并发形态见下文「数据规模与响应性」，那里的四条约束对本模块是硬性的。

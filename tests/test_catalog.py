@@ -4,11 +4,12 @@
 import logging
 
 import pytest
+import requests
 
 from conftest import FakeResponse, FakeSession
 from tchmaterial_parser.config import AppConfig
 from tchmaterial_parser.core import catalog
-from tchmaterial_parser.core.errors import UpstreamFormatError
+from tchmaterial_parser.core.errors import AuthError, UpstreamFormatError
 from tchmaterial_parser.core.http import HttpClient
 
 LIST_A = "https://example.invalid/list-a.json"
@@ -318,3 +319,67 @@ def test_a_single_bad_page_still_yields_a_tree_and_counts_the_page(caplog):
     assert helper.skipped_pages == 1, helper.skipped_pages
     summary = [r.getMessage() for r in caplog.records if "1/2" in r.getMessage()]
     assert summary, [r.getMessage() for r in caplog.records]
+
+
+# ---- R5-P2-5：整页不可用不止「不是数组」一种 ----
+
+@pytest.mark.parametrize("bad_response, fragment", [
+    (FakeResponse(500), "状态码 500"),
+    (FakeResponse(200, json_data=None), "不是合法的 JSON"), # json() 抛 ValueError
+    (requests.ConnectionError("dropped"), "网络请求失败"),
+    (FakeResponse(200, json_data={"data": []}), "不是数组"),
+])
+def test_any_kind_of_unusable_page_is_skipped_not_fatal(bad_response, fragment, caplog):
+    """一页 5xx、半截 JSON、连不上，都不该带走另外三页已经拿到手的课本。"""
+    good = "https://example.invalid/good.json"
+    bad = "https://example.invalid/bad.json"
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(
+            200, json_data={"urls": "%s,%s" % (bad, good)}),
+        bad: bad_response,
+        good: FakeResponse(200, json_data=[book("b1", "语文一年级上册")]),
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+    helper = catalog.ResourceHelper(client)
+
+    with caplog.at_level(logging.WARNING, logger="tchmaterial_parser.core.catalog"):
+        tree = helper.fetch_tree()
+
+    assert {book_id for book_id, _ in leaves(tree)} == {"b1"}, "坏的那一页把好的带走了"
+    assert helper.skipped_pages == 1
+    assert any("整页跳过" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("bad_response, fragment", [
+    (FakeResponse(500), "状态码 500"),
+    (requests.ConnectionError("dropped"), "网络请求失败"),
+])
+def test_all_pages_unusable_reports_the_real_reason(bad_response, fragment):
+    """全都不可用时要响亮失败，且带上第一页的真实原因而不是一句「不是数组」。"""
+    page_a = "https://example.invalid/a.json"
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(200, json_data={"urls": page_a}),
+        page_a: bad_response,
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+
+    with pytest.raises(UpstreamFormatError) as excinfo:
+        catalog.ResourceHelper(client).fetch_tree()
+    assert fragment in str(excinfo.value), str(excinfo.value)
+
+
+def test_an_expired_token_is_reported_as_such_not_as_a_format_error():
+    """401 四页都会中，把它降级成格式错误会抹掉用户唯一能据以行动的信息。"""
+    page_a = "https://example.invalid/a.json"
+    routes = {
+        catalog.TCH_MATERIAL_TAGS: FakeResponse(200, json_data=TAGS),
+        catalog.TCH_MATERIAL_VERSION: FakeResponse(200, json_data={"urls": page_a}),
+        page_a: FakeResponse(401),
+    }
+    client = HttpClient(config=AppConfig(), session=FakeSession(routes))
+
+    with pytest.raises(AuthError) as excinfo:
+        catalog.ResourceHelper(client).fetch_tree()
+    assert "Token" in str(excinfo.value)
