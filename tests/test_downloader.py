@@ -1259,12 +1259,11 @@ def test_a_failed_submit_registers_nothing(tmp_path, monkeypatch):
     assert manager.snapshot().all_finished is False # 一条都没有，谈不上「整批完成」
 
 
-def test_a_failed_submit_keeps_the_reservation(tmp_path, monkeypatch):
-    """投递失败不归还文件名预留。
+def test_a_failed_submit_gives_the_reserved_name_back(tmp_path, monkeypatch):
+    """劝退成功的任务不会再用那个路径，预留就该还回去。
 
-    ThreadPoolExecutor 先入队再起线程，起线程失败时那条任务可能仍会跑。
-    此刻归还预留，下一条任务就可能拿到同一个路径，两条 worker 同时写一个
-    .part——用「下次重下时名字带个 (2)」换掉一次静默的文件损坏。
+    不还会留下设计里点名的「幽灵序号」：修好之后重下同一本教材，名字一路
+    涨到 (2) (3) (4)。
     """
     manager = make_manager(FakeSession(default=FakeResponse(200, [b"x"])))
     first = build_save_path(str(tmp_path), "语文一年级上册")
@@ -1277,33 +1276,127 @@ def test_a_failed_submit_keeps_the_reservation(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         manager.submit(URL, first)
 
-    assert build_save_path(str(tmp_path), "语文一年级上册") != first, \
-        "预留被归还了，下一条任务会拿到同一个路径"
+    assert build_save_path(str(tmp_path), "语文一年级上册") == first, "预留没有归还"
 
 
-def test_a_queued_task_that_still_runs_is_not_declared_dead(tmp_path, monkeypatch):
-    """起线程失败但任务已入队：它照样会跑完，期间不许有人宣布整批结束。"""
+def test_a_disowned_task_writes_nothing_if_it_is_scheduled_anyway(tmp_path, monkeypatch):
+    """归属裁定之一：投递侧先拿到锁。
+
+    ThreadPoolExecutor 先入队、后起线程，所以「submit 抛了」并不等于「没入队」。
+    投递侧此刻已经摘掉状态、归还了预留，那条任务若还开跑，就会写一个没人认得
+    的文件，还可能和拿到同一路径的新任务对着写同一个 .part。
+    """
     manager = make_manager(FakeSession(default=FakeResponse(200, [b"payload!"])))
     save_path = str(tmp_path / "书.pdf")
 
-    real = manager._ensure_executor()
+    class EnqueueWithoutRunning:
+        """入了队，但线程没起来——队列里那条任务什么时候跑由用例说了算。"""
 
-    class QueueThenFail:
-        """复刻 ThreadPoolExecutor 的顺序：先入队，再起线程（起线程这步抛）。"""
+        def __init__(self):
+            self.queued = []
 
         def submit(self, fn, *args, **kwargs):
-            real.submit(fn, *args, **kwargs)
+            self.queued.append((fn, args, kwargs))
             raise RuntimeError("can't start new thread")
 
-    monkeypatch.setattr(manager, "_ensure_executor", lambda: QueueThenFail())
+    executor = EnqueueWithoutRunning()
+    monkeypatch.setattr(manager, "_ensure_executor", lambda: executor)
 
     with pytest.raises(RuntimeError):
         manager.submit(URL, save_path)
 
-    real.shutdown(wait=True) # 等那条仍然入了队的任务跑完
+    assert manager.states() == [], "把一条已经判死的任务留在了状态表里"
 
-    assert manager.states() == [], "把一条仍会跑的任务登记进了状态表"
-    assert open(save_path, "rb").read() == b"payload!", "入了队的任务没跑完"
+    # 队列里那条任务仍被调度了
+    fn, args, kwargs = executor.queued[0]
+    fn(*args, **kwargs)
+
+    assert not os.path.exists(save_path), "被劝退的任务还是把文件写出来了"
+    assert not os.path.exists(save_path + ".part"), "留下了残件"
+    assert manager.states() == [], "被劝退的任务把自己加了回去"
+
+
+def test_a_worker_that_got_there_first_keeps_ownership(tmp_path, monkeypatch):
+    """归属裁定之二：工作线程先拿到锁，投递侧就不许再碰这条任务。
+
+    它一定会走到自己的 finally，判定与清理（含归还预留）都归它。投递侧这时
+    再判死、再归还，就是两边对着改同一条状态。
+    """
+    manager = make_manager(FakeSession(default=FakeResponse(200, [b"payload!"])))
+    save_path = build_save_path(str(tmp_path), "语文一年级上册")
+
+    class MarkStartedThenFail:
+        """工作线程抢在起线程失败之前认领了这条任务。"""
+
+        def submit(self, fn, *args, **kwargs):
+            state = args[2]
+            with manager._lock:
+                state["started"] = True
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(manager, "_ensure_executor", lambda: MarkStartedThenFail())
+
+    with pytest.raises(RuntimeError):
+        manager.submit(URL, save_path)
+
+    assert len(manager.states()) == 1, "工作线程已接手，投递侧却把状态摘掉了"
+    state = manager.states()[0]
+    assert state["finished"] is False, "投递侧替工作线程判了死"
+    assert state["failed_reason"] is None
+    assert build_save_path(str(tmp_path), "语文一年级上册") != save_path, \
+        "预留被投递侧归还了，而工作线程还打算用这个路径"
+
+
+def test_a_task_still_writing_keeps_the_batch_unfinished(tmp_path):
+    """A 已完成、B 正在写盘：这一批就不算完成。
+
+    登记必须早于「任务可能开跑」的那一刻。晚一步的话，B 已经在写文件而
+    _states 里只有跑完的 A，快照会说整批完成——界面据此弹完成框、解禁按钮，
+    用户可以开下一批，而 B 还在往磁盘上写。
+    """
+    url_a = "http://example.invalid/a.pdf"
+    url_b = "http://example.invalid/b.pdf"
+
+    writing = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    manager = None
+
+    def hold(_index):
+        writing.set()
+        release.wait(timeout=5)
+
+    session = FakeSession(routes={
+        url_a: FakeResponse(200, [b"A" * 8], headers={"Content-Length": "8"}),
+        url_b: FakeResponse(200, [b"B" * 8], headers={"Content-Length": "8"},
+                            on_chunk=lambda i: (seen.append(manager.snapshot().all_finished),
+                                                hold(i))),
+    })
+    manager = make_manager(session)
+
+    manager.submit(url_a, str(tmp_path / "a.pdf")).result() # A 先跑完
+    assert manager.snapshot().all_finished is True
+
+    real = manager._ensure_executor()
+
+    class SubmitThenLetItStart:
+        """让工作线程先跑起来，再让 submit 返回——真实世界里的那个窗口。"""
+
+        def submit(self, fn, *args, **kwargs):
+            future = real.submit(fn, *args, **kwargs)
+            assert writing.wait(timeout=5), "B 没有开始写盘"
+            return future
+
+    manager._ensure_executor = lambda: SubmitThenLetItStart()
+    future_b = manager.submit(url_b, str(tmp_path / "b.pdf"))
+
+    assert seen == [False], "B 正在写盘，快照却说整批完成了：%r" % (seen,)
+    assert manager.snapshot().all_finished is False
+
+    release.set()
+    future_b.result()
+    assert manager.snapshot().all_finished is True
 
 
 # ---- R5-P2-8：头名大小写不敏感 ----

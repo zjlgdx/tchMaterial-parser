@@ -44,7 +44,8 @@ def new_download_state(url: str, save_path: str) -> dict:
     等到真跑起来才报 KeyError，而测试恰恰是绿的。
     """
     return { "download_url": url, "save_path": save_path, "downloaded_size": 0,
-             "total_size": 0, "finished": False, "failed_reason": None, "attempts": 0 }
+             "total_size": 0, "started": False, "finished": False,
+             "failed_reason": None, "attempts": 0 }
 
 
 def remove_part_file(part_path: str) -> None: # 清理下载残件
@@ -307,31 +308,39 @@ class DownloadManager:
         return self._executor
 
     def submit(self, url: str, save_path: str):
-        """投递任务并登记。
+        """登记任务并投递。
 
         登记必须发生在这里、由调用方线程同步完成，而不是挪进工作线程：线程池
         排队的任务、调用方还没解析完的后续链接，都还不在 _states 里；把「是否
         全部完成」建立在「此刻已登记的那几条」之上，第一个跑完的任务就会被当成
-        全部跑完。
+        全部跑完。也必须排在投递**之前**：投递一返回，工作线程随时可能已经在
+        写盘了，此时它还不在 _states 里，快照就会说「整批完成」。
 
-        登记排在投递之后：ThreadPoolExecutor 是先入队再起线程，起线程失败时
-        那条任务可能已经在队列里、待会真的会跑。先登记再投递的话，为这种失败
-        补一个「就地判死」反而更糟——all_finished 会提前为真（弹完成框、解禁
-        按钮、下一批 reset 掉 _states），而那条 worker 还在写文件。反过来，
-        投递成功之后再登记，失败路径上压根没有半截状态需要收拾。
+        投递失败是这里唯一棘手的地方。ThreadPoolExecutor 是先入队、再起线程，
+        起线程失败时那条任务可能已经在队列里、待会真的会跑，调用方既拿不到
+        future 也无从判断——猜哪一边都会漏。所以不猜：这条任务的归属由**锁**
+        来定，工作线程开头那次检查与这里的判死在同一把 self._lock 里，两者
+        只有一个能拿到它。
         """
         state = new_download_state(url, save_path)
-        try:
-            future = self._ensure_executor().submit(self.download_file, url, save_path, state)
-        except Exception as e:
-            # 不归还文件名预留：那条任务可能仍会跑，归还就可能把同一个路径再发给
-            # 另一条 worker，两边同时写一个 .part。代价只是下次重下时名字带个 (2)
-            logger.warning("下载任务投递失败：%s（%s）", url, e)
-            raise
-
         with self._lock:
             self._states.append(state)
-        return future
+
+        try:
+            return self._ensure_executor().submit(self.download_file, url, save_path, state)
+        except Exception as e:
+            logger.warning("下载任务投递失败：%s（%s）", url, e)
+            with self._lock:
+                if state["started"]:
+                    # 工作线程已经接手：它一定会走到自己的 finally，判定与清理
+                    # 都归它。这里动任何一个字段都会和它打架
+                    raise
+                # 还没被接手：判死并摘掉。finished 置位就是留给那条「可能已入队」
+                # 的任务看的暗号——它开跑前会读到，然后原地退出
+                state["finished"] = True
+                self._states[:] = [item for item in self._states if item is not state]
+            naming.release_path(save_path) # 那条任务已被劝退，不会再用这个路径
+            raise
 
     def cancel_all(self) -> None:
         """关窗时调用。
@@ -458,6 +467,16 @@ class DownloadManager:
             current_state = new_download_state(url, save_path)
             with self._lock:
                 self._states.append(current_state)
+
+        with self._lock:
+            if current_state["finished"]:
+                # 投递侧已经替这条任务判了死：它入了队，但线程没起来，调用方
+                # 以为它不会跑。此刻它已经不在 _states 里、文件名预留也归还了，
+                # 再跑就是写一个没人认得的文件，还可能和拿到同一路径的新任务
+                # 对着写同一个 .part。认赔退出
+                logger.info("投递侧已放弃这条任务，工作线程不再执行：%s", url)
+                return
+            current_state["started"] = True # 从这里起，这条任务归工作线程管
 
         # 先写临时文件，写完整了才改名，失败时不会留下能被当成课本打开的半截 PDF
         part = PartFile(save_path + ".part")
