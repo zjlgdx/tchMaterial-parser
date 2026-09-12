@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# 供 test_download_resume_integration.py 与 manual_resume_demo.py 共用的本地测试服务器：
+# 供 test_download_resume_integration.py 共用的本地测试服务器：
 # 真的实现 Range / If-Range / ETag / 416 语义，而不是只回 200——否则证明不了续传，
 # 只是个更慢的单元测试。绑 port 0，调用方自己读回内核分配的实际端口。
 
