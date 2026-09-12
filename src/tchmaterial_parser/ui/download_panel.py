@@ -677,6 +677,9 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
     response = None
     registered_key = None
     paused = False # 暂停时 finished 保持 False，留给“继续”重新提交；其余情况都会在 finally 里置为 True
+    finalizing = False # 传输已确认完整、进入"加书签 + 改名"收尾阶段之后置位：.tmp 从这一刻起
+    # 可能不再是服务端正文的前缀（add_bookmarks 会整份重写它），这个阶段发生的暂停请求
+    # 不能再把任务回滚成"可续传"状态，只能判定为失败并清理，逼下一次发起全新下载
 
     def discard_temp_and_zero_counters() -> None: # 离开这个任务且不算暂停的路径都要走这里：
         # .tmp 可能是这次建的，也可能是上一轮暂停/续传留下的，一律清掉，计数器一律归零
@@ -749,7 +752,8 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                     current_state["failed_reason"] = f"文件下载不完整，需下载 {current_state['total_size']} 字节，实际下载 {current_state['downloaded_size']} 字节"
                     discard_temp_and_zero_counters()
                 else:
-                    if chapters: # 添加书签
+                    finalizing = True # 传输已确认完整；从这一刻起 .tmp 随时可能不再是服务端正文的前缀
+                    if chapters: # 添加书签：会把 .tmp 整份重写，字节内容、长度都会变
                         ui_call(progress_label.config, text="添加书签")
                         add_bookmarks(temp_path, chapters)
 
@@ -760,9 +764,11 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
         reason = stop_reason()
         if reason == "cancelled":
             discard_temp_and_zero_counters()
-        elif reason == "paused":
+        elif reason == "paused" and not finalizing:
             paused = True
         else:
+            # finalizing 阶段命中暂停也落到这里：加书签/改名失败时 .tmp 可能已经被整份重写，
+            # 不再是服务端正文的前缀，没有"继续"这回事，只能判定失败并清理，逼下一次全新下载
             print_error(e)
             current_state["failed_reason"] = redact_access_token(traceback.format_exc().rstrip())
             discard_temp_and_zero_counters()
