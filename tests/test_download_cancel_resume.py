@@ -656,8 +656,10 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         control.cancel_event.set()
         state["control"] = control
 
-        panel.download_file(self.url, state["save_path"], None, state)
+        with patch.object(panel, "request_download") as mocked_request_download:
+            panel.download_file(self.url, state["save_path"], None, state)
 
+        mocked_request_download.assert_not_called() # 排队中被取消：不发起网络请求，不是“发了请求随后按取消收尾”
         self.assertTrue(state["finished"])
         self.assertFalse(Path(f"{state['save_path']}.tmp").exists())
         self.acquire_slots_without_blocking()
@@ -668,8 +670,10 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         control.pause_event.set()
         state["control"] = control
 
-        panel.download_file(self.url, state["save_path"], None, state)
+        with patch.object(panel, "request_download") as mocked_request_download:
+            panel.download_file(self.url, state["save_path"], None, state)
 
+        mocked_request_download.assert_not_called() # 排队中被暂停同样不发起网络请求
         self.assertFalse(state["finished"]) # 排队中就被暂停：这个任务本身还没跑，留给“继续”
         self.acquire_slots_without_blocking()
 
