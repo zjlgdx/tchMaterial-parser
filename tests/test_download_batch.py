@@ -95,6 +95,7 @@ class DownloadBatchTest(unittest.TestCase):
     def test_successful_batch_creates_subdirectories_and_reports_root(self):
         class Response:
             ok = True
+            status_code = 200
             headers = {"Content-Length": "2"}
 
             def iter_content(self, **kwargs):

@@ -223,7 +223,25 @@ class PlanDownloadWriteTest(unittest.TestCase):
         with patch.object(panel, "request_download", return_value=(response, [self.url])) as mocked:
             panel.plan_download_write(state, self.temp_path, self.url)
 
-        self.assertIsNone(mocked.call_args.kwargs["range_from"])
+        # 没有校验子时按原有的“单参数”方式调用，不额外声称一次并不存在的 Range 续传
+        mocked.assert_called_once_with(self.url)
+
+    def test_failed_response_skips_content_range_and_validator_handling(self) -> None:
+        # 失败响应未必带 headers；plan_download_write 不应该在这种响应上做续传相关的判断
+        state = self.existing_state(offset=100)
+
+        class FailedResponseWithoutHeaders:
+            status_code = 404
+            ok = False
+
+            def close(self) -> None:
+                pass
+
+        with patch.object(panel, "request_download", return_value=(FailedResponseWithoutHeaders(), [self.url])):
+            open_mode, response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+
+        self.assertFalse(response.ok)
+        self.assertEqual(open_mode, "wb") # 调用方看到 response.ok 为假就会走失败分支，这个值本身不会被用到
 
     def test_validator_refreshes_whenever_response_is_a_full_body(self) -> None:
         # 首次下载（无 Range）拿到 200 要刷新校验子；带 Range 但被判定失配、回落成 200 的续传请求同样要刷新。
@@ -239,6 +257,98 @@ class PlanDownloadWriteTest(unittest.TestCase):
         with patch.object(panel, "request_download", return_value=(fallback_200, [self.url])):
             panel.plan_download_write(state, self.temp_path, self.url)
         self.assertEqual(state["validator"], "Tue, 01 Jan 2030 00:00:00 GMT")
+
+
+class DownloadFileResumeIntegrationTest(unittest.TestCase):
+    """接入 plan_download_write 之后，download_file 端到端的续传行为（坑 2、坑 7）。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.tmp_dir = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.url = "https://example.com/book.pdf"
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        for name in ("progress_label", "download_progress_bar"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+
+    def test_resume_fallback_to_full_restart_resets_downloaded_size_and_keeps_the_file(self) -> None:
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        temp_path = f"{save_path}.tmp"
+        with open(temp_path, "wb") as file: # 上一次暂停留下的半截内容
+            file.write(b"OLDOLD")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = '"old-etag"'
+
+        new_content = b"HELLO WORLD" # 远端已变化，续传请求会被服务端判定失配，回落成整份新内容
+
+        class FullBodyResponse:
+            ok = True
+            status_code = 200
+            headers = {"Content-Length": str(len(new_content)), "ETag": '"new-etag"'}
+
+            def iter_content(self, **kwargs) -> object:
+                yield new_content
+
+            def close(self) -> None:
+                pass
+
+        calls: list[tuple] = []
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            calls.append((url, range_from, validator))
+            return FullBodyResponse(), [url]
+
+        with patch.object(panel, "request_download", side_effect=fake_request_download):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertEqual(calls, [(self.url, 6, '"old-etag"')]) # 确实按现读的偏移尝试过续传
+        self.assertIsNone(state["failed_reason"])
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["downloaded_size"], len(new_content))
+        self.assertEqual(state["total_size"], len(new_content))
+        self.assertEqual(Path(save_path).read_bytes(), new_content) # 是新内容整份，不是旧内容+新内容拼接
+        self.assertFalse(Path(temp_path).exists())
+        self.assertEqual(state["validator"], '"new-etag"')
+
+    def test_resume_completes_integrity_check_successfully(self) -> None:
+        save_path = str(Path(self.tmp_dir) / "book2.pdf")
+        temp_path = f"{save_path}.tmp"
+        with open(temp_path, "wb") as file:
+            file.write(b"HELLO ")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = '"etag"'
+
+        remaining = b"WORLD" # 恰好补全成 "HELLO WORLD"
+
+        class PartialResponse:
+            ok = True
+            status_code = 206
+            headers = {"Content-Range": "bytes 6-10/11", "Content-Length": "5"}
+
+            def iter_content(self, **kwargs) -> object:
+                yield remaining
+
+            def close(self) -> None:
+                pass
+
+        calls: list[tuple] = []
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            calls.append((url, range_from, validator))
+            return PartialResponse(), [url]
+
+        with patch.object(panel, "request_download", side_effect=fake_request_download):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertEqual(calls, [(self.url, 6, '"etag"')])
+        self.assertIsNone(state["failed_reason"])
+        self.assertEqual(state["downloaded_size"], 11)
+        self.assertEqual(state["total_size"], 11)
+        self.assertEqual(Path(save_path).read_bytes(), b"HELLO WORLD")
+        self.assertFalse(Path(temp_path).exists())
 
 
 if __name__ == "__main__":

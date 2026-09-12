@@ -413,11 +413,10 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
     offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
     can_attempt_range = offset > 0 and bool(current_state["validator"])
 
-    response, attempted_urls = request_download(
-        url,
-        range_from=offset if can_attempt_range else None,
-        validator=current_state["validator"] if can_attempt_range else None,
-    )
+    if can_attempt_range:
+        response, attempted_urls = request_download(url, range_from=offset, validator=current_state["validator"])
+    else:
+        response, attempted_urls = request_download(url)
 
     if response.status_code == 416 and can_attempt_range:
         # 范围无效：不信任这次响应，放弃这次的偏移，按一次全新请求重来
@@ -425,6 +424,9 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
         offset = 0
         can_attempt_range = False
         response, attempted_urls = request_download(url)
+
+    if not response.ok: # 失败响应交给调用方走既有的失败分支，这里不去碰它未必存在的响应头
+        return "wb", response, attempted_urls
 
     content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
     # 追加的前提：本地确有偏移、手上有校验子、服务端真的回了 206、且这段的起点正好等于我们请求的偏移
@@ -482,16 +484,14 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
     response = None
     try:
         with _download_slots:
-            response, attempted_urls = request_download(url)
+            open_mode, response, attempted_urls = plan_download_write(current_state, temp_path, url)
 
             if not response.ok: # 服务器返回表示错误的 HTTP 状态码
                 current_state["failed_reason"] = download_failure_reason(response, attempted_urls)
             else:
-                current_state["total_size"] = int(response.headers.get("Content-Length", 0))
-
                 os.makedirs(os.path.dirname(save_path), exist_ok=True) # 分类下载时子目录可能尚不存在
-                with open(temp_path, "wb") as file:
-                    for chunk in response.iter_content( # 分块下载
+                with open(temp_path, open_mode) as file:
+                    for chunk in response.iter_content( # 分块下载；total_size 续传时也是文件全长，分档依据不变
                         chunk_size=131072 if current_state["total_size"] < 20971520 else 262144 if current_state["total_size"] < 52428800 else 524288
                     ):
                         if chunk: # 过滤掉 Keep-Alive 块
