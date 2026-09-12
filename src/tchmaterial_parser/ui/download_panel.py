@@ -331,7 +331,8 @@ def parse_and_copy() -> None: # 解析并复制链接
     copy_btn.config(state="disabled") # 解析期间禁用按钮，避免重复触发
 
     def copy_urls(resources_info_list: list[ResourceInfo], failed_urls: set[str]) -> None: # 解析完成后在主线程复制链接
-        copy_btn.config(state="normal") # 恢复按钮为启用状态
+        if _batch_control is None: # 没有下载批次在跑才由这里恢复按钮；否则 copy_btn 听 set_ui_phase 的
+            copy_btn.config(state="normal")
         if not downloads_active():
             progress_label.config(text="等待下载") # 解析进度已无用，恢复默认文案
 
@@ -362,8 +363,7 @@ def download() -> None: # 下载资源文件
     global download_states, _batch_control
     control = BatchControl() # 覆盖从这里到批次终结的整段生命周期，解析阶段就能取消
     _batch_control = control
-    set_ui_phase("parsing") # 解析阶段只有取消有意义，暂停无从谈起
-    download_progress_bar.config(value=0) # 重置上一批任务可能残留的进度
+    set_ui_phase("parsing") # 解析阶段只有取消有意义，暂停无从谈起；进度条清零也收在这里
     download_states = [] # 初始化下载状态
     urls = {line.strip() for line in url_text.get("1.0", "end").splitlines() if line.strip()} # 获取所有非空行并去重
 
@@ -381,9 +381,7 @@ def download() -> None: # 下载资源文件
     def start_downloads(resources_info_list: list[ResourceInfo], failed_urls: set[str]) -> None: # 解析完成后在主线程选择保存位置并开始下载
         def restore_idle_ui() -> None: # 放弃这次下载（不是取消）：恢复界面到空闲，控制对象也一并收回
             global _batch_control
-            if not downloads_active():
-                progress_label.config(text="等待下载")
-            set_ui_phase("idle")
+            set_ui_phase("idle") # 进度条清零、文案复位为“等待下载”都收在这里
             _batch_control = None
 
         if control.cancel_event.is_set(): # 解析阶段被取消：不弹任何对话框，直接回到空闲
@@ -492,16 +490,20 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
     return open_mode, response, attempted_urls
 
 def set_ui_phase(phase: str) -> None:
-    """统一切换底部两个按钮在四个阶段的文案/命令/启用状态；是所有离开/进入批次的路径共用的唯一收口点。
+    """统一切换底部两个按钮在四个阶段的文案/命令/启用状态，以及进度条/进度文案是否清空——
+    是所有离开/进入批次的路径共用的唯一收口点，不要在调用方各自散着写一份。
 
-    只改 text/command/state，不改 ttk style，因此浅色/深色主题不需要额外适配。
+    只改按钮的 text/command/state，不改 ttk style，因此浅色/深色主题不需要额外适配。
     """
     if phase == "idle":
         copy_btn.config(text="解析并复制", state="normal", command=parse_and_copy)
         download_btn.config(text="下载", state="normal", command=download)
+        download_progress_bar.config(value=0)
+        progress_label.config(text="等待下载")
     elif phase == "parsing": # 点了“下载”触发的解析：暂停无从谈起，只有取消有意义
         copy_btn.config(text="解析并复制", state="disabled", command=parse_and_copy)
         download_btn.config(text="取消", state="normal", command=cancel_current_batch)
+        download_progress_bar.config(value=0) # 重置上一批任务可能残留的进度；文案交给 show_parse_progress
     elif phase == "downloading":
         copy_btn.config(text="暂停", state="normal", command=pause_current_batch)
         download_btn.config(text="取消", state="normal", command=cancel_current_batch)
@@ -536,9 +538,7 @@ def cancel_current_batch() -> None: # “取消”按钮：解析中/下载中/�
                     pass
                 state["downloaded_size"], state["total_size"] = 0, 0
                 state["finished"] = True
-        download_progress_bar.config(value=0)
-        progress_label.config(text="等待下载")
-        set_ui_phase("idle")
+        set_ui_phase("idle") # 进度条清零、文案复位为“等待下载”都收在这里
         _batch_control = None
     # 否则批次线程仍然存活（不论是解析中、下载中，还是刚发出暂停请求但还没停稳），
     # 交给它自己在 _run_batch_worker 退出后通过 handle_batch_outcome 收尾。
@@ -550,11 +550,7 @@ def resume_current_batch() -> None: # “继续”按钮：只在批次真正停
     control.pause_event.clear()
     control.paused_settled = False
 
-    pending = [state for state in download_states if not state["finished"]]
-    if not pending: # 理论上不会发生：判定为“暂停”的前提就是仍有未完成任务；防御性处理避免卡死
-        ui_call(handle_batch_outcome, "completed", control)
-        return
-
+    pending = [state for state in download_states if not state["finished"]] # 判定为“暂停”的前提就是仍有未完成任务
     set_ui_phase("downloading")
     progress_label.config(text=f"正在下载 {len(pending)} 个文件")
     thread_it(lambda: _run_batch_worker(pending, control))
@@ -617,9 +613,7 @@ def handle_batch_outcome(outcome: str, control: BatchControl) -> None: # 在主�
             state["downloaded_size"], state["total_size"] = 0, 0
             state["finished"] = True
 
-    download_progress_bar.config(value=0)
-    progress_label.config(text="等待下载")
-    set_ui_phase("idle")
+    set_ui_phase("idle") # 进度条清零、文案复位为“等待下载”都收在这里
     _batch_control = None
 
     if outcome == "cancelled": # 取消不弹“下载完成”弹窗
@@ -712,9 +706,12 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                 # 循环退出后重新读一次：流干净结束（EOF）时不能沿用循环里最后一次的 reason，
                 # 否则暂停恰好撞上 EOF 会被当成“下载不完整”，把好不容易保住的半截文件删掉。
                 reason = stop_reason()
+                # 暂停恰好落在最后一块之后：文件其实已经下完，只是还没来得及被判定成功，
+                # 不该当成“暂停”留着 .tmp 不改名——已知总长且确实下满，就按完成处理。
+                reached_full_length = current_state["total_size"] > 0 and current_state["downloaded_size"] == current_state["total_size"]
                 if reason == "cancelled": # 在飞中被取消：中止写入，删除 .tmp，不算失败
                     discard_temp_and_zero_counters()
-                elif reason == "paused": # 在飞中被暂停：保留已写的 .tmp，不清零已下载量
+                elif reason == "paused" and not reached_full_length: # 在飞中被暂停：保留已写的 .tmp，不清零已下载量
                     paused = True
                 elif current_state["total_size"] > 0 and current_state["downloaded_size"] != current_state["total_size"]: # 文件下载不完整
                     current_state["failed_reason"] = f"文件下载不完整，需下载 {current_state['total_size']} 字节，实际下载 {current_state['downloaded_size']} 字节"

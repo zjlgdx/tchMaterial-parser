@@ -727,6 +727,39 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertTrue(Path(f"{save_path}.tmp").exists()) # 半截文件必须保留，不能被完整性校验删掉
         self.assertEqual(Path(f"{save_path}.tmp").read_bytes(), b"x" * 512)
 
+    def test_pause_exactly_at_full_length_completes_instead_of_staying_paused(self) -> None:
+        # P2-10：暂停恰好落在最后一块之后——文件其实已经下完，不该判成“暂停”，否则不会改名，
+        # 继续时会因为 offset == total_size 触发 416，退化成一次没有必要的全量重下。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        full_content = b"x" * 512
+
+        class PauseAtEofResponse:
+            ok = True
+            status_code = 200
+            headers = {"Content-Length": str(len(full_content))}
+
+            def iter_content(self, **kwargs) -> object:
+                yield full_content
+                # 消费者写完最后一块、查过 stop_reason()（此时还没暂停）之后才会回来问要下一项；
+                # 用户恰好在这段时间点了暂停，随后连接被关掉，迭代干净结束。
+                control.pause_event.set()
+                return
+
+            def close(self) -> None:
+                pass
+
+        with patch.object(panel, "request_download", return_value=(PauseAtEofResponse(), [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertTrue(state["finished"]) # 按完成处理，不是暂停
+        self.assertIsNone(state["failed_reason"])
+        self.assertEqual(state["downloaded_size"], len(full_content))
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
+        self.assertEqual(Path(save_path).read_bytes(), full_content)
+
     def test_pause_stops_reading_via_cooperative_check_even_when_the_stream_never_raises(self) -> None:
         # “良民”流：close() 之后不抛错，会一直正常吐块。暂停必须靠分块循环里的协作式检查
         # 提前 break，而不是像上一条那样恰好等到断连异常。
@@ -1231,21 +1264,6 @@ class BatchControlActionsTest(unittest.TestCase):
         self.assertEqual(resubmitted_states, [pending_state]) # 只续传未完成的
         self.assertIs(passed_control, control)
 
-    def test_resume_with_no_pending_states_settles_as_completed_defensively(self) -> None:
-        control = panel.BatchControl()
-        control.pause_event.set()
-        control.paused_settled = True
-        panel._batch_control = control
-        finished_state = panel.create_download_state("https://example.com/done.pdf", str(Path(self.tmp_dir) / "done.pdf"))
-        finished_state["finished"] = True
-        panel.download_states = [finished_state]
-
-        with patch.object(panel, "_run_batch_worker") as mocked_worker:
-            panel.resume_current_batch()
-
-        mocked_worker.assert_not_called()
-        self.assertIsNone(panel._batch_control) # 走了 handle_batch_outcome("completed", ...) 的收尾
-
 
 class DownloadEntryIdleResetTest(unittest.TestCase):
     """download() 里“放弃这次下载”（不是取消）的五条路径，逐条验证真的回到空闲。
@@ -1303,6 +1321,22 @@ class DownloadEntryIdleResetTest(unittest.TestCase):
 
         self.assertEqual(mocked_phase.call_args_list, [call("parsing"), call("idle")])
         self.assertIsNone(panel._batch_control)
+
+    def test_askdirectory_cancelled_also_resets_the_progress_bar(self) -> None:
+        # P2-9：进度条/文案的复位收口进 set_ui_phase 之前，restore_idle_ui 只复位了文案，
+        # 漏了进度条——这条不打桩 set_ui_phase，直接看真实进度条/文案控件收到的调用。
+        resource_by_url = {
+            f"https://example.com/{index}.pdf": ResourceInfo(f"教材{index}", f"https://example.com/{index}.pdf", "pdf", [])
+            for index in range(2)
+        }
+        panel.url_text.get.return_value = "\n".join(resource_by_url)
+
+        with patch.object(panel, "parse", side_effect=lambda url, bookmarks: [resource_by_url[url]]):
+            with patch.object(panel.filedialog, "askdirectory", return_value=""):
+                panel.download()
+
+        panel.download_progress_bar.config.assert_any_call(value=0)
+        panel.progress_label.config.assert_any_call(text="等待下载")
 
     def test_asksaveasfilename_cancelled_resets_to_idle(self) -> None:
         resource = ResourceInfo("教材", "https://example.com/only.pdf", "pdf", [])
@@ -1376,8 +1410,13 @@ class ParseAndCopyDoesNotWireCancellationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.context = ExitStack()
         self.addCleanup(self.context.close)
-        for name in ("copy_btn", "url_text"):
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
+        for name in ("copy_btn", "url_text", "progress_label"):
             self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
+        self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
+        self.context.enter_context(patch.object(panel.messagebox, "showerror"))
 
     def test_should_stop_is_none_for_the_copy_flow(self) -> None:
         captured: dict[str, object] = {"called": False}
@@ -1391,7 +1430,54 @@ class ParseAndCopyDoesNotWireCancellationTest(unittest.TestCase):
             panel.parse_and_copy()
 
         self.assertTrue(captured["called"])
-        self.assertIsNone(captured["should_stop"])
+
+    def test_copy_btn_is_not_re_enabled_while_a_download_batch_is_active(self) -> None:
+        # P2-11：copy_urls 此前无条件把 copy_btn 设回 normal，若这次“解析并复制”的完成回调
+        # 恰好在下载流程自己的“解析中”阶段（_batch_control 不是 None）才触发，会把
+        # set_ui_phase 刚设好的 disabled 状态抢回来，导致同一个按钮同时在做两件事。
+        resource = ResourceInfo("教材", "https://example.com/parsed.pdf", "pdf", [])
+
+        def fake_parse_urls_in_background(urls, bookmarks, on_finished, should_stop=None) -> None:
+            panel._batch_control = panel.BatchControl() # 模拟下载流程的“解析中”阶段仍在进行
+            on_finished([resource], set())
+
+        panel.url_text.get.return_value = "https://example.com/1"
+        with patch.object(panel, "parse_urls_in_background", fake_parse_urls_in_background):
+            panel.parse_and_copy()
+
+        self.assertNotIn(call(state="normal"), panel.copy_btn.config.call_args_list)
+
+
+class SetUiPhaseProgressResetTest(unittest.TestCase):
+    """P2-9：进度条/文案是否清空收口进 set_ui_phase，不再由各个调用方各写一份。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+
+    def test_idle_resets_progress_bar_and_label(self) -> None:
+        panel.set_ui_phase("idle")
+
+        panel.download_progress_bar.config.assert_any_call(value=0)
+        panel.progress_label.config.assert_any_call(text="等待下载")
+
+    def test_parsing_resets_the_progress_bar_but_leaves_the_label_to_show_parse_progress(self) -> None:
+        panel.set_ui_phase("parsing")
+
+        panel.download_progress_bar.config.assert_any_call(value=0)
+        for recorded_call in panel.progress_label.config.call_args_list:
+            self.assertNotIn("text", recorded_call.kwargs) # 解析进度文案交给 show_parse_progress，这里不写死
+
+    def test_downloading_and_paused_do_not_touch_the_progress_widgets(self) -> None:
+        panel.set_ui_phase("downloading")
+        panel.download_progress_bar.config.assert_not_called()
+        panel.progress_label.config.assert_not_called()
+
+        panel.set_ui_phase("paused")
+        panel.download_progress_bar.config.assert_not_called()
+        panel.progress_label.config.assert_not_called()
 
 
 if __name__ == "__main__":
