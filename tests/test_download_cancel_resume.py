@@ -81,13 +81,18 @@ class TriggerThenRaiseResponse:
 
 
 class FakeRangeResponse:
-    """模拟 requests.Response，只暴露续传逻辑需要的 status_code/headers/close。"""
+    """模拟 requests.Response：status_code/headers/close，外加可选的 body 供 iter_content 吐出。"""
 
-    def __init__(self, status_code: int, headers: dict | None = None) -> None:
+    def __init__(self, status_code: int, headers: dict | None = None, body: bytes = b"") -> None:
         self.status_code = status_code
         self.ok = status_code < 400
         self.headers = headers or {}
+        self.body = body
         self.closed = False
+
+    def iter_content(self, **kwargs) -> object:
+        if self.body:
+            yield self.body
 
     def close(self) -> None:
         self.closed = True
@@ -331,25 +336,37 @@ class PlanDownloadWriteTest(unittest.TestCase):
         self.assertEqual(state["total_size"], 999)
 
     def test_resume_requires_content_range_start_to_match_requested_offset(self) -> None:
+        # P0-1：206 但起点不匹配，响应体只是那一段，不能直接当整份写下去——必须像 416 一样
+        # 关掉这次响应、重新发一次不带 Range 的请求。用两个不同的总长断言最终数值确实来自
+        # 那次重试的响应，而不是继续沿用第一次（不可信）响应里的总长凑巧对上。
         state = self.existing_state(offset=1000)
-        # 服务端回了 206，但起点是 0 而不是我们请求的 1000（例如被服务端 clamp），
-        # 这段接不上我们本地已有的字节，不能当成可以追加续传。
         mismatched_206 = FakeRangeResponse(206, {"Content-Range": "bytes 0-4999/5000", "Content-Length": "5000"})
-        with patch.object(panel, "request_download", return_value=(mismatched_206, [self.url])):
-            open_mode, _response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+        fresh_full_200 = FakeRangeResponse(200, {"Content-Length": "9999", "ETag": '"fresh"'})
+        with patch.object(panel, "request_download", side_effect=[(mismatched_206, [self.url]), (fresh_full_200, [self.url])]) as mocked:
+            open_mode, used_response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+
+        self.assertEqual(mocked.call_count, 2)
+        self.assertIsNone(mocked.call_args_list[1].kwargs.get("range_from")) # 第二次是不带 Range 的全新请求
+        self.assertTrue(mismatched_206.closed) # 不可信的响应必须被关掉，不能拿它的响应体接着用
+        self.assertIs(used_response, fresh_full_200)
         self.assertEqual(open_mode, "wb")
         self.assertEqual(state["downloaded_size"], 0)
-        self.assertEqual(state["total_size"], 5000) # 落回按 Content-Length 处理，不使用 Content-Range 的总长
+        self.assertEqual(state["total_size"], 9999) # 来自重试后的响应，不是第一次那个 5000
 
     def test_malformed_content_range_falls_back_to_full_restart(self) -> None:
+        # 同上，只是触发条件换成 Content-Range 解析不出来。
         state = self.existing_state(offset=200)
-        response = FakeRangeResponse(206, {"Content-Range": "not-a-content-range", "Content-Length": "42"})
-        with patch.object(panel, "request_download", return_value=(response, [self.url])):
-            open_mode, _response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+        unparseable_206 = FakeRangeResponse(206, {"Content-Range": "not-a-content-range", "Content-Length": "42"})
+        fresh_full_200 = FakeRangeResponse(200, {"Content-Length": "777", "ETag": '"fresh"'})
+        with patch.object(panel, "request_download", side_effect=[(unparseable_206, [self.url]), (fresh_full_200, [self.url])]) as mocked:
+            open_mode, used_response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
 
+        self.assertEqual(mocked.call_count, 2)
+        self.assertTrue(unparseable_206.closed)
+        self.assertIs(used_response, fresh_full_200)
         self.assertEqual(open_mode, "wb")
         self.assertEqual(state["downloaded_size"], 0)
-        self.assertEqual(state["total_size"], 42)
+        self.assertEqual(state["total_size"], 777) # 不是第一次那个 42
 
     def test_no_validator_never_attempts_a_range_request(self) -> None:
         state = self.existing_state(offset=800, validator=None)
@@ -447,6 +464,117 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertFalse(Path(temp_path).exists())
         self.assertEqual(state["validator"], '"new-etag"')
 
+    def test_unusable_206_is_never_written_as_if_it_were_the_full_file(self) -> None:
+        # P0-1：起点不匹配的 206——响应体只是那一段，一旦被当整份写下去就是静默损坏
+        # （文件存在、大小和计数器都对得上、内容却是错的）。必须断言最终文件的字节，
+        # 只断言 open_mode/计数器钉不住这个 bug：旧实现落回 wb 之后计数器照样能自洽。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        temp_path = f"{save_path}.tmp"
+        with open(temp_path, "wb") as file: # 半截内容：11 字节
+            file.write(b"OLD-PARTIAL")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = '"old-etag"'
+
+        full_content = os.urandom(5000)
+        # 服务端声称这段从 2000 开始，但我们请求的是 11——起点接不上本地已有的字节
+        unusable_body = full_content[2000:]
+
+        class UnusableRangeResponse:
+            ok = True
+            status_code = 206
+            headers = {"Content-Range": "bytes 2000-4999/5000", "Content-Length": str(len(unusable_body))}
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def iter_content(self, **kwargs) -> object:
+                yield unusable_body
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FreshFullResponse:
+            ok = True
+            status_code = 200
+            headers = {"Content-Length": str(len(full_content)), "ETag": '"fresh-etag"'}
+
+            def iter_content(self, **kwargs) -> object:
+                yield full_content
+
+            def close(self) -> None:
+                pass
+
+        unusable_response = UnusableRangeResponse()
+        calls: list[tuple] = []
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            calls.append((range_from, validator))
+            return (unusable_response if len(calls) == 1 else FreshFullResponse()), [url]
+
+        with patch.object(panel, "request_download", fake_request_download):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertEqual(calls, [(11, '"old-etag"'), (None, None)]) # 第二次是不带 Range 的全新请求
+        self.assertTrue(unusable_response.closed) # 不可信的响应必须被关掉，不能拿它的响应体接着用
+        self.assertIsNone(state["failed_reason"])
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["downloaded_size"], len(full_content))
+        self.assertEqual(state["total_size"], len(full_content))
+        self.assertFalse(Path(temp_path).exists())
+        self.assertEqual(Path(save_path).read_bytes(), full_content) # 逐字节比对，不是长度/计数器凑巧一致
+
+    def test_206_with_unparseable_content_range_is_never_written_as_if_it_were_the_full_file(self) -> None:
+        # 同上，触发条件换成 Content-Range 解析不出来。
+        save_path = str(Path(self.tmp_dir) / "book2.pdf")
+        temp_path = f"{save_path}.tmp"
+        with open(temp_path, "wb") as file:
+            file.write(b"OLD-PARTIAL")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = '"old-etag"'
+
+        full_content = os.urandom(4200)
+
+        class UnparseableRangeResponse:
+            ok = True
+            status_code = 206
+            headers = {"Content-Range": "bytes */5000", "Content-Length": "999"}
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def iter_content(self, **kwargs) -> object:
+                yield b"x" * 999
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FreshFullResponse:
+            ok = True
+            status_code = 200
+            headers = {"Content-Length": str(len(full_content)), "ETag": '"fresh-etag"'}
+
+            def iter_content(self, **kwargs) -> object:
+                yield full_content
+
+            def close(self) -> None:
+                pass
+
+        unparseable_response = UnparseableRangeResponse()
+        calls: list[tuple] = []
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            calls.append((range_from, validator))
+            return (unparseable_response if len(calls) == 1 else FreshFullResponse()), [url]
+
+        with patch.object(panel, "request_download", fake_request_download):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertEqual(calls, [(11, '"old-etag"'), (None, None)])
+        self.assertTrue(unparseable_response.closed)
+        self.assertIsNone(state["failed_reason"])
+        self.assertTrue(state["finished"])
+        self.assertEqual(Path(save_path).read_bytes(), full_content)
+
     def test_resume_completes_integrity_check_successfully(self) -> None:
         save_path = str(Path(self.tmp_dir) / "book2.pdf")
         temp_path = f"{save_path}.tmp"
@@ -535,6 +663,69 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertTrue(response.closed)
         self.assertFalse(state["finished"]) # 暂停：finished 保持 False，留给“继续”
         self.assertEqual(Path(f"{save_path}.tmp").read_bytes(), b"12345") # 半截内容保留
+
+    def test_pause_in_flight_with_non_ok_response_is_not_treated_as_a_real_failure(self) -> None:
+        # P0-2：请求还在飞的时候用户点了暂停，随后服务端偏偏回了非 ok 状态码。
+        # 响应是否 ok 已经不重要——这一轮不管拿到什么，都该按暂停收场，不能判成真失败。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+
+        class FailingResponse:
+            ok = False
+            status_code = 503
+            content = b""
+
+            def close(self) -> None:
+                pass
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            control.pause_event.set() # 请求在飞时用户点了暂停，响应此刻还没返回
+            return FailingResponse(), [url]
+
+        with patch.object(panel, "request_download", fake_request_download):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertFalse(state["finished"]) # 暂停契约：finished 必须是 False，留给“继续”重试
+        self.assertIsNone(state["failed_reason"]) # 不能被判成 HTTP 503 真失败
+        self.assertFalse(Path(f"{save_path}.tmp").exists()) # 从未写过任何字节，不该凭空产生 .tmp
+
+    def test_pause_requested_right_before_a_clean_stream_end_preserves_the_partial_file(self) -> None:
+        # P0-3：暂停恰好撞上流干净结束（不抛异常）。循环内 break 用的检查不会再被沿用到
+        # 循环之后的分类判断上——分类必须重新读一次 stop_reason()，否则会被当成“下载不完整”，
+        # 把好不容易保住的半截文件删掉，直接打掉暂停功能本身的意义。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+
+        class EofOnPauseResponse:
+            ok = True
+            status_code = 200
+            headers = {"Content-Length": "2048"} # 声称全长 2048，但连接会在暂停后干净结束
+
+            def __init__(self) -> None:
+                self.closed = False
+
+            def iter_content(self, **kwargs) -> object:
+                yield b"x" * 512
+                # 消费者写完这块、查过 stop_reason()（此时还没暂停）之后，才会回来问生成器要下一项；
+                # 用户正是在“等待下一块”这段时间点了暂停，随后连接被关掉，迭代干净结束（不抛异常）。
+                control.pause_event.set()
+                return
+
+            def close(self) -> None:
+                self.closed = True
+
+        with patch.object(panel, "request_download", return_value=(EofOnPauseResponse(), [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertFalse(state["finished"]) # 暂停契约
+        self.assertIsNone(state["failed_reason"]) # 不能被判成“文件下载不完整”
+        self.assertEqual(state["downloaded_size"], 512)
+        self.assertTrue(Path(f"{save_path}.tmp").exists()) # 半截文件必须保留，不能被完整性校验删掉
+        self.assertEqual(Path(f"{save_path}.tmp").read_bytes(), b"x" * 512)
 
     def test_pause_stops_reading_via_cooperative_check_even_when_the_stream_never_raises(self) -> None:
         # “良民”流：close() 之后不抛错，会一直正常吐块。暂停必须靠分块循环里的协作式检查
@@ -668,6 +859,55 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(f"{state['save_path']}.tmp").exists())
         self.acquire_slots_without_blocking()
 
+    def test_cancelled_before_request_cleans_up_tmp_left_over_from_a_previous_pause(self) -> None:
+        # P1-5：暂停留下 .tmp 后点“继续”，任务在取得执行机会前又被取消——排队取消分支
+        # 必须清理这个“上一轮留下的” .tmp，不能只在“这次有没有产生过” .tmp 上打转
+        # （改动前这条路径永远拿到一个全新任务，不可能预先存在 .tmp，现在续传场景下会）。
+        save_path = str(Path(self.tmp_dir) / "resumed.pdf")
+        with open(f"{save_path}.tmp", "wb") as file:
+            file.write(b"leftover-from-a-previous-pause")
+        state = panel.create_download_state(self.url, save_path)
+        state["downloaded_size"] = 31 # 与半截内容对应，模拟暂停时记下的旧计数器
+        control = panel.BatchControl()
+        control.cancel_event.set()
+        state["control"] = control
+
+        with patch.object(panel, "request_download") as mocked_request_download:
+            panel.download_file(self.url, save_path, None, state)
+
+        mocked_request_download.assert_not_called()
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertEqual(state["total_size"], 0)
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
+
+    def test_non_ok_response_cleans_up_tmp_and_counters_instead_of_leaving_them_stale(self) -> None:
+        # P1-5：plan_download_write 对非 ok 响应的早退不会归零，download_file 必须在这里补上，
+        # 否则失败文件的残留字节会被计进批次总进度，且残留 .tmp 会让同一次运行里重下该资源
+        # 被 allocate_download_paths 误判成“已存在”，改名成 book (2).pdf。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        with open(f"{save_path}.tmp", "wb") as file:
+            file.write(b"leftover")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = '"old-etag"'
+
+        class FailingResponse:
+            ok = False
+            status_code = 503
+            content = b""
+
+            def close(self) -> None:
+                pass
+
+        with patch.object(panel, "request_download", return_value=(FailingResponse(), [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertTrue(state["finished"])
+        self.assertIsNotNone(state["failed_reason"])
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertEqual(state["total_size"], 0)
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
+
     def test_paused_before_request_releases_the_slot_and_leaves_unfinished(self) -> None:
         state = panel.create_download_state(self.url, str(Path(self.tmp_dir) / "b.pdf"))
         control = panel.BatchControl()
@@ -787,6 +1027,28 @@ class BatchOutcomeTest(unittest.TestCase):
 
         self.assertFalse(control.paused_settled) # 没有走到“暂停”分支
         self.assertIsNone(panel._batch_control) # 走的是取消分支
+
+    def test_reclassifies_as_cancelled_when_cancel_arrives_after_outcome_was_computed(self) -> None:
+        # P1-4：_run_batch_worker 算出 outcome="paused" 之后、ui_call 排队的回调真正执行之前，
+        # 批次线程已经退出，用户在这个窗口点了取消——cancel_event 此刻已经置位，但传进 handle_batch_outcome
+        # 的 outcome 参数仍然是算出来时的旧值 "paused"。不重判的话，取消会被静默吞掉：paused_settled
+        # 置位、.tmp 全留、finished 仍是 False、cancel_event 也没清，用户再点“继续”会立刻走排队取消分支。
+        control = panel.BatchControl()
+        control.directory = self.directory
+        state = self.make_state(finished=False)
+        Path(f"{state['save_path']}.tmp").write_bytes(b"partial")
+        panel.download_states = [state]
+        panel._batch_control = control
+
+        control.cancel_event.set() # 在 outcome 参数被算出之后才发生，函数收到的 outcome 还是旧的
+
+        panel.handle_batch_outcome("paused", control)
+
+        self.assertFalse(control.paused_settled) # 没有落成“暂停”
+        self.assertIsNone(panel._batch_control) # 按取消收尾，控制对象被清空，不留给“继续”
+        self.assertTrue(state["finished"])
+        self.assertFalse(Path(f"{state['save_path']}.tmp").exists()) # 半截 .tmp 被清理，不是“全留”
+        self.notice.assert_not_called() # 不弹“下载完成”
 
     def test_cancelled_outcome_force_finishes_any_leftover_unfinished_state(self) -> None:
         # 批次生命周期边界上的最后一道保险：正常情况下 download_file 内部已经处理过，这里只兜底。
