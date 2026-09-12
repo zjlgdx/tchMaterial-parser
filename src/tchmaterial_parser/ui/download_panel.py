@@ -342,7 +342,7 @@ def download() -> None: # 下载资源文件
             download_btn.config(state="normal") # 设置下载按钮为启用状态
 
         if len(resources_info_list) > 1:
-            messagebox.showinfo("提示", "您将下载多个文件，请选择要下载文件的位置。本程序将在该文件夹中按教材分类创建子文件夹，并以资源名称命名文件。")
+            messagebox.showinfo("提示", f"您将下载 {len(resources_info_list)} 个文件，请选择要下载文件的位置。本程序将在该文件夹中按教材分类创建子文件夹，并以资源名称命名文件。")
             dir_path = filedialog.askdirectory() # 选择文件夹
             if not dir_path: # 用户取消或关闭对话框
                 restore_download_btn()
