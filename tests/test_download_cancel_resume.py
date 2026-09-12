@@ -589,7 +589,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertFalse(Path(temp_path).exists())
 
     def test_ab_resume_preserves_the_validator_across_a_second_pause(self) -> None:
-        # P1-2：本轮修法有两半——"wb 必须无条件覆盖"和"ab 必须完全不碰"。只钉住前一半的话，
+        # P1-2：本轮修法有两半——“wb 必须无条件覆盖”和“ab 必须完全不碰”。只钉住前一半的话，
         # 把写回代码换成裸的 `current_state["validator"] = planned_validator`（删掉 ab 保护）
         # 全量测试依然全绿：续传（ab）成功后校验子会被覆盖成 None（因为 plan_download_write
         # 对 "resumed" 分支恒返回 planned_validator=None），后果不是损坏，而是已下载的字节
@@ -989,19 +989,19 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(f"{save_path}.tmp").exists()) # 从未写过任何字节，不该凭空产生 .tmp
 
     def test_pause_during_finalization_does_not_roll_back_to_a_resumable_state(self) -> None:
-        # P1-1：这是"正文与校验子不同源"这个物种的第四个变种，藏在传输循环*之外*——
+        # P1-1：这是“正文与校验子不同源”这个物种的第四个变种，藏在传输循环*之外*——
         # add_bookmarks 会把 .tmp 整份重写（字节内容、长度都变了，不再是服务端正文的前缀），
         # 紧接着的 os.replace 若失败（Windows 上目标文件被阅读器/杀软占用很常见），会走进
         # 外层的 except；此时如果 pause_event 恰好在加书签这几秒里被点了，原代码不分青红皂白
-        # 按 pause_event 分类成"暂停"，把这份已经不是服务端正文前缀的书签重写版 .tmp 留在
+        # 按 pause_event 分类成“暂停”，把这份已经不是服务端正文前缀的书签重写版 .tmp 留在
         # 磁盘上，state["validator"]/downloaded_size/total_size 却仍然描述着原始服务端正文。
-        # 下一轮"继续"会用这份 offset（书签版的文件长度）+ 校验子（原始正文的）发起 Range 请求，
+        # 下一轮“继续”会用这份 offset（书签版的文件长度）+ 校验子（原始正文的）发起 Range 请求，
         # 只要服务端仍持有同一版本就会认可，把服务端正文的尾巴接到书签版前缀后面——又是长度
         # 自洽、无失败提示、内容错误的文件。
         #
-        # 正确做法：一旦确认传输已经完整、进入"加书签 + 改名"这个收尾阶段，这个任务的下载
-        # 本身就已经结束了，收尾阶段发生的暂停请求不能再把它回滚成"可续传"状态——.tmp 已经
-        # 不再是服务端正文的前缀，没有"继续"这回事，只能判定为失败，清理掉这份不可信的 .tmp，
+        # 正确做法：一旦确认传输已经完整、进入“加书签 + 改名”这个收尾阶段，这个任务的下载
+        # 本身就已经结束了，收尾阶段发生的暂停请求不能再把它回滚成“可续传”状态——.tmp 已经
+        # 不再是服务端正文的前缀，没有“继续”这回事，只能判定为失败，清理掉这份不可信的 .tmp，
         # 逼下一次发起一次全新的下载。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         state = panel.create_download_state(self.url, save_path)
@@ -1024,9 +1024,43 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
              patch.object(panel.os, "replace", side_effect=PermissionError("目标文件被占用")):
             panel.download_file(self.url, save_path, [{"title": "第一章", "page_index": 1}], state)
 
-        self.assertTrue(state["finished"]) # 不能停在"暂停"这个可续传状态上——.tmp 已经不可信了
+        self.assertTrue(state["finished"]) # 不能停在“暂停”这个可续传状态上——.tmp 已经不可信了
         self.assertIsNotNone(state["failed_reason"]) # 必须报告为失败，而不是悄悄假装暂停
         self.assertFalse(Path(f"{save_path}.tmp").exists()) # 不可信的书签重写版 .tmp 必须被清理掉
+        self.assertFalse(Path(save_path).exists())
+
+    def test_finalizing_must_be_set_before_calling_add_bookmarks_not_after(self) -> None:
+        # P2-4：上一条用例是“加书签成功、os.replace 失败”，这条异常恰好发生在 add_bookmarks
+        # 返回之后——如果有人把 finalizing = True 这一行从 add_bookmarks 调用之前挪到调用
+        # 之后（比如误以为“只有 os.replace 会失败，加书签本身失败与我无关”），上一条用例
+        # 依然全绿，测不出这个挪动。这里让 add_bookmarks 自身抛出异常（真实的 add_bookmarks
+        # 会把内部异常都吞掉，但这里是为了钉住“finalizing 必须在调用它之前置位”这条时序
+        # 规则本身，不依赖它是否真的会抛），异常发生在 finalizing 那一行“之后”还是“之前”，
+        # 决定了这次暂停最终会被判成失败还是被误判成可续传的暂停。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = None
+        control = panel.BatchControl()
+        state["control"] = control
+
+        server_content = os.urandom(2000)
+        bookmarked_content = os.urandom(1600) # 模拟 pypdf 已经重写了一部分 .tmp 之后才失败
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            return FakeRangeResponse(200, {"Content-Length": str(len(server_content)), "ETag": '"server-etag"'}, body=server_content), [url]
+
+        def fake_add_bookmarks(pdf_path: str, chapters: list[dict]) -> None:
+            Path(pdf_path).write_bytes(bookmarked_content) # .tmp 已经不再是服务端正文的前缀
+            control.pause_event.set() # 这几秒里用户点了暂停
+            raise OSError("写书签失败") # add_bookmarks 自身抛出，不是 os.replace
+
+        with patch.object(panel, "request_download", fake_request_download), \
+             patch.object(panel, "add_bookmarks", fake_add_bookmarks):
+            panel.download_file(self.url, save_path, [{"title": "第一章", "page_index": 1}], state)
+
+        self.assertTrue(state["finished"]) # finalizing 必须在调用 add_bookmarks 之前就已置位
+        self.assertIsNotNone(state["failed_reason"])
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
         self.assertFalse(Path(save_path).exists())
 
     def test_pause_requested_right_before_a_clean_stream_end_preserves_the_partial_file(self) -> None:
