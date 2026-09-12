@@ -4,7 +4,7 @@ import queue
 import tempfile
 import threading
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from src.tchmaterial_parser.api import ResourceInfo
 from src.tchmaterial_parser.ui import download_panel as panel
@@ -20,7 +20,8 @@ class DownloadBatchTest(unittest.TestCase):
         self.root_directory.mkdir(exist_ok=True)
         self.directory = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
         self.context.enter_context(patch.object(panel, "download_states", []))
-        for name in ("progress_label", "download_progress_bar", "download_btn"):
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
+        for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn"):
             self.context.enter_context(patch.object(panel, name, Mock(), create=True))
         self.notice = self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
         self.warning = self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
@@ -61,17 +62,20 @@ class DownloadBatchTest(unittest.TestCase):
 
         with patch.object(panel, "download_file", download):
             panel.start_download_batch(self.targets(5), self.directory)
+            # 批次一开始（start_download_batch 本身，同步）按钮就已经切到“取消”
+            self.assertEqual(panel.download_btn.config.call_args, call(text="取消", state="normal", command=panel.cancel_current_batch))
             self.assertTrue(entered.wait(timeout=3))
             self.assertTrue(panel.downloads_active())
             self.assertTrue(self.callbacks.empty())
-            panel.download_btn.config.assert_not_called()
+            self.assertEqual(panel.download_btn.config.call_count, 1) # 批次仍在进行，还没收到终态回调
             release.set()
             self.finish()
 
         self.assertEqual(observed, [5] * 5)
         self.warning.assert_called_once()
         self.notice.assert_not_called()
-        panel.download_btn.config.assert_called_once_with(state="normal")
+        # 批次结束后恢复空闲：文案、命令都要换回去，不只是 state
+        self.assertEqual(panel.download_btn.config.call_args, call(text="下载", state="normal", command=panel.download))
 
     def test_concurrent_downloads_emit_one_batch_notice(self):
         barrier = threading.Barrier(2)
@@ -84,7 +88,7 @@ class DownloadBatchTest(unittest.TestCase):
             def close(self):
                 barrier.wait(timeout=3)
 
-        with patch.object(panel, "request_download", side_effect=lambda url: (Response(), [url])):
+        with patch.object(panel, "request_download", side_effect=lambda url, **kwargs: (Response(), [url])):
             panel.start_download_batch(self.targets(2), self.directory)
             self.finish()
 
@@ -95,6 +99,7 @@ class DownloadBatchTest(unittest.TestCase):
     def test_successful_batch_creates_subdirectories_and_reports_root(self):
         class Response:
             ok = True
+            status_code = 200
             headers = {"Content-Length": "2"}
 
             def iter_content(self, **kwargs):
@@ -104,7 +109,7 @@ class DownloadBatchTest(unittest.TestCase):
                 pass
 
         targets = [(resource, str(Path(self.directory) / resource.title / "book.pdf")) for resource, _ in self.targets(2)]
-        with patch.object(panel, "request_download", side_effect=lambda url: (Response(), [url])):
+        with patch.object(panel, "request_download", side_effect=lambda url, **kwargs: (Response(), [url])):
             panel.start_download_batch(targets, self.directory)
             self.finish()
 

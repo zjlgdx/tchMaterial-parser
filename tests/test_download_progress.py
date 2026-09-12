@@ -42,6 +42,10 @@ class DownloadProgressTest(unittest.TestCase):
         self.addCleanup(setattr, download_panel, "download_states", previous_states)
         download_panel.download_states = []
 
+        previous_control = download_panel._batch_control
+        self.addCleanup(setattr, download_panel, "_batch_control", previous_control)
+        download_panel._batch_control = None
+
         self.label = RecordingWidget()
         self.bar = RecordingWidget()
         for name, widget in (("progress_label", self.label), ("download_progress_bar", self.bar)):
@@ -74,6 +78,63 @@ class DownloadProgressTest(unittest.TestCase):
 
         self.assertIn("已完成 1/2 个文件", self.latest_label_text())
         self.assertEqual(self.bar.configs, []) # 未知总大小时不驱动进度条
+
+    def test_prefixes_paused_when_batch_has_settled_as_paused(self) -> None:
+        download_panel.download_states = [
+            {"downloaded_size": 50, "total_size": 100, "finished": False, "failed_reason": None},
+        ]
+        control = download_panel.BatchControl()
+        control.paused_settled = True
+        download_panel._batch_control = control
+
+        download_panel.refresh_download_progress()
+
+        self.assertEqual(
+            self.latest_label_text(),
+            "已暂停 " + f"{download_panel.format_bytes(50)}/{download_panel.format_bytes(100)} (50.00%) 已下载 0/1",
+        )
+
+    def test_prefixes_paused_on_the_no_total_size_branch_too(self) -> None:
+        download_panel.download_states = [
+            {"downloaded_size": 0, "total_size": 0, "finished": False, "failed_reason": None},
+        ]
+        control = download_panel.BatchControl()
+        control.paused_settled = True
+        download_panel._batch_control = control
+
+        download_panel.refresh_download_progress()
+
+        self.assertTrue(self.latest_label_text().startswith("已暂停 "))
+        self.assertIn("已完成 0/1 个文件", self.latest_label_text())
+
+    def test_no_prefix_while_a_batch_is_merely_downloading(self) -> None:
+        # 已请求暂停但还没停稳（paused_settled 仍是 False）：这一刻按钮还没切到“继续”，
+        # 文案也不该提前挂上“已暂停”。
+        download_panel.download_states = [
+            {"downloaded_size": 50, "total_size": 100, "finished": False, "failed_reason": None},
+        ]
+        control = download_panel.BatchControl()
+        control.pause_event.set()
+        download_panel._batch_control = control
+
+        download_panel.refresh_download_progress()
+
+        self.assertFalse(self.latest_label_text().startswith("已暂停"))
+
+    def test_prefix_is_gone_once_resumed(self) -> None:
+        download_panel.download_states = [
+            {"downloaded_size": 50, "total_size": 100, "finished": False, "failed_reason": None},
+        ]
+        control = download_panel.BatchControl()
+        control.paused_settled = True
+        download_panel._batch_control = control
+        download_panel.refresh_download_progress()
+        self.assertTrue(self.latest_label_text().startswith("已暂停"))
+
+        control.paused_settled = False # resume_current_batch 会先做这一步，再重新提交任务
+        download_panel.refresh_download_progress()
+
+        self.assertFalse(self.latest_label_text().startswith("已暂停"))
 
     def test_counts_failed_downloads(self) -> None:
         download_panel.download_states = [
