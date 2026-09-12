@@ -21,7 +21,7 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
 class RangeAwareHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def do_GET(self) -> None: # noqa: N802（http.server 的既定命名）
+    def do_GET(self) -> None: # noqa: N802 （http.server 的既定命名）
         # 每个响应后都主动断开连接：暂停/取消会在响应写到一半时被迫中断，
         # 若允许连接池复用同一条 keep-alive 连接，下一次请求可能读到上一条
         # 响应没写完的尾部字节，把响应解析成乱码——这是测试服务器要避免的问题，
