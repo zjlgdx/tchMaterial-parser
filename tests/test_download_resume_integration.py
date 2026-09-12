@@ -77,6 +77,7 @@ class ResumeIntegrationTest(unittest.TestCase):
         self.assertGreater(paused_size, 0)
         self.assertEqual(Path(f"{save_path}.tmp").stat().st_size, paused_size) # 磁盘上的半截内容与计数器一致
 
+        requests_before_resume = len(self.server.requests)
         control.pause_event.clear() # “继续”：resume_current_batch 会先清掉这个标志
         panel.download_file(self.url, save_path, None, state)
 
@@ -88,6 +89,14 @@ class ResumeIntegrationTest(unittest.TestCase):
         self.assertEqual(len(final_bytes), len(self.content))
         self.assertEqual(sha256(final_bytes), sha256(self.content)) # 哈希一致
         self.assertEqual(final_bytes, self.content) # 逐字节完全相同，不只是长度/哈希对上
+
+        # 字节一致不代表真的走了 Range 续传——退化成不带 Range 的全量重下，字节一样会一致。
+        # 直接核对服务端记录到的请求头与它实际回的状态码，证明确实是从暂停偏移续传上的。
+        resume_requests = self.server.requests[requests_before_resume:]
+        self.assertEqual(len(resume_requests), 1)
+        self.assertEqual(resume_requests[0]["range"], f"bytes={paused_size}-")
+        self.assertEqual(resume_requests[0]["if_range"], self.etag)
+        self.assertEqual(resume_requests[0]["status"], 206)
 
     def test_cancel_mid_download_deletes_the_temp_file(self) -> None:
         save_path = self.save_path("book.pdf")
@@ -122,12 +131,16 @@ class ResumeIntegrationTest(unittest.TestCase):
         worker.join(timeout=5)
         self.assertFalse(state["finished"])
 
+        paused_size = state["downloaded_size"]
+        old_etag = self.etag
+
         # 远端在暂停期间变了：换一份不同长度、不同内容的新文件和新 ETag
         new_content = os.urandom(1 * 1024 * 1024 + 12345)
         new_etag = f'"{sha256(new_content)}"'
         self.server.content = new_content
         self.server.etag = new_etag
 
+        requests_before_resume = len(self.server.requests)
         control.pause_event.clear()
         panel.download_file(self.url, save_path, None, state) # If-Range 不匹配，服务端应该回整份新内容
 
@@ -138,6 +151,14 @@ class ResumeIntegrationTest(unittest.TestCase):
         final_bytes = Path(save_path).read_bytes()
         self.assertEqual(final_bytes, new_content) # 是全新内容整份，不是旧内容 + 新内容拼接
         self.assertEqual(state["validator"], new_etag) # 校验子跟着刷新，下次续传用得上
+
+        # 确认客户端确实带着旧偏移/旧校验子发起过续传请求，是服务端按 If-Range 语义判定失配后
+        # 主动回落成 200，而不是客户端自己放弃续传、一开始就发了个全量请求。
+        resume_requests = self.server.requests[requests_before_resume:]
+        self.assertEqual(len(resume_requests), 1)
+        self.assertEqual(resume_requests[0]["range"], f"bytes={paused_size}-")
+        self.assertEqual(resume_requests[0]["if_range"], old_etag)
+        self.assertEqual(resume_requests[0]["status"], 200)
 
     def test_offset_beyond_shrunk_remote_content_retries_from_scratch_after_416(self) -> None:
         save_path = self.save_path("book.pdf")
@@ -158,6 +179,7 @@ class ResumeIntegrationTest(unittest.TestCase):
         self.assertLess(len(shrunk_content), paused_size)
         self.server.content = shrunk_content
 
+        requests_before_resume = len(self.server.requests)
         control.pause_event.clear()
         panel.download_file(self.url, save_path, None, state)
 
@@ -166,6 +188,15 @@ class ResumeIntegrationTest(unittest.TestCase):
         self.assertEqual(state["downloaded_size"], len(shrunk_content))
         final_bytes = Path(save_path).read_bytes()
         self.assertEqual(final_bytes, shrunk_content)
+
+        # 先 416（带着旧偏移/旧校验子续传，越界），再一次不带 Range 的全新请求——不是别的顺序。
+        resume_requests = self.server.requests[requests_before_resume:]
+        self.assertEqual(len(resume_requests), 2)
+        self.assertEqual(resume_requests[0]["range"], f"bytes={paused_size}-")
+        self.assertEqual(resume_requests[0]["if_range"], self.etag)
+        self.assertEqual(resume_requests[0]["status"], 416)
+        self.assertIsNone(resume_requests[1]["range"]) # 第二次不带 Range，按全新下载处理
+        self.assertEqual(resume_requests[1]["status"], 200)
 
 
 if __name__ == "__main__":

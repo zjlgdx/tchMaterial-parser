@@ -34,15 +34,22 @@ class RangeAwareHandler(BaseHTTPRequestHandler):
         range_header = self.headers.get("Range")
         if_range = self.headers.get("If-Range")
 
+        def record(responded_status: int) -> None:
+            # 供测试断言“真的走了 Range 续传”：不能只看最终字节，字节一致也可能是
+            # 续传退化成了不带 Range 的全量重下——请求头与服务端实际回的状态码才是证据。
+            self.server.requests.append({"range": range_header, "if_range": if_range, "status": responded_status})
+
         if range_header:
             match = _RANGE_PATTERN.fullmatch(range_header)
             start = int(match.group(1)) if match else 0
 
             if if_range and if_range != etag: # 校验子不匹配：远端已变化，回整份最新内容
+                record(200)
                 self._send_full(content, etag)
                 return
 
             if start >= total: # 范围无效：offset 早就超出了当前内容的长度
+                record(416)
                 body = b""
                 self.send_response(416)
                 self.send_header("Content-Range", f"bytes */{total}")
@@ -52,6 +59,7 @@ class RangeAwareHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
 
+            record(206)
             body = content[start:]
             self.send_response(206)
             self.send_header("Content-Range", f"bytes {start}-{total - 1}/{total}")
@@ -63,6 +71,7 @@ class RangeAwareHandler(BaseHTTPRequestHandler):
             self._write_slowly(body)
             return
 
+        record(200)
         self._send_full(content, etag)
 
     def _send_full(self, content: bytes, etag: str) -> None:
@@ -95,6 +104,7 @@ def start_range_server(content: bytes, etag: str) -> tuple[ThreadingHTTPServer, 
     server = QuietThreadingHTTPServer(("127.0.0.1", 0), RangeAwareHandler)
     server.content = content
     server.etag = etag
+    server.requests = [] # 每次请求的 Range/If-Range 头与服务端实际回的状态码，供测试断言真的走了续传
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     host, port = server.server_address
