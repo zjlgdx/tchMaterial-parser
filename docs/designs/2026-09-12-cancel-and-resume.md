@@ -167,7 +167,10 @@ def request_download(url, range_from: int | None = None, validator: str | None =
     ...
 ```
 
-“用什么模式打开文件”“`downloaded_size` 从哪起算”“`total_size` 取哪个响应头”“要不要刷新校验子”是同一个决定的四个输出，写在同一段逻辑里，不允许分开判断。这里有一条容易漏掉的分界线，必须显式说清楚：**响应是不是 206，和响应能不能被当整份正文使用，是两件不同的事**——一个不可用的 206（起点不匹配、或 `Content-Range` 解析不出来）不能落回“当成普通响应，`wb` 截断、`total_size` 取这次的 `Content-Length`”，因为它的响应体只是被请求的那一段，不是完整正文；把它的 `Content-Length` 当成整份文件的长度、把它的 body 当成整份文件的内容写下去，会产出一个大小和计数器都自洽、内容却是错的文件，且不会触发任何失败提示。**判定为“不可用”的 206 必须和 416 走同一条路：关闭这次响应，重新发一次不带 Range 的全新请求，把新响应当作真正的完整正文来源。**
+“用什么模式打开文件”“`downloaded_size` 从哪起算”“`total_size` 取哪个响应头”“要不要刷新校验子”是同一个决定的四个输出。这里有两条容易漏掉的分界线，必须显式说清楚：
+
+1. **响应是不是 206，和响应能不能被当整份正文使用，是两件不同的事**——一个不可用的 206（起点不匹配、或 `Content-Range` 解析不出来）不能落回“当成普通响应，`wb` 截断、`total_size` 取这次的 `Content-Length`”，因为它的响应体只是被请求的那一段，不是完整正文；把它的 `Content-Length` 当成整份文件的长度、把它的 body 当成整份文件的内容写下去，会产出一个大小和计数器都自洽、内容却是错的文件，且不会触发任何失败提示。**判定为“不可用”的 206 必须和 416 走同一条路：关闭这次响应，重新发一次不带 Range 的全新请求，把新响应当作真正的完整正文来源。**“能不能当整份正文用”这条判据必须对**每一次**响应都成立——首次请求、重试之后的响应、没带 Range 的普通下载——不能只在带 Range 的那一次上收紧；而且判据必须是 `status_code == 200`，不是 `response.ok`（`< 400`），否则 204/304 这类“ok 但没有正文”的响应会产出一个零字节文件却判成功。只有“范围本身有问题”（416，或回了 206 但接不上）才值得不带 Range 重来一次；真正的失败（404/500 等，与 Range 无关）重来一次大概率还是失败，直接判定不可信、交给调用方走失败分支，不做这次多余的尝试，重来之后也不再加第二层重试。
+2. **判断出来的 `open_mode`/`downloaded_size`/`total_size`/校验子，必须在“真正确定要写”之后才应用到 `current_state` 上，不能在判断出来的那一刻就写回去。** 从拿到响应、到真正打开文件写入之间，隔着“登记响应供主线程主动断连”“检查是否已经被要求暂停/取消”两步——如果这中间提前把 `current_state` 改成了这次判断出来的新值（尤其是校验子），一旦紧接着命中暂停就此退出，磁盘上的 `.tmp` 还是旧内容，`current_state` 却已经指向新内容，两者不再同源；下一次“继续”会带着这份还没被磁盘内容证实过的新校验子发起续传，服务端一旦认可，就会把新内容接在旧字节后面。正确的顺序是：先把这次的判断结果作为**返回值**带出来，调用方确认真的要写（也就是文件已经用 `open_mode` 打开成功——“wb” 这一步本身就是真正的截断动作）之后，再把这些返回值写回 `current_state`。
 
 ```python
 def parse_content_range(header_value: str | None) -> tuple[int, int, int] | None:
@@ -175,7 +178,19 @@ def parse_content_range(header_value: str | None) -> tuple[int, int, int] | None
     调用方一律按不可续传处理（对应坑 9）。"""
     ...
 
+def response_usability(response, offset, can_attempt_range):
+    """判定这次响应能不能当正文用，对首次请求、重试请求、有没有带 Range 都一视同仁。
+    返回 ("resumed", content_range) / ("full", None) / (None, None)。"""
+    if can_attempt_range and response.status_code == 206:
+        content_range = parse_content_range(response.headers.get("Content-Range"))
+        if content_range is not None and content_range[0] == offset:
+            return "resumed", content_range
+    if response.status_code == 200:  # 不是 response.ok；204/304 这类不算数
+        return "full", None
+    return None, None
+
 def plan_download_write(current_state: dict, temp_path: str, url: str):
+    """只返回“计划”，不直接改 current_state；open_mode 为 None 表示这次响应不可信。"""
     offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
     can_attempt_range = offset > 0 and bool(current_state["validator"])
 
@@ -184,37 +199,44 @@ def plan_download_write(current_state: dict, temp_path: str, url: str):
     else:
         response, attempted_urls = request_download(url)
 
-    if can_attempt_range and response.ok:
-        content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
-        # 追加的前提：本地确有偏移、手上有校验子、服务端真的回了 206、且这段的起点正好等于我们请求的偏移（对应坑 8）
-        usable_206 = response.status_code == 206 and content_range is not None and content_range[0] == offset
-    else:
-        content_range, usable_206 = None, False
+    kind, content_range = response_usability(response, offset, can_attempt_range)
 
-    # 416（范围无效）与“回了 206 但接不上”是同一类不可信响应：这次的响应体不是完整正文，
-    # 绝不能当整份写下去。两者一律不信任这次响应，关掉后按一次全新的、不带 Range 的请求重来
-    # （对应坑 4，以及“206 只是校验起点、落回分支对 206 本身仍然错误”这个此前遗漏的情形）。
-    if can_attempt_range and (response.status_code == 416 or (response.status_code == 206 and not usable_206)):
+    # 只有“范围本身有问题”才值得不带 Range 重来一次；真正的失败直接走下面的失败分支。
+    range_itself_is_the_problem = can_attempt_range and (response.status_code == 416 or (response.status_code == 206 and kind is None))
+    if range_itself_is_the_problem:
         response.close()
         offset = 0
         can_attempt_range = False
         response, attempted_urls = request_download(url)
-        content_range, usable_206 = None, False
+        kind, content_range = response_usability(response, offset, can_attempt_range)
 
-    if not response.ok:  # 失败响应交给调用方走既有的失败分支，这里不去碰它未必存在的响应头
-        return "wb", response, attempted_urls
+    if kind is None:  # 不可信：交给调用方走失败清理，不去碰它未必存在的响应头
+        return None, 0, 0, None, response, attempted_urls
 
-    open_mode = "ab" if usable_206 else "wb"
-    current_state["downloaded_size"] = offset if usable_206 else 0
-    current_state["total_size"] = content_range[2] if usable_206 else int(response.headers.get("Content-Length", 0))
+    if kind == "resumed":
+        return "ab", offset, content_range[2], None, response, attempted_urls
 
-    if response.status_code == 200:  # 这次响应携带的是完整正文，不论请求时有没有带 Range（对应坑 7）
-        current_state["validator"] = response.headers.get("ETag") or response.headers.get("Last-Modified")
-
-    return open_mode, response, attempted_urls
+    validator = response.headers.get("ETag") or response.headers.get("Last-Modified")  # 对应坑 7
+    return "wb", 0, int(response.headers.get("Content-Length", 0)), validator, response, attempted_urls
 ```
 
-即：**`open_mode`、`downloaded_size`、`total_size` 由同一组条件一次性算出，任何一种不满足“本地有偏移 + 有校验子 + 响应是 206 + 起点对得上”的组合，都会一致地走向“`wb` 截断 + `downloaded_size` 归零 + `total_size` 取（重新请求后的）`Content-Length`”，不存在“判成截断但计数器没归零”这种组合，也不存在“判成截断但仍在用一个不可信 206 的响应体/响应头”这种组合。** 这是一个可以在单测里逐一构造反例、覆盖每个分支的不变量，不是“我们记得住状态”这种不可验证的承诺；且这条不变量必须用**最终文件的字节**去验证，不能只验证 `open_mode` 和计数器——一个自洽但错误的计数器同样能通过“数值匹配”的检查，只有比对写到磁盘上的实际字节才能揭穿它。
+`download_file` 侧的用法：
+
+```python
+open_mode, planned_downloaded_size, planned_total_size, planned_validator, response, attempted_urls = plan_download_write(current_state, temp_path, url)
+# 登记响应、检查 stop_reason() ——命中暂停/取消就此退出，不touch current_state，见 (c)
+...
+else:
+    with open(temp_path, open_mode) as file:  # "wb" 在这一刻真正截断
+        current_state["downloaded_size"] = planned_downloaded_size
+        current_state["total_size"] = planned_total_size
+        if planned_validator is not None:
+            current_state["validator"] = planned_validator
+        for chunk in response.iter_content(...):
+            ...
+```
+
+即：**`open_mode`、`downloaded_size`、`total_size` 由同一组条件一次性算出，任何一种不满足“本地有偏移 + 有校验子 + 响应是 206 + 起点对得上”的组合，都会一致地走向“`wb` 截断 + `downloaded_size` 归零 + `total_size` 取（重新请求后的）`Content-Length`”，不存在“判成截断但计数器没归零”这种组合，也不存在“判成截断但仍在用一个不可信 206 的响应体/响应头”这种组合；而且这四个值只有在真正打开文件写入的那一刻才会出现在 `current_state` 上，不存在“判断已经算出新值、但磁盘还是旧内容”的中间态。** 这是一个可以在单测里逐一构造反例、覆盖每个分支的不变量，不是“我们记得住状态”这种不可验证的承诺；且这条不变量必须用**最终文件的字节**去验证，不能只验证 `open_mode` 和计数器——一个自洽但错误的计数器同样能通过“数值匹配”的检查，只有比对写到磁盘上的实际字节才能揭穿它；校验子是否被提前泄漏，也必须用“暂停一轮、再继续一轮，两轮之间校验子有没有变”这种跨轮次的测试才能揭穿，单轮测试看不出来。
 
 - 校验子的刷新只看**这次响应是不是完整正文**（`status_code == 200`），而不是看“这次请求有没有带 Range”：无论是从未续传过的首次下载，还是带着 Range 但被服务端判定失配、回落成 200 的续传请求，只要拿到的是 200，就意味着这是当下这份文件内容的最新校验子，必须覆盖写入，否则下一次暂停/续传会拿着一份对不上的旧校验子，只能反复触发全量重下。
 - 镜像轮换（坑 8）：`request_download` 的镜像轮换逻辑不改，续传只是多带了 `Range`/`If-Range`/`Accept-Encoding`，这些头在每一个候选镜像上都会原样发送；是否可追加完全由 `plan_download_write` 里那组条件判定，不依赖“猜哪个镜像会命中”。
@@ -236,18 +258,26 @@ def _run_batch_worker(states_to_run, control):
         for future in futures:
             future.result()
 
-    if control.cancel_event.is_set():
+    if control.cancel_event.is_set(): # 取消优先于暂停
         outcome = "cancelled"
-    elif control.pause_event.is_set():
+    elif control.pause_event.is_set() and any(not state["finished"] for state in download_states):
+        # 暂停恰好落在最后一个文件的最后一块之后：批次层面已经没有未完成任务了，
+        # 不该因为 pause_event 还留着置位就落成“暂停”——否则界面会卡在“已暂停 100%”，
+        # 点“继续”要空转一轮才弹完成，点“取消”则全程不会有任何完成提示。
         outcome = "paused"
     else:
         outcome = "completed"
-    ui_call(handle_batch_outcome, outcome, control)
+    ui_call(handle_batch_outcome, outcome, control) # 全部线程退出后，仅由批次通知一次
+
+def handle_batch_outcome(outcome, control):
+    if control.cancel_event.is_set(): # outcome 算出之后到这次回调真正执行之前，取消随时可能追上来；
+        outcome = "cancelled"         # 取消一旦置位，不允许再落成 paused/completed，入口重判一次优先级
+    ...
 ```
 
 `states_to_run` 只是这一轮（初次或“继续”）实际提交给线程池的子集；批次真正的全量任务列表跟着模块级 `download_states` 走（下载面板本来就用它汇总/展示整批进度），`handle_batch_outcome` 直接读这个模块级变量，不需要单独传一份 `all_states` 进来。
 
-`handle_batch_outcome`（主线程）按结局收尾：
+`handle_batch_outcome`（主线程）**入口先按 `control.cancel_event` 重判一次 `outcome`**，再按结局收尾：`_run_batch_worker` 算出 `outcome` 到这次回调真正在主线程执行之间隔着一次 `ui_call` 调度，这段间隙里取消随时可能追上来；一旦追上，不管 `_run_batch_worker` 当初算出的是 `"paused"` 还是 `"completed"`，都要改判为 `"cancelled"`，不允许把一次实际上已经被取消的批次收尾成暂停或完成。
 
 - `"completed"`：现有 `finish_download_batch` 的行为原样保留（弹“下载完成”，展示失败清单），额外调用 `set_ui_phase("idle")`，把 `_batch_control` 置回 `None`。
 - `"cancelled"`：不弹“下载完成”弹窗；对 `download_states` 里仍是 `finished == False` 的任务做兜底清理（正常情况下这些任务在 `download_file` 内部已经各自处理过，这里只是批次生命周期边界上的最后一道保险，不是给理论上不会发生的情况加复杂逻辑）；调用 `set_ui_phase("idle")`，把 `_batch_control` 置回 `None`。
@@ -257,9 +287,14 @@ def _run_batch_worker(states_to_run, control):
 
 - 成功 → `finished = True`（不变）。
 - 失败 → `finished = True`（不变）。
-- 排队中被取消 → 不发起网络请求，不产生 `.tmp`，`finished = True`。
+- 排队中被取消 → 不发起网络请求，`finished = True`；如果磁盘上留着上一轮暂停时写下的 `.tmp`（这一轮还没来得及发出请求就直接被取消判定截住），也一并删除、计数器一并归零——不能因为“这一轮没写过东西”就跳过清理，`.tmp` 是不是这一轮建的不影响它该不该被清掉。
 - 在飞中被取消 → 中止写入，删除 `.tmp`，`downloaded_size`/`total_size` 清零，`finished = True`（取消不算失败，不写 `failed_reason`）。
-- 排队中/在飞中被暂停 → 保留已写的 `.tmp`，不清零 `downloaded_size`，`finished` 保持 `False`——这是批次里唯一不终结的情况，也是让 `downloads_active()`（定义 `not all(finished)`，完全不用改）继续把“已暂停”识别为“批次仍然活跃”的关键。
+- 排队中/在飞中被暂停 → 保留已写的 `.tmp`，不清零 `downloaded_size`，`finished` 保持 `False`——这是批次里唯一不终结的情况，也是让 `downloads_active()`（定义 `not all(finished)`，完全不用改）继续把“已暂停”识别为“批次仍然活跃”的关键。**例外**：如果暂停恰好落在最后一块写完之后（`total_size > 0` 且 `downloaded_size == total_size`），说明文件其实已经下完，只是还没来得及走到成功分支，这种情况按“完成”处理（改名、`finished = True`），不留着一个内容已经齐全的 `.tmp` 装作还在暂停。
+
+判定“为什么停下来”还有两条容易漏掉的时序规则，必须显式遵守：
+
+- **P0-2（先判 `stop_reason()`，再判响应可不可用）**：请求返回之后，必须先检查 `stop_reason()`，命中暂停/取消就直接按暂停/取消收尾，根本不去看这次响应是不是可信——网络请求在飞的这段时间里随时可能被暂停/取消，此时响应内容是什么已经不重要，把它当失败处理（写 `failed_reason`）是错的，会把一次正常的暂停/取消误报成下载失败。
+- **P0-3（循环退出后重新读一次 `stop_reason()`，不沿用循环内最后一次的值）**：分块写入循环里每写完一块都会检查一次 `stop_reason()`，命中就 `break`；但循环退出后判定“这个文件最终算什么结局”时，必须**重新调用一次** `stop_reason()`，不能直接复用循环内触发 `break` 那次的返回值——两者之间可能存在流干净结束（EOF）与暂停/取消几乎同时发生的窗口，只有重新读一次才能配合上面“暂停恰好落在最后一块之后”的例外做出正确判断。
 
 也就是说，**一个批次只要不是“暂停”这个结局，离开批次时它名下所有任务的 `finished` 最终都会是 `True`**；只有“暂停”结局允许 `finished` 停留在 `False`，而这些 `False` 的任务只会存在于“已暂停”这一个界面状态里，会被“继续”重新提交，或者被“取消”在 (d) 描述的路径里清理并强制置为 `True`。
 
