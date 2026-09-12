@@ -677,9 +677,9 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
     response = None
     registered_key = None
     paused = False # 暂停时 finished 保持 False，留给“继续”重新提交；其余情况都会在 finally 里置为 True
-    finalizing = False # 传输已确认完整、进入"加书签 + 改名"收尾阶段之后置位：.tmp 从这一刻起
+    finalizing = False # 传输已确认完整、进入“加书签 + 改名”收尾阶段之后置位：.tmp 从这一刻起
     # 可能不再是服务端正文的前缀（add_bookmarks 会整份重写它），这个阶段发生的暂停请求
-    # 不能再把任务回滚成"可续传"状态，只能判定为失败并清理，逼下一次发起全新下载
+    # 不能再把任务回滚成“可续传”状态，只能判定为失败并清理，逼下一次发起全新下载
 
     def discard_temp_and_zero_counters() -> None: # 离开这个任务且不算暂停的路径都要走这里：
         # .tmp 可能是这次建的，也可能是上一轮暂停/续传留下的，一律清掉，计数器一律归零
@@ -726,7 +726,7 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                     if open_mode == "wb": # 全新正文：无条件覆盖校验子，哪怕这次响应没给、该清空成 None
                         current_state["validator"] = planned_validator
                     # open_mode == "ab"（续传）：不动校验子，沿用发起这次请求时用的旧值——
-                    # planned_validator 在这条分支上恒为 None，不代表"应当清空"，只是"不归它管"，
+                    # planned_validator 在这条分支上恒为 None，不代表“应当清空”，只是“不归它管”，
                     # 不能用同一个 None 表达两种语义，只能靠 open_mode 来分辨该不该写。
                     for chunk in response.iter_content( # 分块下载；total_size 续传时也是文件全长，分档依据不变
                         chunk_size=131072 if current_state["total_size"] < 20971520 else 262144 if current_state["total_size"] < 52428800 else 524288
@@ -768,7 +768,7 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
             paused = True
         else:
             # finalizing 阶段命中暂停也落到这里：加书签/改名失败时 .tmp 可能已经被整份重写，
-            # 不再是服务端正文的前缀，没有"继续"这回事，只能判定失败并清理，逼下一次全新下载
+            # 不再是服务端正文的前缀，没有“继续”这回事，只能判定失败并清理，逼下一次全新下载
             print_error(e)
             current_state["failed_reason"] = redact_access_token(traceback.format_exc().rstrip())
             discard_temp_and_zero_counters()
