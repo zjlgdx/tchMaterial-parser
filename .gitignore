@@ -1,2 +1,42 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build outputs
 build/
 dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Test / coverage / type checker caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Playwright CLI session artifacts (may contain page state)
+.playwright-cli/
+
+# Project local temp data
+.tmp/
+tmp/
+temp/
+/.devfiles
