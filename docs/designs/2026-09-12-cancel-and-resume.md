@@ -86,7 +86,7 @@ issue 里引用的行号是撰写时的快照，本节按当前工作树（基�
 8. **镜像轮换与续传：不同镜像续传时 `If-Range` 是唯一的安全网，且要防止“接上错误的位置”。**
    核实：属实，`download_mirror_urls` 会在 r1/r2/r3 之间轮换，且轮换逻辑与续传逻辑目前完全不相交（续传还不存在）；另外光凭状态码 206 不能保证服务端真的从我们请求的偏移开始返回——服务端也可能因为自身实现而回一个别的区间。
    应对：`request_download` 的镜像轮换逻辑保持不变、原样复用，续传只是多带了 `Range`/`If-Range`/`Accept-Encoding`，这些头在每一个候选镜像上都会原样发送。是否可追加不只看状态码是不是 206，还要看 `Content-Range` 解析出的起始位置是否等于本次请求的偏移（见 Architecture (b)）；一旦不等，按不可续传处理。因此不管最终由哪个镜像应答、应答的区间是否符合预期，正确性都由这个校验兜底，不依赖“猜哪个镜像会命中”。
-   测试：`test_resume_across_mirror_rotation_still_sends_if_range`、`test_resume_requires_content_range_start_to_match_requested_offset`。
+   测试：`test_resume_across_mirror_rotation_still_sends_if_range`、`test_resume_requires_content_range_start_to_match_requested_offset`、`test_unusable_206_is_never_written_as_if_it_were_the_full_file`、`test_206_with_unparseable_content_range_is_never_written_as_if_it_were_the_full_file`（后两条走完整的 `download_file`，断言最终文件的字节，不只是 `open_mode` 与计数器）。
 
 9. **信号量/全局锁在取消/暂停时不能泄漏。**
    核实：属实需要留意，但当前代码结构本身是安全的（`with _download_slots:` 包住了整个请求与写入过程，任何 `return`/异常都会走 `__exit__` 释放）。风险点在于**新增的提前返回分支**是否都写在这个 `with` 块内部。
@@ -167,7 +167,7 @@ def request_download(url, range_from: int | None = None, validator: str | None =
     ...
 ```
 
-“用什么模式打开文件”“`downloaded_size` 从哪起算”“`total_size` 取哪个响应头”“要不要刷新校验子”是同一个决定的四个输出，写在同一段逻辑里，不允许分开判断：
+“用什么模式打开文件”“`downloaded_size` 从哪起算”“`total_size` 取哪个响应头”“要不要刷新校验子”是同一个决定的四个输出，写在同一段逻辑里，不允许分开判断。这里有一条容易漏掉的分界线，必须显式说清楚：**响应是不是 206，和响应能不能被当整份正文使用，是两件不同的事**——一个不可用的 206（起点不匹配、或 `Content-Range` 解析不出来）不能落回“当成普通响应，`wb` 截断、`total_size` 取这次的 `Content-Length`”，因为它的响应体只是被请求的那一段，不是完整正文；把它的 `Content-Length` 当成整份文件的长度、把它的 body 当成整份文件的内容写下去，会产出一个大小和计数器都自洽、内容却是错的文件，且不会触发任何失败提示。**判定为“不可用”的 206 必须和 416 走同一条路：关闭这次响应，重新发一次不带 Range 的全新请求，把新响应当作真正的完整正文来源。**
 
 ```python
 def parse_content_range(header_value: str | None) -> tuple[int, int, int] | None:
@@ -179,26 +179,34 @@ def plan_download_write(current_state: dict, temp_path: str, url: str):
     offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
     can_attempt_range = offset > 0 and bool(current_state["validator"])
 
-    response, attempted_urls = request_download(
-        url,
-        range_from=offset if can_attempt_range else None,
-        validator=current_state["validator"] if can_attempt_range else None,
-    )
+    if can_attempt_range:
+        response, attempted_urls = request_download(url, range_from=offset, validator=current_state["validator"])
+    else:
+        response, attempted_urls = request_download(url)
 
-    if response.status_code == 416 and can_attempt_range:
-        # 范围无效：不信任这次响应，放弃这次的偏移，按全新请求重来一遍（对应坑 4）
+    if can_attempt_range and response.ok:
+        content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
+        # 追加的前提：本地确有偏移、手上有校验子、服务端真的回了 206、且这段的起点正好等于我们请求的偏移（对应坑 8）
+        usable_206 = response.status_code == 206 and content_range is not None and content_range[0] == offset
+    else:
+        content_range, usable_206 = None, False
+
+    # 416（范围无效）与“回了 206 但接不上”是同一类不可信响应：这次的响应体不是完整正文，
+    # 绝不能当整份写下去。两者一律不信任这次响应，关掉后按一次全新的、不带 Range 的请求重来
+    # （对应坑 4，以及“206 只是校验起点、落回分支对 206 本身仍然错误”这个此前遗漏的情形）。
+    if can_attempt_range and (response.status_code == 416 or (response.status_code == 206 and not usable_206)):
         response.close()
         offset = 0
         can_attempt_range = False
         response, attempted_urls = request_download(url)
+        content_range, usable_206 = None, False
 
-    content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
-    # 追加的前提：本地确有偏移、手上有校验子、服务端真的回了 206、且这段的起点正好等于我们请求的偏移（对应坑 8）
-    resumed = can_attempt_range and content_range is not None and content_range[0] == offset
+    if not response.ok:  # 失败响应交给调用方走既有的失败分支，这里不去碰它未必存在的响应头
+        return "wb", response, attempted_urls
 
-    open_mode = "ab" if resumed else "wb"
-    current_state["downloaded_size"] = offset if resumed else 0
-    current_state["total_size"] = content_range[2] if resumed else int(response.headers.get("Content-Length", 0))
+    open_mode = "ab" if usable_206 else "wb"
+    current_state["downloaded_size"] = offset if usable_206 else 0
+    current_state["total_size"] = content_range[2] if usable_206 else int(response.headers.get("Content-Length", 0))
 
     if response.status_code == 200:  # 这次响应携带的是完整正文，不论请求时有没有带 Range（对应坑 7）
         current_state["validator"] = response.headers.get("ETag") or response.headers.get("Last-Modified")
@@ -206,7 +214,7 @@ def plan_download_write(current_state: dict, temp_path: str, url: str):
     return open_mode, response, attempted_urls
 ```
 
-即：**`open_mode`、`downloaded_size`、`total_size` 由同一组条件一次性算出，任何一种不满足“本地有偏移 + 有校验子 + 响应是 206 + 起点对得上”的组合（没有偏移、没有校验子、服务端回 200、服务端回 416、`Content-Range` 解析失败、起点不匹配），都会一致地走向“`wb` 截断 + `downloaded_size` 归零 + `total_size` 取 `Content-Length`”，不存在“判成截断但计数器没归零”这种组合。** 这是一个可以在单测里逐一构造反例、覆盖每个分支的不变量，不是“我们记得住状态”这种不可验证的承诺。
+即：**`open_mode`、`downloaded_size`、`total_size` 由同一组条件一次性算出，任何一种不满足“本地有偏移 + 有校验子 + 响应是 206 + 起点对得上”的组合，都会一致地走向“`wb` 截断 + `downloaded_size` 归零 + `total_size` 取（重新请求后的）`Content-Length`”，不存在“判成截断但计数器没归零”这种组合，也不存在“判成截断但仍在用一个不可信 206 的响应体/响应头”这种组合。** 这是一个可以在单测里逐一构造反例、覆盖每个分支的不变量，不是“我们记得住状态”这种不可验证的承诺；且这条不变量必须用**最终文件的字节**去验证，不能只验证 `open_mode` 和计数器——一个自洽但错误的计数器同样能通过“数值匹配”的检查，只有比对写到磁盘上的实际字节才能揭穿它。
 
 - 校验子的刷新只看**这次响应是不是完整正文**（`status_code == 200`），而不是看“这次请求有没有带 Range”：无论是从未续传过的首次下载，还是带着 Range 但被服务端判定失配、回落成 200 的续传请求，只要拿到的是 200，就意味着这是当下这份文件内容的最新校验子，必须覆盖写入，否则下一次暂停/续传会拿着一份对不上的旧校验子，只能反复触发全量重下。
 - 镜像轮换（坑 8）：`request_download` 的镜像轮换逻辑不改，续传只是多带了 `Range`/`If-Range`/`Accept-Encoding`，这些头在每一个候选镜像上都会原样发送；是否可追加完全由 `plan_download_write` 里那组条件判定，不依赖“猜哪个镜像会命中”。

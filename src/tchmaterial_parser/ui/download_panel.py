@@ -448,7 +448,12 @@ def parse_content_range(header_value: str | None) -> tuple[int, int, int] | None
 
 def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[str, object, list[str]]:
     """决定这次写入用什么模式、downloaded_size/total_size 从哪起算、要不要刷新校验子——
-    四件事由同一次判断给出，不允许出现互相矛盾的组合（例如判成截断却没有归零计数器）。"""
+    四件事由同一次判断给出，不允许出现互相矛盾的组合（例如判成截断却没有归零计数器）。
+
+    206 只有在“服务端真的从我们请求的偏移开始返回”时才可信；只要它的起点不匹配、或
+    Content-Range 解析不出来，这次响应体就只是那一段，不是完整正文，绝不能当整份写下去
+    ——必须像 416 一样不信任这次响应，关掉后按一次全新的、不带 Range 的请求重来。
+    """
     offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
     can_attempt_range = offset > 0 and bool(current_state["validator"])
 
@@ -457,23 +462,29 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
     else:
         response, attempted_urls = request_download(url)
 
-    if response.status_code == 416 and can_attempt_range:
-        # 范围无效：不信任这次响应，放弃这次的偏移，按一次全新请求重来
+    if can_attempt_range and response.ok:
+        content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
+        usable_206 = response.status_code == 206 and content_range is not None and content_range[0] == offset
+    else:
+        content_range = None
+        usable_206 = False
+
+    # 416（范围无效）与“回了 206 但接不上”是同一类不可信响应，处理方式完全一样：
+    # 放弃这次的偏移与响应体，重新发一次不带 Range 的请求，按全新下载处理。
+    if can_attempt_range and (response.status_code == 416 or (response.status_code == 206 and not usable_206)):
         response.close()
         offset = 0
         can_attempt_range = False
         response, attempted_urls = request_download(url)
+        content_range = None
+        usable_206 = False
 
     if not response.ok: # 失败响应交给调用方走既有的失败分支，这里不去碰它未必存在的响应头
         return "wb", response, attempted_urls
 
-    content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
-    # 追加的前提：本地确有偏移、手上有校验子、服务端真的回了 206、且这段的起点正好等于我们请求的偏移
-    resumed = can_attempt_range and content_range is not None and content_range[0] == offset
-
-    open_mode = "ab" if resumed else "wb"
-    current_state["downloaded_size"] = offset if resumed else 0
-    current_state["total_size"] = content_range[2] if resumed else int(response.headers.get("Content-Length", 0))
+    open_mode = "ab" if usable_206 else "wb"
+    current_state["downloaded_size"] = offset if usable_206 else 0
+    current_state["total_size"] = content_range[2] if usable_206 else int(response.headers.get("Content-Length", 0))
 
     if response.status_code == 200: # 这次响应携带的是完整正文，不论请求时有没有带 Range，都要刷新校验子
         current_state["validator"] = response.headers.get("ETag") or response.headers.get("Last-Modified")
@@ -586,6 +597,9 @@ def _run_batch_worker(states_to_run: list[dict], control: BatchControl) -> None:
 def handle_batch_outcome(outcome: str, control: BatchControl) -> None: # 在主线程判定/收尾一个批次的终态
     global _batch_control
 
+    if control.cancel_event.is_set(): # outcome 算出之后到这次回调真正执行之前，取消随时可能追上来；
+        outcome = "cancelled"         # 取消一旦置位，不允许再落成 paused/completed
+
     if outcome == "paused":
         control.paused_settled = True # 批次线程确认退出后才置位；全模块唯一的赋值点
         set_ui_phase("paused")
@@ -648,10 +662,20 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
     response = None
     registered_key = None
     paused = False # 暂停时 finished 保持 False，留给“继续”重新提交；其余情况都会在 finally 里置为 True
+
+    def discard_temp_and_zero_counters() -> None: # 离开这个任务且不算暂停的路径都要走这里：
+        # .tmp 可能是这次建的，也可能是上一轮暂停/续传留下的，一律清掉，计数器一律归零
+        current_state["downloaded_size"], current_state["total_size"] = 0, 0
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
     try:
         with _download_slots:
             reason = stop_reason()
-            if reason == "cancelled": # 排队中被取消：不发起网络请求，不产生 .tmp；finished 由 finally 统一置位
+            if reason == "cancelled": # 排队中被取消：不发起网络请求；.tmp 可能是上一轮暂停留下的，一并清理
+                discard_temp_and_zero_counters()
                 return
             if reason == "paused": # 排队中被暂停：不发起网络请求，留给“继续”重新提交
                 paused = True
@@ -663,8 +687,15 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                 with control.lock:
                     control.active_responses[registered_key] = response
 
-            if not response.ok: # 服务器返回表示错误的 HTTP 状态码
+            # 请求在飞时也可能已经被暂停/取消：响应是否 ok 已经不重要，不能把它判成真失败
+            reason = stop_reason()
+            if reason == "cancelled":
+                discard_temp_and_zero_counters()
+            elif reason == "paused":
+                paused = True
+            elif not response.ok: # 服务器返回表示错误的 HTTP 状态码
                 current_state["failed_reason"] = download_failure_reason(response, attempted_urls)
+                discard_temp_and_zero_counters()
             else:
                 os.makedirs(os.path.dirname(save_path), exist_ok=True) # 分类下载时子目录可能尚不存在
                 with open(temp_path, open_mode) as file:
@@ -675,25 +706,19 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                             file.write(chunk)
                             current_state["downloaded_size"] += len(chunk)
                             refresh_download_progress()
-                        reason = stop_reason()
-                        if reason: # 每写完一块检查一次，命中就停止读取，不再等下一块
+                        if stop_reason(): # 每写完一块检查一次，命中就停止读取，不再等下一块
                             break
 
+                # 循环退出后重新读一次：流干净结束（EOF）时不能沿用循环里最后一次的 reason，
+                # 否则暂停恰好撞上 EOF 会被当成“下载不完整”，把好不容易保住的半截文件删掉。
+                reason = stop_reason()
                 if reason == "cancelled": # 在飞中被取消：中止写入，删除 .tmp，不算失败
-                    current_state["downloaded_size"], current_state["total_size"] = 0, 0
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
+                    discard_temp_and_zero_counters()
                 elif reason == "paused": # 在飞中被暂停：保留已写的 .tmp，不清零已下载量
                     paused = True
                 elif current_state["total_size"] > 0 and current_state["downloaded_size"] != current_state["total_size"]: # 文件下载不完整
                     current_state["failed_reason"] = f"文件下载不完整，需下载 {current_state['total_size']} 字节，实际下载 {current_state['downloaded_size']} 字节"
-                    current_state["downloaded_size"], current_state["total_size"] = 0, 0
-                    try:
-                        os.remove(temp_path)
-                    except Exception:
-                        pass
+                    discard_temp_and_zero_counters()
                 else:
                     if chapters: # 添加书签
                         ui_call(progress_label.config, text="添加书签")
@@ -705,21 +730,13 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
         # 主动断连会让 iter_content/文件写入抛出异常，具体异常类型不保证一致，按事件标志分类更稳定
         reason = stop_reason()
         if reason == "cancelled":
-            current_state["downloaded_size"], current_state["total_size"] = 0, 0
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+            discard_temp_and_zero_counters()
         elif reason == "paused":
             paused = True
         else:
             print_error(e)
-            current_state["downloaded_size"], current_state["total_size"] = 0, 0
             current_state["failed_reason"] = redact_access_token(traceback.format_exc().rstrip())
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
+            discard_temp_and_zero_counters()
     finally:
         if registered_key is not None: # 登记过就一定要注销，避免别的任务的主动断连误关到这次已经用不上的响应
             with control.lock:
