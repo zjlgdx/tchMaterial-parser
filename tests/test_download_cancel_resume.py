@@ -1184,6 +1184,75 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(f"{save_path}.tmp").exists())
         self.assertEqual(Path(save_path).read_bytes(), full_content)
 
+    def test_cancel_exactly_at_full_length_completes_instead_of_discarding_the_file(self) -> None:
+        # 与上一条对称：取消恰好落在最后一块之后——同一时刻、同一磁盘状态，只是按下的按钮不同。
+        # 文件其实已经下完，删掉它就是在丢弃一份已经做完的工作；取消只回收尚未下满的半成品。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        full_content = b"x" * 512
+
+        class CancelAtEofResponse:
+            ok = True
+            status_code = 200
+            headers = {"Content-Length": str(len(full_content))}
+
+            def iter_content(self, **kwargs) -> object:
+                yield full_content
+                # 消费者写完最后一块、查过 stop_reason()（此时还没取消）之后才会回来问要下一项；
+                # 用户恰好在这段时间点了取消，随后连接被关掉，迭代干净结束。
+                control.cancel_event.set()
+                return
+
+            def close(self) -> None:
+                pass
+
+        with patch.object(panel, "request_download", return_value=(CancelAtEofResponse(), [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertTrue(state["finished"]) # 按完成处理，不是取消清理
+        self.assertIsNone(state["failed_reason"]) # 取消不算失败
+        self.assertEqual(state["downloaded_size"], len(full_content))
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
+        self.assertEqual(Path(save_path).read_bytes(), full_content) # 已经完整的成果照常交付
+
+    def test_cancel_without_a_content_length_still_discards_the_partial_file(self) -> None:
+        # 反向约束，防止上一条改过头：服务端没给 Content-Length 时 total_size 为 0，
+        # 无从判定这份 .tmp 是不是完整的，就不能拿“下满了”当借口交付，仍按半成品清理。
+        # 写过若干字节和一个字节都没写，两种都要按半成品处理——后者的 downloaded_size
+        # 恰好也等于 total_size（都是 0），正是“下满了”这个判据必须带上 total_size > 0
+        # 的原因：少了它，一次什么都没收到的取消会交付一个零字节文件还判成功。
+        for written in (512, 0):
+            with self.subTest(written=written):
+                save_path = str(Path(self.tmp_dir) / f"book-{written}.pdf")
+                state = panel.create_download_state(self.url, save_path)
+                control = panel.BatchControl()
+                state["control"] = control
+
+                class UnknownLengthResponse:
+                    ok = True
+                    status_code = 200
+                    headers: dict = {} # 没有 Content-Length
+
+                    def iter_content(self, **kwargs) -> object:
+                        if written:
+                            yield b"x" * written
+                        control.cancel_event.set()
+                        return
+
+                    def close(self) -> None:
+                        pass
+
+                with patch.object(panel, "request_download", return_value=(UnknownLengthResponse(), [self.url])):
+                    panel.download_file(self.url, save_path, None, state)
+
+                self.assertTrue(state["finished"])
+                self.assertIsNone(state["failed_reason"]) # 取消不算失败
+                self.assertEqual(state["total_size"], 0)
+                self.assertFalse(Path(f"{save_path}.tmp").exists()) # 长度未知：仍是半成品，照常清理
+                self.assertFalse(Path(save_path).exists())
+
     def test_pause_stops_reading_via_cooperative_check_even_when_the_stream_never_raises(self) -> None:
         # “良民”流：close() 之后不抛错，会一直正常吐块。暂停必须靠分块循环里的协作式检查
         # 提前 break，而不是像上一条那样恰好等到断连异常。

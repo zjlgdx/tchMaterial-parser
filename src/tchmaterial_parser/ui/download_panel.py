@@ -793,12 +793,14 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                 # 循环退出后重新读一次：流干净结束（EOF）时不能沿用循环里最后一次的 reason，
                 # 否则暂停恰好撞上 EOF 会被当成“下载不完整”，把好不容易保住的半截文件删掉。
                 reason = stop_reason()
-                # 暂停恰好落在最后一块之后：文件其实已经下完，只是还没来得及被判定成功，
-                # 不该当成“暂停”留着 .tmp 不改名——已知总长且确实下满，就按完成处理。
+                # 停止恰好落在最后一块之后：文件其实已经下完，只是还没来得及被判定成功。
+                # 已知总长且确实下满时，暂停和取消都按完成处理——既不留着一份内容已经齐全的
+                # .tmp 装作还在暂停，也不把一份已经完整的成果当半成品删掉。总长未知（服务端
+                # 没给 Content-Length）时无从判定完整，一律仍按半成品对待。
                 reached_full_length = current_state["total_size"] > 0 and current_state["downloaded_size"] == current_state["total_size"]
-                if reason == "cancelled": # 传输尚未确认完整时被取消：中止写入，删除这份半成品，不算失败
+                if reason == "cancelled" and not reached_full_length: # 尚未下满就被取消：中止写入，删除这份半成品，不算失败
                     discard_temp_and_zero_counters()
-                elif reason == "paused" and not reached_full_length: # 在飞中被暂停：保留已写的 .tmp，不清零已下载量
+                elif reason == "paused" and not reached_full_length: # 尚未下满就被暂停：保留已写的 .tmp，不清零已下载量
                     paused = True
                 elif current_state["total_size"] > 0 and current_state["downloaded_size"] != current_state["total_size"]: # 文件下载不完整
                     current_state["failed_reason"] = f"文件下载不完整，需下载 {current_state['total_size']} 字节，实际下载 {current_state['downloaded_size']} 字节"
