@@ -524,8 +524,7 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
     try:
         with _download_slots:
             reason = stop_reason()
-            if reason == "cancelled": # 排队中被取消：不发起网络请求，不产生 .tmp
-                current_state["finished"] = True
+            if reason == "cancelled": # 排队中被取消：不发起网络请求，不产生 .tmp；finished 由 finally 统一置位
                 return
             if reason == "paused": # 排队中被暂停：不发起网络请求，留给“继续”重新提交
                 paused = True

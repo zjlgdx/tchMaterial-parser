@@ -32,6 +32,52 @@ class BlockingChunkResponse:
         self.close_event.set()
 
 
+class WellBehavedStoppableResponse:
+    """连续吐块、close() 不抛错的“良民”响应：证明分块循环里的协作式检查本身在起作用，
+    不依赖“断连之后 iter_content 恰好抛出异常”这条路径——真实的流未必会在断连后立刻报错。"""
+
+    def __init__(self, trigger, trigger_after_chunks: int = 3, chunk_count: int = 200, chunk_size: int = 100) -> None:
+        self.ok = True
+        self.status_code = 200
+        self.headers = {"Content-Length": str(chunk_count * chunk_size)}
+        self._trigger = trigger
+        self._trigger_after_chunks = trigger_after_chunks
+        self._chunk_size = chunk_size
+        self._chunk_count = chunk_count
+        self.closed = False
+
+    def iter_content(self, **kwargs) -> object:
+        for index in range(self._chunk_count):
+            if index == self._trigger_after_chunks: # 模拟用户在下载中途点了暂停/取消
+                self._trigger()
+            yield b"x" * self._chunk_size
+
+    def close(self) -> None:
+        self.closed = True # 不抛错
+
+
+class TriggerThenRaiseResponse:
+    """吐几块正常数据后，先触发回调、再抛出异常——模拟主动断连确实让 iter_content 报错的场景，
+    但报错发生在“取次一块”时，而不是紧跟在已经写入的那块后面。"""
+
+    def __init__(self, trigger, chunk_count: int = 3, chunk_size: int = 100) -> None:
+        self.ok = True
+        self.status_code = 200
+        self.headers = {"Content-Length": str((chunk_count + 50) * chunk_size)}
+        self._trigger = trigger
+        self._chunk_count = chunk_count
+        self._chunk_size = chunk_size
+
+    def iter_content(self, **kwargs) -> object:
+        for _ in range(self._chunk_count):
+            yield b"x" * self._chunk_size
+        self._trigger()
+        raise ConnectionError("connection reset")
+
+    def close(self) -> None:
+        pass
+
+
 class FakeRangeResponse:
     """模拟 requests.Response，只暴露续传逻辑需要的 status_code/headers/close。"""
 
@@ -485,6 +531,62 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertTrue(response.closed)
         self.assertFalse(state["finished"]) # 暂停：finished 保持 False，留给“继续”
         self.assertEqual(Path(f"{save_path}.tmp").read_bytes(), b"12345") # 半截内容保留
+
+    def test_pause_stops_reading_via_cooperative_check_even_when_the_stream_never_raises(self) -> None:
+        # “良民”流：close() 之后不抛错，会一直正常吐块。暂停必须靠分块循环里的协作式检查
+        # 提前 break，而不是像上一条那样恰好等到断连异常。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        chunk_count, chunk_size = 200, 100
+        response = WellBehavedStoppableResponse(control.pause_event.set, trigger_after_chunks=3, chunk_count=chunk_count, chunk_size=chunk_size)
+
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        total_size = chunk_count * chunk_size
+        self.assertGreater(state["downloaded_size"], 0)
+        self.assertLess(state["downloaded_size"], total_size // 2) # 远小于全长，证明是协作式检查提前停下的
+        self.assertFalse(state["finished"]) # 暂停：留给“继续”
+        self.assertTrue(Path(f"{save_path}.tmp").exists())
+        self.assertEqual(Path(f"{save_path}.tmp").stat().st_size, state["downloaded_size"])
+        self.assertFalse(Path(save_path).exists())
+
+    def test_cancel_in_flight_deletes_the_partially_written_temp_file(self) -> None:
+        # 良民流路径：分块循环正常 break 出来（不经过 except），必须清理掉已经写了一部分的 .tmp。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        response = WellBehavedStoppableResponse(control.cancel_event.set, trigger_after_chunks=3, chunk_count=200, chunk_size=100)
+
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertTrue(state["finished"])
+        self.assertIsNone(state["failed_reason"]) # 取消不算失败
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertEqual(state["total_size"], 0)
+        self.assertFalse(Path(f"{save_path}.tmp").exists()) # 之前确实写过若干字节，取消后必须清理掉
+        self.assertFalse(Path(save_path).exists())
+
+    def test_cancel_via_disconnect_exception_also_deletes_the_partial_temp_file(self) -> None:
+        # 断连异常路径：iter_content 在取下一块时才抛错（except 分支），同样要清理 .tmp。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        response = TriggerThenRaiseResponse(control.cancel_event.set, chunk_count=3, chunk_size=100)
+
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertTrue(state["finished"])
+        self.assertIsNone(state["failed_reason"]) # 取消不算失败，不应该走进真失败那条分支
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
+        self.assertFalse(Path(save_path).exists())
 
     def test_active_responses_registered_then_unregistered_on_the_disconnect_path(self) -> None:
         save_path = str(Path(self.tmp_dir) / "book.pdf")
