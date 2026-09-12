@@ -15,6 +15,16 @@ def fetch_book_version() -> tuple[str, list[str]]: # 获取电子课本目录的
     urls: str = version_data["urls"]
     return f"{version_data['module_version']}:{urls}", urls.split(",")
 
+def is_resource_tree(items: object) -> bool: # 缓存文件可能被外部改动，结构不符时不能当成命中，否则界面会卡在加载提示上
+    if not isinstance(items, dict):
+        return False
+    for item in items.values():
+        if not isinstance(item, dict) or not isinstance(item.get("display_name"), str):
+            return False
+        if "children" in item and not is_resource_tree(item["children"]):
+            return False
+    return True
+
 def load_cached_resource_list(version: str) -> dict | None: # 读取本地缓存的资源目录；缓存缺失、损坏或版本不符时返回 None，由调用方重新抓取
     cache_file = catalog_cache_path()
     if not cache_file:
@@ -28,7 +38,7 @@ def load_cached_resource_list(version: str) -> dict | None: # 读取本地缓存
         if not isinstance(cached, dict) or cached.get("cache_format") != CACHE_FORMAT or cached.get("version") != version:
             return None
         resource_list = cached.get("resource_list")
-        return resource_list if isinstance(resource_list, dict) else None
+        return resource_list if is_resource_tree(resource_list) else None
     except Exception as e: # 缓存文件损坏或无法读取，重新抓取即可
         print_error(e)
         return None

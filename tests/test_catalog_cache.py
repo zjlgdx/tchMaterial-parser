@@ -109,6 +109,9 @@ class CatalogCacheTest(unittest.TestCase):
             "缺少版本字段": gzip.compress(json.dumps({"cache_format": catalog.CACHE_FORMAT, "resource_list": {}}).encode("utf-8")),
             "版本不符": gzip.compress(json.dumps({"cache_format": catalog.CACHE_FORMAT, "version": "别的版本", "resource_list": {}}).encode("utf-8")),
             "资源列表结构异常": gzip.compress(json.dumps({"cache_format": catalog.CACHE_FORMAT, "version": version, "resource_list": "文本"}).encode("utf-8")),
+            "节点为 null": gzip.compress(json.dumps({"cache_format": catalog.CACHE_FORMAT, "version": version, "resource_list": {"books": None}}).encode("utf-8")),
+            "节点缺少显示名": gzip.compress(json.dumps({"cache_format": catalog.CACHE_FORMAT, "version": version, "resource_list": {"books": {"children": {}}}}).encode("utf-8")),
+            "子节点不是字典": gzip.compress(json.dumps({"cache_format": catalog.CACHE_FORMAT, "version": version, "resource_list": {"books": {"display_name": "电子教材", "children": []}}}).encode("utf-8")),
             "缓存结构版本不符": gzip.compress(json.dumps({"cache_format": catalog.CACHE_FORMAT + 1, "version": version, "resource_list": {}}).encode("utf-8")),
             "空文件": b"",
         }
