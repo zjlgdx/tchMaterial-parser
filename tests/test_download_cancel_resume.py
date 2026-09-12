@@ -1,5 +1,8 @@
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import Mock, patch
+import os
+import tempfile
 import unittest
 
 from src.tchmaterial_parser.api import ResourceInfo
@@ -137,6 +140,105 @@ class MultiFileCountPromptTest(unittest.TestCase):
                 panel.download()
 
         self.notice.assert_not_called()
+
+
+class PlanDownloadWriteTest(unittest.TestCase):
+    """坑 1/2/4/6/7/8/9：追加/截断、downloaded_size、total_size、校验子刷新是同一个决定的输出。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.tmp_dir = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.temp_path = str(Path(self.tmp_dir) / "book.pdf.tmp")
+        self.url = "https://example.com/book.pdf"
+
+    def existing_state(self, offset: int, validator: str | None = '"etag-old"') -> dict:
+        with open(self.temp_path, "wb") as file:
+            file.write(b"x" * offset)
+        state = panel.create_download_state(self.url, str(Path(self.tmp_dir) / "book.pdf"))
+        state["validator"] = validator
+        return state
+
+    def test_206_total_size_comes_from_content_range_not_content_length(self) -> None:
+        state = self.existing_state(offset=100)
+        response = FakeRangeResponse(206, {"Content-Range": "bytes 100-4999/5000", "Content-Length": "4900"})
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            open_mode, used_response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+
+        self.assertEqual(open_mode, "ab")
+        self.assertIs(used_response, response)
+        self.assertEqual(state["total_size"], 5000)
+        self.assertEqual(state["downloaded_size"], 100)
+
+    def test_resume_accumulates_downloaded_size_from_existing_temp_file_offset(self) -> None:
+        state = self.existing_state(offset=12345)
+        response = FakeRangeResponse(206, {"Content-Range": "bytes 12345-19999/20000", "Content-Length": "7655"})
+        with patch.object(panel, "request_download", return_value=(response, [self.url])) as mocked:
+            panel.plan_download_write(state, self.temp_path, self.url)
+
+        self.assertEqual(state["downloaded_size"], 12345) # 现读的磁盘偏移，不是某个内存里的旧计数
+        self.assertEqual(mocked.call_args.kwargs["range_from"], 12345)
+
+    def test_resume_retries_from_scratch_on_416(self) -> None:
+        state = self.existing_state(offset=500)
+        range_invalid = FakeRangeResponse(416)
+        fresh = FakeRangeResponse(200, {"Content-Length": "999", "ETag": '"etag-new"'})
+        with patch.object(panel, "request_download", side_effect=[(range_invalid, [self.url]), (fresh, [self.url])]) as mocked:
+            open_mode, used_response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+
+        self.assertEqual(mocked.call_count, 2)
+        self.assertTrue(range_invalid.closed) # 不信任 416 响应，主动关闭后重来
+        self.assertEqual(mocked.call_args_list[1].kwargs.get("range_from"), None)
+        self.assertEqual(open_mode, "wb")
+        self.assertIs(used_response, fresh)
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertEqual(state["total_size"], 999)
+
+    def test_resume_requires_content_range_start_to_match_requested_offset(self) -> None:
+        state = self.existing_state(offset=1000)
+        # 服务端回了 206，但起点是 0 而不是我们请求的 1000（例如被服务端 clamp），
+        # 这段接不上我们本地已有的字节，不能当成可以追加续传。
+        mismatched_206 = FakeRangeResponse(206, {"Content-Range": "bytes 0-4999/5000", "Content-Length": "5000"})
+        with patch.object(panel, "request_download", return_value=(mismatched_206, [self.url])):
+            open_mode, _response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+        self.assertEqual(open_mode, "wb")
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertEqual(state["total_size"], 5000) # 落回按 Content-Length 处理，不使用 Content-Range 的总长
+
+    def test_malformed_content_range_falls_back_to_full_restart(self) -> None:
+        state = self.existing_state(offset=200)
+        response = FakeRangeResponse(206, {"Content-Range": "not-a-content-range", "Content-Length": "42"})
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            open_mode, _response, _attempted = panel.plan_download_write(state, self.temp_path, self.url)
+
+        self.assertEqual(open_mode, "wb")
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertEqual(state["total_size"], 42)
+
+    def test_no_validator_never_attempts_a_range_request(self) -> None:
+        state = self.existing_state(offset=800, validator=None)
+        response = FakeRangeResponse(200, {"Content-Length": "800"})
+        with patch.object(panel, "request_download", return_value=(response, [self.url])) as mocked:
+            panel.plan_download_write(state, self.temp_path, self.url)
+
+        self.assertIsNone(mocked.call_args.kwargs["range_from"])
+
+    def test_validator_refreshes_whenever_response_is_a_full_body(self) -> None:
+        # 首次下载（无 Range）拿到 200 要刷新校验子；带 Range 但被判定失配、回落成 200 的续传请求同样要刷新。
+        state = self.existing_state(offset=0, validator=None)
+        os.remove(self.temp_path)
+        fresh = FakeRangeResponse(200, {"Content-Length": "10", "ETag": '"fresh-etag"'})
+        with patch.object(panel, "request_download", return_value=(fresh, [self.url])):
+            panel.plan_download_write(state, self.temp_path, self.url)
+        self.assertEqual(state["validator"], '"fresh-etag"')
+
+        state = self.existing_state(offset=100, validator='"stale-etag"')
+        fallback_200 = FakeRangeResponse(200, {"Content-Length": "999", "Last-Modified": "Tue, 01 Jan 2030 00:00:00 GMT"})
+        with patch.object(panel, "request_download", return_value=(fallback_200, [self.url])):
+            panel.plan_download_write(state, self.temp_path, self.url)
+        self.assertEqual(state["validator"], "Tue, 01 Jan 2030 00:00:00 GMT")
 
 
 if __name__ == "__main__":

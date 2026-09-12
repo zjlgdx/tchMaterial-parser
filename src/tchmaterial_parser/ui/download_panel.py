@@ -390,7 +390,54 @@ def download() -> None: # 下载资源文件
     parse_urls_in_background(list(urls), bookmark_var.get(), start_downloads)
 
 def create_download_state(url: str, save_path: str) -> dict:
-    return { "download_url": url, "save_path": save_path, "downloaded_size": 0, "total_size": 0, "finished": False, "failed_reason": None }
+    return {
+        "download_url": url, "save_path": save_path,
+        "downloaded_size": 0, "total_size": 0,
+        "finished": False, "failed_reason": None,
+        "validator": None, # 续传校验子：ETag 优先，否则 Last-Modified；都没有则为 None，此时不尝试续传
+    }
+
+def parse_content_range(header_value: str | None) -> tuple[int, int, int] | None:
+    """解析 `Content-Range: bytes 起-止/总长`，返回 (起始, 结束, 总长)；缺失或格式不对时返回 None，
+    调用方一律按不可续传处理（不能相信这次响应真的从我们请求的偏移开始）。"""
+    if not header_value:
+        return None
+    match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", header_value.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[str, object, list[str]]:
+    """决定这次写入用什么模式、downloaded_size/total_size 从哪起算、要不要刷新校验子——
+    四件事由同一次判断给出，不允许出现互相矛盾的组合（例如判成截断却没有归零计数器）。"""
+    offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
+    can_attempt_range = offset > 0 and bool(current_state["validator"])
+
+    response, attempted_urls = request_download(
+        url,
+        range_from=offset if can_attempt_range else None,
+        validator=current_state["validator"] if can_attempt_range else None,
+    )
+
+    if response.status_code == 416 and can_attempt_range:
+        # 范围无效：不信任这次响应，放弃这次的偏移，按一次全新请求重来
+        response.close()
+        offset = 0
+        can_attempt_range = False
+        response, attempted_urls = request_download(url)
+
+    content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
+    # 追加的前提：本地确有偏移、手上有校验子、服务端真的回了 206、且这段的起点正好等于我们请求的偏移
+    resumed = can_attempt_range and content_range is not None and content_range[0] == offset
+
+    open_mode = "ab" if resumed else "wb"
+    current_state["downloaded_size"] = offset if resumed else 0
+    current_state["total_size"] = content_range[2] if resumed else int(response.headers.get("Content-Length", 0))
+
+    if response.status_code == 200: # 这次响应携带的是完整正文，不论请求时有没有带 Range，都要刷新校验子
+        current_state["validator"] = response.headers.get("ETag") or response.headers.get("Last-Modified")
+
+    return open_mode, response, attempted_urls
 
 def start_download_batch(targets: list[tuple[ResourceInfo, str]], directory: str) -> None:
     global download_states
