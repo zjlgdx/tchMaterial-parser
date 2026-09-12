@@ -862,6 +862,25 @@ class BatchControlActionsTest(unittest.TestCase):
         self.assertTrue(control.pause_event.is_set())
         self.assertEqual(closed, [True])
 
+    def test_cancel_sets_the_event_and_closes_active_responses(self) -> None:
+        # 与暂停对称：协作式检查只在收到一块数据之后才触发，连接卡住不吐数据时
+        # （限流、网络中断但 TCP 未断）只能靠主动断连尽快停下，否则要等到 60 秒读超时，
+        # 取消就不再是“随时可用”的逃生口。
+        control = panel.BatchControl()
+        panel._batch_control = control
+        closed = []
+
+        class FakeResponse:
+            def close(self) -> None:
+                closed.append(True)
+
+        control.active_responses[1] = FakeResponse()
+
+        panel.cancel_current_batch()
+
+        self.assertTrue(control.cancel_event.is_set())
+        self.assertEqual(closed, [True])
+
     def test_cancel_while_batch_thread_still_running_does_not_touch_files_or_go_idle(self) -> None:
         control = panel.BatchControl() # 从未请求过暂停：典型的“下载中点取消”
         panel._batch_control = control
