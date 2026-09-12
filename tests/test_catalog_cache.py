@@ -131,6 +131,13 @@ class CatalogCacheTest(unittest.TestCase):
                 self.assertEqual(sorted(self.fetch()["books"]["children"]["primary"]["children"]),
                                  ["book-0", "book-1", "book-2", "book-3"]) # 平台恢复后自行痊愈
 
+    def test_unreadable_cache_path_is_treated_as_miss(self):
+        expected = self.fetch()
+        with patch.object(Path, "exists", side_effect=PermissionError("模拟缓存目录不可访问")): # 目录权限或 ACL 被收紧
+            self.assertEqual(self.fetch(), expected) # 读不到缓存只是退化为重新抓取，不应连资源列表一起加载失败
+        self.assertEqual(self.session.part_calls(), PART_URLS)
+        self.assertTrue(self.errors)
+
     def test_missing_cache_file_is_treated_as_miss(self):
         expected = self.fetch()
         self.cache_file.unlink()

@@ -17,10 +17,12 @@ def fetch_book_version() -> tuple[str, list[str]]: # 获取电子课本目录的
 
 def load_cached_resource_list(version: str) -> dict | None: # 读取本地缓存的资源目录；缓存缺失、损坏或版本不符时返回 None，由调用方重新抓取
     cache_file = catalog_cache_path()
-    if not cache_file or not cache_file.exists():
+    if not cache_file:
         return None
 
     try:
+        if not cache_file.exists(): # 探测本身也可能因目录权限不足而抛错，因此一并放进 try
+            return None
         with gzip.open(cache_file, "rt", encoding="utf-8") as f:
             cached = json.load(f)
         if not isinstance(cached, dict) or cached.get("cache_format") != CACHE_FORMAT or cached.get("version") != version:
