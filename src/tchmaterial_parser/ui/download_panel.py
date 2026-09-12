@@ -331,9 +331,8 @@ def parse_and_copy() -> None: # 解析并复制链接
     copy_btn.config(state="disabled") # 解析期间禁用按钮，避免重复触发
 
     def copy_urls(resources_info_list: list[ResourceInfo], failed_urls: set[str]) -> None: # 解析完成后在主线程复制链接
-        if _batch_control is None: # 没有下载批次在跑才由这里恢复按钮；否则 copy_btn 听 set_ui_phase 的
+        if _batch_control is None: # 没有下载批次在跑才由这里恢复界面；否则听 set_ui_phase/show_parse_progress 的
             copy_btn.config(state="normal")
-        if not downloads_active():
             progress_label.config(text="等待下载") # 解析进度已无用，恢复默认文案
 
         resource_urls = {resource.url for resource in resources_info_list}
@@ -444,13 +443,38 @@ def parse_content_range(header_value: str | None) -> tuple[int, int, int] | None
         return None
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
-def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[str, object, list[str]]:
+def _response_usability(response, offset: int, can_attempt_range: bool) -> tuple[str | None, tuple[int, int, int] | None]:
+    """判定这次响应能不能当正文用，对首次请求、重试请求、有没有带 Range 都一视同仁。
+
+    返回 ("resumed", content_range) 表示可续传的 206（起点对得上）；
+    返回 ("full", None) 表示这就是完整正文（严格要求 status_code == 200，
+    而不是 response.ok/`< 400`——204/304 这类“ok 但没有正文”的响应不算数，
+    否则会产出一个零字节文件却判成功）；
+    返回 (None, None) 表示两者都不是，调用方不能信任这次响应的正文/响应头。
+    """
+    if can_attempt_range and response.status_code == 206:
+        content_range = parse_content_range(response.headers.get("Content-Range"))
+        if content_range is not None and content_range[0] == offset:
+            return "resumed", content_range
+    if response.status_code == 200:
+        return "full", None
+    return None, None
+
+def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[str | None, int, int, str | None, object, list[str]]:
     """决定这次写入用什么模式、downloaded_size/total_size 从哪起算、要不要刷新校验子——
     四件事由同一次判断给出，不允许出现互相矛盾的组合（例如判成截断却没有归零计数器）。
 
     206 只有在“服务端真的从我们请求的偏移开始返回”时才可信；只要它的起点不匹配、或
     Content-Range 解析不出来，这次响应体就只是那一段，不是完整正文，绝不能当整份写下去
-    ——必须像 416 一样不信任这次响应，关掉后按一次全新的、不带 Range 的请求重来。
+    ——必须像 416 一样不信任这次响应，关掉后按一次全新的、不带 Range 的请求重来，且这次
+    重来只做一遍：重试后的响应依然不是可续传的 206、也不是完整的 200 正文，就直接判定
+    “不可信”交给调用方走失败清理，不再加一层重试。
+
+    这里只返回“计划”出来的 downloaded_size/total_size/validator，不直接写回 current_state：
+    调用方必须在真正确定要按 open_mode 打开文件、且已经打开成功之后再应用这些值，
+    否则某个提前退出的分支（比如响应刚拿到就被要求暂停）会把 current_state 里的校验子
+    改成新版本，磁盘上却还留着旧版本的半截文件，两者从此不同源。open_mode 为 None
+    表示这次响应不可信，调用方不应该把它的正文当数据源，应该走失败分支。
     """
     offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
     can_attempt_range = offset > 0 and bool(current_state["validator"])
@@ -460,34 +484,28 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
     else:
         response, attempted_urls = request_download(url)
 
-    if can_attempt_range and response.ok:
-        content_range = parse_content_range(response.headers.get("Content-Range")) if response.status_code == 206 else None
-        usable_206 = response.status_code == 206 and content_range is not None and content_range[0] == offset
-    else:
-        content_range = None
-        usable_206 = False
+    kind, content_range = _response_usability(response, offset, can_attempt_range)
 
-    # 416（范围无效）与“回了 206 但接不上”是同一类不可信响应，处理方式完全一样：
-    # 放弃这次的偏移与响应体，重新发一次不带 Range 的请求，按全新下载处理。
-    if can_attempt_range and (response.status_code == 416 or (response.status_code == 206 and not usable_206)):
+    # 只有“范围本身有问题”（416，或回了 206 但接不上）才值得不带 Range 重来一次：
+    # 换个偏移/校验子可能就通了。真正的失败（404/500 等，与 Range 无关）重来一次
+    # 大概率还是失败，直接走下面的失败分支，不做这次多余的尝试。
+    range_itself_is_the_problem = can_attempt_range and (response.status_code == 416 or (response.status_code == 206 and kind is None))
+    if range_itself_is_the_problem:
         response.close()
         offset = 0
         can_attempt_range = False
         response, attempted_urls = request_download(url)
-        content_range = None
-        usable_206 = False
+        kind, content_range = _response_usability(response, offset, can_attempt_range)
 
-    if not response.ok: # 失败响应交给调用方走既有的失败分支，这里不去碰它未必存在的响应头
-        return "wb", response, attempted_urls
+    if kind is None: # 不可信：交给调用方走失败清理，不去碰它未必存在的响应头
+        return None, 0, 0, None, response, attempted_urls
 
-    open_mode = "ab" if usable_206 else "wb"
-    current_state["downloaded_size"] = offset if usable_206 else 0
-    current_state["total_size"] = content_range[2] if usable_206 else int(response.headers.get("Content-Length", 0))
+    if kind == "resumed":
+        return "ab", offset, content_range[2], None, response, attempted_urls
 
-    if response.status_code == 200: # 这次响应携带的是完整正文，不论请求时有没有带 Range，都要刷新校验子
-        current_state["validator"] = response.headers.get("ETag") or response.headers.get("Last-Modified")
-
-    return open_mode, response, attempted_urls
+    # kind == "full"：这次响应携带的是完整正文，不论请求时有没有带 Range，都要刷新校验子
+    validator = response.headers.get("ETag") or response.headers.get("Last-Modified")
+    return "wb", 0, int(response.headers.get("Content-Length", 0)), validator, response, attempted_urls
 
 def set_ui_phase(phase: str) -> None:
     """统一切换底部两个按钮在四个阶段的文案/命令/启用状态，以及进度条/进度文案是否清空——
@@ -584,7 +602,10 @@ def _run_batch_worker(states_to_run: list[dict], control: BatchControl) -> None:
 
     if control.cancel_event.is_set(): # 取消优先于暂停
         outcome = "cancelled"
-    elif control.pause_event.is_set():
+    elif control.pause_event.is_set() and any(not state["finished"] for state in download_states):
+        # 暂停恰好落在最后一个文件的最后一块之后：批次层面已经没有未完成任务了，
+        # 不该因为 pause_event 还留着置位就落成“暂停”——否则界面会卡在“已暂停 100%”，
+        # 点“继续”要空转一轮才弹完成，点“取消”则全程不会有任何完成提示。
         outcome = "paused"
     else:
         outcome = "completed"
@@ -675,24 +696,32 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                 paused = True
                 return
 
-            open_mode, response, attempted_urls = plan_download_write(current_state, temp_path, url)
+            open_mode, planned_downloaded_size, planned_total_size, planned_validator, response, attempted_urls = plan_download_write(current_state, temp_path, url)
             if control is not None: # 登记这次响应，供主线程暂停/取消时主动断连
                 registered_key = id(current_state)
                 with control.lock:
                     control.active_responses[registered_key] = response
 
-            # 请求在飞时也可能已经被暂停/取消：响应是否 ok 已经不重要，不能把它判成真失败
+            # 请求在飞时也可能已经被暂停/取消：响应是否可用已经不重要，不能把它判成真失败，
+            # 也不能在这里就把 current_state 改成这次“计划”出来的值——万一就此提前退出，
+            # 磁盘上的 .tmp 还是旧内容，current_state 却已经指向新版本，两者不再同源。
             reason = stop_reason()
             if reason == "cancelled":
                 discard_temp_and_zero_counters()
             elif reason == "paused":
                 paused = True
-            elif not response.ok: # 服务器返回表示错误的 HTTP 状态码
+            elif open_mode is None: # 响应不可信：不是可续传的 206，也不是完整的 200 正文
                 current_state["failed_reason"] = download_failure_reason(response, attempted_urls)
                 discard_temp_and_zero_counters()
             else:
                 os.makedirs(os.path.dirname(save_path), exist_ok=True) # 分类下载时子目录可能尚不存在
                 with open(temp_path, open_mode) as file:
+                    # 走到这里，open() 已经按 open_mode 打开成功（"wb" 已经截断），
+                    # 磁盘状态与即将写入的 current_state 必然同源，这才应用“计划”里的值。
+                    current_state["downloaded_size"] = planned_downloaded_size
+                    current_state["total_size"] = planned_total_size
+                    if planned_validator is not None:
+                        current_state["validator"] = planned_validator
                     for chunk in response.iter_content( # 分块下载；total_size 续传时也是文件全长，分档依据不变
                         chunk_size=131072 if current_state["total_size"] < 20971520 else 262144 if current_state["total_size"] < 52428800 else 524288
                     ):
