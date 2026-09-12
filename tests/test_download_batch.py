@@ -88,7 +88,7 @@ class DownloadBatchTest(unittest.TestCase):
             def close(self):
                 barrier.wait(timeout=3)
 
-        with patch.object(panel, "request_download", side_effect=lambda url: (Response(), [url])):
+        with patch.object(panel, "request_download", side_effect=lambda url, **kwargs: (Response(), [url])):
             panel.start_download_batch(self.targets(2), self.directory)
             self.finish()
 
@@ -109,7 +109,7 @@ class DownloadBatchTest(unittest.TestCase):
                 pass
 
         targets = [(resource, str(Path(self.directory) / resource.title / "book.pdf")) for resource, _ in self.targets(2)]
-        with patch.object(panel, "request_download", side_effect=lambda url: (Response(), [url])):
+        with patch.object(panel, "request_download", side_effect=lambda url, **kwargs: (Response(), [url])):
             panel.start_download_batch(targets, self.directory)
             self.finish()
 

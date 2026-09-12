@@ -21,6 +21,14 @@ from ..network import REQUEST_TIMEOUT, request_headers, session
 from ..platform_utils import print_error
 
 download_states: list[dict] = [] # 初始化下载状态
+_STOP_POLL_INTERVAL = 0.05 # 轮询停止请求的时间片；最长只用来切一次 3 秒的退避等待，代价可以忽略
+
+class BatchStopped(Exception):
+    """请求发起阶段命中取消/暂停：这一轮不再继续换镜像或退避重试。
+
+    取消/暂停不是下载失败，调用方应按 stop_reason() 分类收尾（取消→清理，暂停→留给“继续”），
+    不要写 failed_reason；用专用异常而不是返回空响应，正是为了不让它落进“响应不可信”那条失败路径。
+    """
 
 class BatchControl:
     """一个批次（从点下“下载”到批次终结的整段生命周期）的取消/暂停控制状态。
@@ -37,6 +45,24 @@ class BatchControl:
         self.directory: str | None = None # 解析阶段尚未选定目录；选定后再写入
         self.lock = threading.Lock() # 只保护 active_responses
         self.active_responses: dict[int, object] = {} # id(state) -> Response，用于主动断连
+
+    def stop_requested(self) -> bool:
+        """是否已经请求取消或暂停。两个 Event 始终是唯一事实来源，不另外维护派生出来的标志位。"""
+        return self.cancel_event.is_set() or self.pause_event.is_set()
+
+    def wait_or_stop(self, timeout: float) -> bool:
+        """等待至多 timeout 秒，期间一旦请求取消/暂停就立刻醒来并返回 True；等满则返回 False。
+
+        用小时间片轮询现有的两个 Event，而不是新增一个“取消或暂停”的合并 Event——后者必须在
+        每一个置位取消/暂停的地方同步维护，多出一条只能靠人工守住的不变量。
+        """
+        deadline = time.monotonic() + timeout
+        while not self.stop_requested():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(remaining, _STOP_POLL_INTERVAL))
+        return True
 
 _batch_control: BatchControl | None = None # 当前批次；空闲时为 None
 PRIVATE_DOWNLOAD_HOSTS = tuple(f"r{index}-ndr-private.ykt.cbern.com.cn" for index in range(1, 4))
@@ -75,7 +101,7 @@ def _pace_request() -> None:
             time.sleep(wait)
         _last_request_at = time.monotonic()
 
-def request_download(url: str, range_from: int | None = None, validator: str | None = None):
+def request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: BatchControl | None = None):
     """请求资源并在镜像出错时自动切换，返回最终响应和已尝试的无凭据地址。
 
     鉴权只放在 request_headers 生成的 X-ND-AUTH 里，URL 保持原样。
@@ -90,6 +116,11 @@ def request_download(url: str, range_from: int | None = None, validator: str | N
     首次下载与续传若协商出不同的编码，两次响应的字节内容、长度、校验子都可能对不上。
     传入 range_from 时附加 Range 续传；再带上 validator（ETag 或 Last-Modified）时
     一并附加 If-Range，远端内容已变化时服务端会回整个 200 而不是 206。
+
+    传入 control 时，镜像轮换与 400 退避都受取消/暂停约束：换下一个镜像之前、每次退避重试
+    之前各检查一次，退避本身也改成可被唤醒的等待，命中就抛 BatchStopped。这样“点下取消到
+    真正停下”的上界就只剩当前这一条在飞的请求，不会再被镜像数与退避次数叠乘。
+    不传 control 时逐字保持原有行为（一路重试到底，等待就是普通 sleep）。
     """
     extra_headers = {"Accept-Encoding": "identity"}
     if range_from is not None:
@@ -101,7 +132,22 @@ def request_download(url: str, range_from: int | None = None, validator: str | N
     last_response = None
     last_exception: RequestException | None = None
 
+    def close_and_stop() -> BatchStopped:
+        """关掉手上那个已经用不上的响应，并产出调用方要抛的 BatchStopped。"""
+        if last_response is not None:
+            last_response.close()
+        return BatchStopped()
+
+    def wait_before_retry(delay: float) -> bool:
+        """退避等待：有批次控制时切片轮询，命中取消/暂停立刻醒来；没有时就是一次普通 sleep。"""
+        if control is None:
+            time.sleep(delay)
+            return False
+        return control.wait_or_stop(delay)
+
     for candidate_url in download_mirror_urls(url):
+        if control is not None and control.stop_requested(): # 已经要停了就不再多打一个镜像
+            raise close_and_stop()
         attempted_urls.append(candidate_url)
         retry = 0
         while True:
@@ -129,7 +175,9 @@ def request_download(url: str, range_from: int | None = None, validator: str | N
                 return last_response, attempted_urls
             if response.status_code == 400:
                 if retry < len(_400_RETRY_DELAYS):
-                    time.sleep(_400_RETRY_DELAYS[retry])
+                    # 这几秒的退避是取消/暂停最容易被卡住的地方，等待必须能被唤醒
+                    if wait_before_retry(_400_RETRY_DELAYS[retry]):
+                        raise close_and_stop()
                     retry += 1
                     continue
                 return last_response, attempted_urls
@@ -475,14 +523,18 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
     否则某个提前退出的分支（比如响应刚拿到就被要求暂停）会把 current_state 里的校验子
     改成新版本，磁盘上却还留着旧版本的半截文件，两者从此不同源。open_mode 为 None
     表示这次响应不可信，调用方不应该把它的正文当数据源，应该走失败分支。
+
+    响应头到达之前命中取消/暂停时，request_download 抛出的 BatchStopped 会原样向上传递，
+    调用方按停止收尾即可——这条路径上什么都还没写过，不需要、也不应该判成失败。
     """
     offset = os.path.getsize(temp_path) if os.path.exists(temp_path) else 0
     can_attempt_range = offset > 0 and bool(current_state["validator"])
+    control = current_state.get("control") # 单独下载文件时没有这个键，等价于没有取消/暂停能力
 
     if can_attempt_range:
-        response, attempted_urls = request_download(url, range_from=offset, validator=current_state["validator"])
+        response, attempted_urls = request_download(url, range_from=offset, validator=current_state["validator"], control=control)
     else:
-        response, attempted_urls = request_download(url)
+        response, attempted_urls = request_download(url, control=control)
 
     kind, content_range = _response_usability(response, offset, can_attempt_range)
 
@@ -494,7 +546,7 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
         response.close()
         offset = 0
         can_attempt_range = False
-        response, attempted_urls = request_download(url)
+        response, attempted_urls = request_download(url, control=control)
         kind, content_range = _response_usability(response, offset, can_attempt_range)
 
     if kind is None: # 不可信：交给调用方走失败清理，不去碰它未必存在的响应头
@@ -678,11 +730,11 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
     registered_key = None
     paused = False # 暂停时 finished 保持 False，留给“继续”重新提交；其余情况都会在 finally 里置为 True
     finalizing = False # 传输已确认完整、进入“加书签 + 改名”收尾阶段之后置位：.tmp 从这一刻起
-    # 可能不再是服务端正文的前缀（add_bookmarks 会整份重写它），这个阶段发生的暂停请求
-    # 不能再把任务回滚成“可续传”状态，只能判定为失败并清理，逼下一次发起全新下载
+    # 可能不再是服务端正文的前缀（add_bookmarks 会整份重写它），因此这个阶段一旦抛出异常，
+    # 期间命中的暂停请求不能再把任务回滚成“可续传”状态，只能判定为失败并清理，逼下一次发起全新下载
 
-    def discard_temp_and_zero_counters() -> None: # 离开这个任务且不算暂停的路径都要走这里：
-        # .tmp 可能是这次建的，也可能是上一轮暂停/续传留下的，一律清掉，计数器一律归零
+    def discard_temp_and_zero_counters() -> None: # 结局既不是“暂停”、也不是“传输已确认完整”的路径都要走这里：
+        # 此时 .tmp 只是个半成品（可能是这次建的，也可能是上一轮暂停/续传留下的），一律清掉，计数器一律归零
         current_state["downloaded_size"], current_state["total_size"] = 0, 0
         try:
             os.remove(temp_path)
@@ -744,7 +796,7 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                 # 暂停恰好落在最后一块之后：文件其实已经下完，只是还没来得及被判定成功，
                 # 不该当成“暂停”留着 .tmp 不改名——已知总长且确实下满，就按完成处理。
                 reached_full_length = current_state["total_size"] > 0 and current_state["downloaded_size"] == current_state["total_size"]
-                if reason == "cancelled": # 在飞中被取消：中止写入，删除 .tmp，不算失败
+                if reason == "cancelled": # 传输尚未确认完整时被取消：中止写入，删除这份半成品，不算失败
                     discard_temp_and_zero_counters()
                 elif reason == "paused" and not reached_full_length: # 在飞中被暂停：保留已写的 .tmp，不清零已下载量
                     paused = True
@@ -752,7 +804,10 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                     current_state["failed_reason"] = f"文件下载不完整，需下载 {current_state['total_size']} 字节，实际下载 {current_state['downloaded_size']} 字节"
                     discard_temp_and_zero_counters()
                 else:
-                    finalizing = True # 传输已确认完整；从这一刻起 .tmp 随时可能不再是服务端正文的前缀
+                    # 传输已确认完整；从这一刻起 .tmp 随时可能不再是服务端正文的前缀。
+                    # 收尾两步都不抛异常时，不论期间命中的是暂停还是取消都按完成交付——
+                    # 取消只回收尚未完整的半成品，不回收已经完整的成果。
+                    finalizing = True
                     if chapters: # 添加书签：会把 .tmp 整份重写，字节内容、长度都会变
                         ui_call(progress_label.config, text="添加书签")
                         add_bookmarks(temp_path, chapters)
@@ -760,7 +815,8 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                     os.replace(temp_path, save_path) # 重命名临时文件为目标文件
 
     except Exception as e:
-        # 主动断连会让 iter_content/文件写入抛出异常，具体异常类型不保证一致，按事件标志分类更稳定
+        # 主动断连会让 iter_content/文件写入抛出异常，具体异常类型不保证一致，按事件标志分类更稳定；
+        # 响应头到达之前命中取消/暂停时 request_download 抛出的 BatchStopped 也落在这里，同样按标志分类
         reason = stop_reason()
         if reason == "cancelled":
             discard_temp_and_zero_counters()

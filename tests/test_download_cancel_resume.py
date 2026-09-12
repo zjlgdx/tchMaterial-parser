@@ -426,7 +426,7 @@ class PlanDownloadWriteTest(unittest.TestCase):
             panel.plan_download_write(state, self.temp_path, self.url)
 
         # 没有校验子时按原有的“单参数”方式调用，不额外声称一次并不存在的 Range 续传
-        mocked.assert_called_once_with(self.url)
+        mocked.assert_called_once_with(self.url, control=None)
 
     def test_failed_response_returns_none_open_mode_without_a_wasted_retry(self) -> None:
         # 真正的失败（与 Range 无关，例如 404）不该被当成“范围有问题”而多打一次不带 Range 的请求；
@@ -554,7 +554,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         new_version = os.urandom(5000)
         calls: list[tuple] = []
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             calls.append((range_from, validator))
             if len(calls) == 1: # 响应到达、plan_download_write 已经决定 wb 之后，用户点了暂停
                 control.pause_event.set()
@@ -599,7 +599,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
 
         calls: list[tuple] = []
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             calls.append((range_from, validator))
             if len(calls) == 1:
                 # 第一轮续传：真实写入 3 块（300 字节）之后被真的暂停打断
@@ -655,7 +655,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         new_version = os.urandom(5000)
         calls: list[tuple] = []
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             calls.append((range_from, validator))
             if len(calls) == 1:
                 # 第一轮：服务端回的是完整正文（200），没有给 ETag/Last-Modified 中的任何一个，
@@ -705,7 +705,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
 
         calls: list[tuple] = []
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             calls.append((url, range_from, validator))
             return FullBodyResponse(), [url]
 
@@ -765,7 +765,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         unusable_response = UnusableRangeResponse()
         calls: list[tuple] = []
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             calls.append((range_from, validator))
             return (unusable_response if len(calls) == 1 else FreshFullResponse()), [url]
 
@@ -820,7 +820,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         unparseable_response = UnparseableRangeResponse()
         calls: list[tuple] = []
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             calls.append((range_from, validator))
             return (unparseable_response if len(calls) == 1 else FreshFullResponse()), [url]
 
@@ -856,7 +856,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
 
         calls: list[tuple] = []
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             calls.append((url, range_from, validator))
             return PartialResponse(), [url]
 
@@ -938,7 +938,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
             def close(self) -> None:
                 pass
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             control.pause_event.set() # 请求在飞时用户点了暂停，响应此刻还没返回
             return FailingResponse(), [url]
 
@@ -965,7 +965,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
             def close(self) -> None:
                 pass
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             control.cancel_event.set() # 请求在飞时用户点了取消，响应此刻还没返回
             return FailingResponse(), [url]
 
@@ -1002,7 +1002,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         server_content = os.urandom(2000)
         bookmarked_content = os.urandom(1600) # 模拟 pypdf 重写之后完全不同的字节与长度
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             return FakeRangeResponse(200, {"Content-Length": str(len(server_content)), "ETag": '"server-etag"'}, body=server_content), [url]
 
         def fake_add_bookmarks(pdf_path: str, chapters: list[dict]) -> None:
@@ -1018,6 +1018,36 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertIsNotNone(state["failed_reason"]) # 必须报告为失败，而不是悄悄假装暂停
         self.assertFalse(Path(f"{save_path}.tmp").exists()) # 不可信的书签重写版 .tmp 必须被清理掉
         self.assertFalse(Path(save_path).exists())
+
+    def test_cancel_during_finalization_still_delivers_the_finished_file(self) -> None:
+        # 与上一条互补：这里“加书签 + 改名”两步都顺利跑完。走到这一刻传输已经确认完整、
+        # 书签也已经写成功，这是一份完好的成果——用户恰好在最后这两秒点了取消，不该把它删掉，
+        # 那是在丢弃一份已经做完的工作。取消只回收尚未完整的半成品：文件照常改名交付，
+        # finished 置为 True，且不写 failed_reason（取消不是失败）。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = None
+        control = panel.BatchControl()
+        state["control"] = control
+
+        server_content = os.urandom(2000)
+        bookmarked_content = server_content + b"%bookmarked%"
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
+            return FakeRangeResponse(200, {"Content-Length": str(len(server_content)), "ETag": '"server-etag"'}, body=server_content), [url]
+
+        def fake_add_bookmarks(pdf_path: str, chapters: list[dict]) -> None:
+            control.cancel_event.set() # 加书签这几秒里，用户点了取消
+            Path(pdf_path).write_bytes(bookmarked_content)
+
+        with patch.object(panel, "request_download", fake_request_download), \
+             patch.object(panel, "add_bookmarks", fake_add_bookmarks):
+            panel.download_file(self.url, save_path, [{"title": "第一章", "page_index": 1}], state)
+
+        self.assertEqual(Path(save_path).read_bytes(), bookmarked_content) # 已经完整的成果照常交付
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
+        self.assertTrue(state["finished"])
+        self.assertIsNone(state["failed_reason"]) # 取消不是失败
 
     def test_finalizing_must_be_set_before_calling_add_bookmarks_not_after(self) -> None:
         # 与“加书签成功、os.replace 失败”那条互补：那条的异常发生在 add_bookmarks 返回
@@ -1037,7 +1067,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         server_content = os.urandom(2000)
         bookmarked_content = os.urandom(1600) # 模拟 pypdf 已经重写了一部分 .tmp 之后才失败
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             return FakeRangeResponse(200, {"Content-Length": str(len(server_content)), "ETag": '"server-etag"'}, body=server_content), [url]
 
         def fake_add_bookmarks(pdf_path: str, chapters: list[dict]) -> None:
@@ -1069,7 +1099,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
 
         server_content = os.urandom(2000)
 
-        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
             return FakeRangeResponse(200, {"Content-Length": str(len(server_content)), "ETag": '"server-etag"'}, body=server_content), [url]
 
         def failing_replace(src: str, dst: str) -> None:
@@ -1380,6 +1410,226 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
     def test_close_active_responses_does_nothing_when_empty(self) -> None:
         control = panel.BatchControl()
         panel.close_active_responses(control) # 不应该抛出
+
+
+class WaitOrStopTest(unittest.TestCase):
+    """可被唤醒的等待：判据完全由 cancel_event/pause_event 派生，不依赖第三个需要同步维护的标志。"""
+
+    def test_returns_false_after_waiting_out_the_full_timeout(self) -> None:
+        control = panel.BatchControl()
+        started_at = time.monotonic()
+
+        self.assertFalse(control.wait_or_stop(0.2))
+
+        self.assertGreaterEqual(time.monotonic() - started_at, 0.2) # 没人叫停就得老老实实等满
+
+    def test_returns_immediately_when_stop_was_already_requested(self) -> None:
+        for event_name in ("cancel_event", "pause_event"):
+            with self.subTest(event=event_name):
+                control = panel.BatchControl()
+                getattr(control, event_name).set()
+                started_at = time.monotonic()
+
+                self.assertTrue(control.wait_or_stop(5))
+
+                self.assertLess(time.monotonic() - started_at, 1)
+
+    def test_wakes_up_while_waiting(self) -> None:
+        for event_name in ("cancel_event", "pause_event"): # 暂停和取消都要能叫醒，不能只认取消
+            with self.subTest(event=event_name):
+                control = panel.BatchControl()
+                timer = threading.Timer(0.1, getattr(control, event_name).set)
+                timer.start()
+                self.addCleanup(timer.cancel)
+                started_at = time.monotonic()
+
+                self.assertTrue(control.wait_or_stop(5))
+
+                self.assertLess(time.monotonic() - started_at, 2)
+
+    def test_stop_requested_reads_both_events(self) -> None:
+        control = panel.BatchControl()
+        self.assertFalse(control.stop_requested())
+        control.pause_event.set()
+        self.assertTrue(control.stop_requested())
+        control.pause_event.clear()
+        control.cancel_event.set()
+        self.assertTrue(control.stop_requested())
+
+
+class StopBeforeResponseHeadersTest(unittest.TestCase):
+    """响应头到达之前的那段等待——镜像轮换与 400 退避——同样要能被取消/暂停打断。
+
+    没有这些检查点时，一次停止最坏要等“镜像数 × 每个镜像的退避次数”条请求全部走完；
+    有了之后上界只剩当前这一条在飞的请求，停止之后不会再打出任何一条新请求。
+    """
+
+    PARTIAL = b"HEAD" * 25 # 上一轮暂停留下的半截内容
+    REST = b"TAIL" * 25
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.tmp_dir = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        for name in ("progress_label", "download_progress_bar"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        self.context.enter_context(patch.object(panel, "request_headers", lambda url: {}))
+        self.context.enter_context(patch.object(panel, "_MIN_REQUEST_INTERVAL", 0)) # 别把限流间隔混进被测的等待
+        # 退避设得远长于下面的 join 超时：等待真能被唤醒时工作线程立刻退出，测试根本不会睡满这几秒；
+        # 唤醒机制一旦失效，表现是 join 超时，而不是让测试真的等上十几秒。
+        self.context.enter_context(patch.object(panel, "_400_RETRY_DELAYS", (5.0, 5.0)))
+        self.url = "https://r1-ndr-private.ykt.cbern.com.cn/book.pdf" # 私有 CDN 才有 r1/r2/r3 三个镜像
+        self.save_path = str(Path(self.tmp_dir) / "book.pdf")
+        self.temp_path = f"{self.save_path}.tmp"
+
+    def state_with_a_paused_leftover(self) -> tuple[dict, panel.BatchControl]:
+        """造一个“上一轮暂停留下半截 .tmp”的任务：这半截和它的校验子是续传的全部依据。"""
+        with open(self.temp_path, "wb") as file:
+            file.write(self.PARTIAL)
+        state = panel.create_download_state(self.url, self.save_path)
+        state["validator"] = '"etag-v1"'
+        control = panel.BatchControl()
+        state["control"] = control
+        panel.download_states.append(state)
+        return state, control
+
+    def run_until_stopped(self, state: dict, fake_get, stop) -> list[str]:
+        """在工作线程里跑 download_file，等第一条请求确实发出之后再发停止请求。"""
+        first_request = threading.Event()
+        requested_urls: list[str] = []
+
+        def recording_get(url: str, **kwargs) -> object:
+            requested_urls.append(url)
+            first_request.set()
+            return fake_get(url, **kwargs)
+
+        with patch.object(panel, "session", Mock(get=recording_get)):
+            worker = threading.Thread(target=panel.download_file, args=(self.url, self.save_path, None, state), daemon=True)
+            worker.start()
+            self.assertTrue(first_request.wait(timeout=5), "第一条请求都没发出，测试前置条件不成立")
+            time.sleep(0.1) # 让工作线程真的进到那段等待里，而不是停在等待之前
+            stop()
+            worker.join(timeout=2) # 远小于被测的 5 秒退避：没停下就说明那段等待打不断
+
+        self.assertFalse(worker.is_alive(), "停止请求没能打断响应头到达之前的那段等待")
+        return requested_urls
+
+    def assert_resumes_to_completion(self, state: dict, control: panel.BatchControl) -> None:
+        """暂停留下的半截确实能被“继续”接着下完，而不只是名义上 finished == False。"""
+        control.pause_event.clear()
+        full_content = self.PARTIAL + self.REST
+        resumed = SlicedResponse(full_content, start=len(self.PARTIAL))
+
+        with patch.object(panel, "request_download", return_value=(resumed, [self.url])):
+            panel.download_file(self.url, self.save_path, None, state)
+
+        self.assertTrue(state["finished"])
+        self.assertIsNone(state["failed_reason"])
+        self.assertEqual(Path(self.save_path).read_bytes(), full_content)
+
+    def test_cancel_during_400_backoff_stops_before_the_next_request(self) -> None:
+        state, control = self.state_with_a_paused_leftover()
+
+        requested_urls = self.run_until_stopped(
+            state,
+            lambda url, **kwargs: FakeRangeResponse(400), # 私有 CDN 限流：同地址退避重试
+            control.cancel_event.set,
+        )
+
+        self.assertEqual(requested_urls, [self.url]) # 取消之后不再打出任何一条请求
+        self.assertIsNone(state["failed_reason"]) # 取消不是下载失败
+        self.assertTrue(state["finished"])
+        self.assertFalse(Path(self.temp_path).exists()) # 取消回收尚未完整的半成品
+
+    def test_pause_during_400_backoff_keeps_the_partial_file_resumable(self) -> None:
+        state, control = self.state_with_a_paused_leftover()
+
+        requested_urls = self.run_until_stopped(
+            state,
+            lambda url, **kwargs: FakeRangeResponse(400),
+            control.pause_event.set,
+        )
+
+        self.assertEqual(requested_urls, [self.url])
+        self.assertIsNone(state["failed_reason"])
+        self.assertFalse(state["finished"]) # 暂停：留给“继续”重新提交
+        self.assertEqual(Path(self.temp_path).read_bytes(), self.PARTIAL) # 半截原样保留
+        self.assertEqual(state["validator"], '"etag-v1"') # 校验子没被这一轮动过，仍与磁盘同源
+        self.assert_resumes_to_completion(state, control)
+
+    def make_held_mirror_request(self, release: threading.Event):
+        """把第一个镜像的请求卡住，让停止请求确定落在“换下一个镜像之前”那个检查点上。"""
+        def fake_get(url: str, **kwargs) -> object:
+            self.assertTrue(release.wait(timeout=5), "第一个镜像的请求一直没被放行")
+            return FakeRangeResponse(500) # 500 会换下一个镜像，不走 400 的同地址退避
+        return fake_get
+
+    def test_cancel_between_mirrors_stops_before_trying_the_next_mirror(self) -> None:
+        state, control = self.state_with_a_paused_leftover()
+        release = threading.Event()
+
+        def stop() -> None:
+            control.cancel_event.set()
+            release.set() # 放行第一个镜像，让它带着“已经要停了”回到轮换处
+
+        requested_urls = self.run_until_stopped(state, self.make_held_mirror_request(release), stop)
+
+        self.assertEqual(requested_urls, [self.url]) # r2/r3 一个都不该再打
+        self.assertIsNone(state["failed_reason"])
+        self.assertTrue(state["finished"])
+        self.assertFalse(Path(self.temp_path).exists())
+
+    def test_pause_between_mirrors_keeps_the_partial_file_resumable(self) -> None:
+        state, control = self.state_with_a_paused_leftover()
+        release = threading.Event()
+
+        def stop() -> None:
+            control.pause_event.set()
+            release.set()
+
+        requested_urls = self.run_until_stopped(state, self.make_held_mirror_request(release), stop)
+
+        self.assertEqual(requested_urls, [self.url])
+        self.assertIsNone(state["failed_reason"])
+        self.assertFalse(state["finished"])
+        self.assertEqual(Path(self.temp_path).read_bytes(), self.PARTIAL)
+        self.assertEqual(state["validator"], '"etag-v1"')
+        self.assert_resumes_to_completion(state, control)
+
+    def test_request_download_without_a_control_still_retries_and_rotates(self) -> None:
+        # 不传 control 时行为与新增检查点之前逐字一致：400 在同地址退避重试满，500 继续换镜像。
+        self.context.enter_context(patch.object(panel, "_400_RETRY_DELAYS", (0, 0)))
+        backoff_session = FakeHeaderRecordingSession([FakeRangeResponse(400)])
+        with patch.object(panel, "session", backoff_session):
+            response, attempted_urls = panel.request_download(self.url)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(attempted_urls, [self.url]) # 400 不换镜像
+        self.assertEqual(len(backoff_session.requested_urls), 3) # 首次 + 2 次退避重试
+
+        rotation_session = FakeHeaderRecordingSession([FakeRangeResponse(500)])
+        with patch.object(panel, "session", rotation_session):
+            _response, rotated_urls = panel.request_download(self.url)
+        self.assertEqual(len(rotated_urls), 3) # 500 依次走满 r1/r2/r3
+
+    def test_request_download_closes_the_useless_response_when_it_stops(self) -> None:
+        # 命中停止时手上那个已经用不上的响应必须关掉，不能留着不管。
+        control = panel.BatchControl()
+        unusable = FakeRangeResponse(500)
+
+        def fake_get(url: str, **kwargs) -> object:
+            control.cancel_event.set() # 第一个镜像的请求在飞时用户点了取消
+            return unusable
+
+        self.context.enter_context(patch.object(panel, "session", Mock(get=fake_get)))
+
+        with self.assertRaises(panel.BatchStopped):
+            panel.request_download(self.url, control=control)
+
+        self.assertTrue(unusable.closed)
 
 
 class BatchOutcomeTest(unittest.TestCase):
