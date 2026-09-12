@@ -272,6 +272,8 @@ def refresh_download_progress() -> None: # 汇总全部任务状态刷新进度�
         progress_text = f"已下载 {format_bytes(all_downloaded_size)}，已完成 {finished_number}/{total_number} 个文件"
     if failed_number:
         progress_text += f"，{failed_number} 个失败"
+    if _batch_control is not None and _batch_control.paused_settled: # 已暂停：文案要能和正在下载区分开，不能看起来像卡住了
+        progress_text = f"已暂停 {progress_text}"
     ui_call(progress_label.config, text=progress_text) # 更新标签以显示当前下载进度
 
 def collect_parsed_resources(
