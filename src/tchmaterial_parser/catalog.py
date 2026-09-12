@@ -1,7 +1,54 @@
 # -*- coding: utf-8 -*-
 # 获取平台上的资源目录树，并提供按分类路径筛选与计数的辅助函数
 
+import gzip, json, os
+
+from .config import catalog_cache_path
 from .network import session
+from .platform_utils import print_error
+
+BOOK_VERSION_URL = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json"
+CACHE_FORMAT = 1 # 缓存文件的结构版本，结构变动后旧缓存自然失效
+
+def fetch_book_version() -> tuple[str, list[str]]: # 获取电子课本目录的版本标识与各分片地址（该文件很小，可先取它判断缓存是否仍然可用）
+    version_data: dict = session.get(BOOK_VERSION_URL).json()
+    urls: str = version_data["urls"]
+    return f"{version_data['module_version']}:{urls}", urls.split(",")
+
+def load_cached_resource_list(version: str) -> dict | None: # 读取本地缓存的资源目录；缓存缺失、损坏或版本不符时返回 None，由调用方重新抓取
+    cache_file = catalog_cache_path()
+    if not cache_file or not cache_file.exists():
+        return None
+
+    try:
+        with gzip.open(cache_file, "rt", encoding="utf-8") as f:
+            cached = json.load(f)
+        if not isinstance(cached, dict) or cached.get("cache_format") != CACHE_FORMAT or cached.get("version") != version:
+            return None
+        resource_list = cached.get("resource_list")
+        return resource_list if isinstance(resource_list, dict) else None
+    except Exception as e: # 缓存文件损坏或无法读取，重新抓取即可
+        print_error(e)
+        return None
+
+def save_cached_resource_list(version: str, resource_list: dict) -> None: # 把资源目录写入本地缓存（数据较大，使用 gzip 压缩存放）
+    cache_file = catalog_cache_path()
+    if not cache_file:
+        return
+
+    # 先写入临时文件再替换，避免写入中断时留下半截缓存；文件名带进程 ID，以免多个实例同时写入时互相覆盖
+    temp_file = cache_file.with_name(f"{cache_file.name}.{os.getpid()}.tmp")
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(temp_file, "wt", encoding="utf-8") as f:
+            json.dump({ "cache_format": CACHE_FORMAT, "version": version, "resource_list": resource_list }, f, ensure_ascii=False)
+        os.replace(temp_file, cache_file)
+    except Exception as e:
+        print_error(e)
+        try:
+            temp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 class ResourceHelper: # 获取网站上资源的数据
     def parse_hierarchy(self, hierarchy: list) -> dict: # 解析层级数据
@@ -14,20 +61,18 @@ class ResourceHelper: # 获取网站上资源的数据
                 parsed[ch["tag_id"]] = { "display_name": ch["tag_name"], "children": self.parse_hierarchy(ch["hierarchies"]) }
         return parsed
 
-    def fetch_book_list(self) -> dict: # 获取课本列表
+    def fetch_book_list(self, list_data: list[str]) -> dict: # 获取课本列表（list_data 为 fetch_book_version() 取得的分片地址）
         # 获取电子课本层级数据
         tags_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/tch_material_tag.json")
         tags_data: dict = tags_resp.json()
         parsed_hier = self.parse_hierarchy(tags_data["hierarchies"])
 
-        # 获取电子课本 URL 列表
-        list_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json")
-        list_data: list[str] = list_resp.json()["urls"].split(",")
-
         # 获取电子课本列表
         for url in list_data:
             book_resp = session.get(url)
             book_data: list[dict] = book_resp.json()
+            if not isinstance(book_data, list) or not book_data: # 分片内容异常时整体失败，避免把残缺的目录写进缓存后长期复用
+                raise ValueError(f"电子课本分片返回了异常内容：{url}")
             for book in book_data:
                 if book.get("tag_paths"): # 某些非课本资料的 tag_paths 属性为空数组
                     # 解析课本层级数据
@@ -120,11 +165,19 @@ class ResourceHelper: # 获取网站上资源的数据
 
         return parsed_hier
 
-    def fetch_resource_list(self) -> dict: # 获取资源列表
-        book_hier = self.fetch_book_list()
+    def fetch_resource_list(self) -> dict: # 获取资源列表：目录版本未变时直接使用本地缓存，避免每次启动都重新下载全部分片
+        version, list_data = fetch_book_version()
+        cached_list = load_cached_resource_list(version)
+        if cached_list is not None:
+            return cached_list
+
+        book_hier = self.fetch_book_list(list_data)
+        # 下面两类资源若要启用，其版本标识也应计入 version，否则它们更新后不会刷新缓存
         # national_lesson_hier = self.fetch_national_lesson_list()
         # prepare_lesson_hier = self.fetch_prepare_lesson_list()
-        return { **book_hier }
+        resource_list = { **book_hier }
+        save_cached_resource_list(version, resource_list)
+        return resource_list
 
 def filter_resource_items(items: dict[str, dict], query: str) -> dict[str, dict]: # 按完整分类路径筛选资源树
     keywords = query.casefold().split()

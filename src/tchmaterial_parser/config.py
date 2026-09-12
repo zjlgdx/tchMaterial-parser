@@ -38,6 +38,10 @@ def config_file_path() -> Path | None: # 获取配置文件路径
     elif os_name == "Darwin": # 在 macOS 上，配置存放于 ~/Library/Application Support/tchMaterial-parser/data.json
         return Path.home() / "Library" / "Application Support" / "tchMaterial-parser" / "data.json"
 
+def catalog_cache_path() -> Path | None: # 获取资源目录缓存的文件路径，与配置文件放在同一目录下
+    config_path = config_file_path()
+    return config_path.with_name("catalog-cache.json.gz") if config_path else None
+
 def config_location() -> str: # 获取配置存放位置的描述文本，用于提示用户
     if os_name == "Windows":
         return f"已写入注册表：HKEY_CURRENT_USER\\{REGISTRY_PATH}"
