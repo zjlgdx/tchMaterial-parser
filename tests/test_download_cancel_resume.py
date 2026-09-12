@@ -530,6 +530,52 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertEqual(Path(save_path).read_bytes(), new_version) # 逐字节等于新版本，不是新旧拼接
         self.assertFalse(Path(temp_path).exists())
 
+    def test_full_body_without_a_validator_header_clears_the_stale_one_instead_of_keeping_it(self) -> None:
+        # P0-C：plan_download_write 对“206 续传（保留原校验子）”和“200 完整正文但服务端
+        # 没给 ETag/Last-Modified（应当清空）”都返回 validator=None，写回时若用
+        # `if planned_validator is not None:` 去判断该不该写，会把后一种也当成“不用管”而
+        # 跳过——磁盘上已经换成了新正文，内存里的校验子却还是旧版本，下一轮“继续”会带着
+        # 这份对不上的旧校验子发起 Range 请求，一旦有镜像仍持有旧版本就会把新旧内容拼接。
+        # 正确做法是：能不能续传（ab）决定要不要保留旧校验子；一旦确定是 wb（全新正文），
+        # 不论这次响应有没有给校验子，都要用这次的结果无条件覆盖 current_state["validator"]，
+        # 该清空就清空成 None。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        temp_path = f"{save_path}.tmp"
+        old_version = os.urandom(5000)
+        offset = 500
+        with open(temp_path, "wb") as file:
+            file.write(old_version[:offset])
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = '"old-etag"'
+        state["downloaded_size"] = offset
+        control = panel.BatchControl()
+        state["control"] = control
+
+        new_version = os.urandom(5000)
+        calls: list[tuple] = []
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            calls.append((range_from, validator))
+            # 服务端这次回的是完整正文（200），但没有给 ETag/Last-Modified 中的任何一个
+            return FakeRangeResponse(200, {"Content-Length": str(len(new_version))}, body=new_version), [url]
+
+        with patch.object(panel, "request_download", fake_request_download):
+            panel.download_file(self.url, save_path, None, state)
+
+        self.assertIsNone(state["failed_reason"])
+        self.assertTrue(state["finished"])
+        self.assertIsNone(state["validator"]) # 没有校验子的完整正文必须清空旧校验子，不能沿用
+        self.assertEqual(Path(save_path).read_bytes(), new_version)
+        self.assertFalse(Path(temp_path).exists())
+
+        # 校验子已被清空：下一轮理应发起不带 Range/If-Range 的全新请求，不能再拿旧校验子去续传
+        state["finished"] = False
+        with open(f"{save_path}.tmp", "wb") as file: # 模拟又下到一半后再次暂停留下的 .tmp（内容不重要）
+            file.write(os.urandom(100))
+        with patch.object(panel, "request_download", fake_request_download):
+            panel.download_file(self.url, save_path, None, state)
+        self.assertEqual(calls[1], (None, None))
+
     def test_resume_fallback_to_full_restart_resets_downloaded_size_and_keeps_the_file(self) -> None:
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         temp_path = f"{save_path}.tmp"
