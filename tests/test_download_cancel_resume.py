@@ -142,6 +142,67 @@ class MultiFileCountPromptTest(unittest.TestCase):
         self.notice.assert_not_called()
 
 
+class BatchControlTest(unittest.TestCase):
+    """新批次的控制状态默认全部处于空闲/未请求，且 paused_settled 只是一个普通布尔值。"""
+
+    def test_fresh_control_starts_idle(self) -> None:
+        control = panel.BatchControl()
+
+        self.assertFalse(control.cancel_event.is_set())
+        self.assertFalse(control.pause_event.is_set())
+        self.assertFalse(control.paused_settled)
+        self.assertIsNone(control.directory)
+        self.assertEqual(control.active_responses, {})
+
+    def test_module_starts_without_an_active_batch(self) -> None:
+        self.assertIsNone(panel._batch_control)
+
+
+class CreateDownloadStateChaptersTest(unittest.TestCase):
+    """chapters 挪进状态字典，续传/继续时只靠 download_states 就能重新提交任务。"""
+
+    def test_chapters_travel_with_the_state_dict(self) -> None:
+        chapters = [{"id": "chapter-1"}]
+        state = panel.create_download_state("https://example.com/book.pdf", "book.pdf", chapters)
+        self.assertIs(state["chapters"], chapters)
+
+    def test_defaults_to_no_chapters(self) -> None:
+        state = panel.create_download_state("https://example.com/book.pdf", "book.pdf")
+        self.assertIsNone(state["chapters"])
+
+
+class ChaptersTravelThroughBatchSubmissionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.directory = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        self.context.enter_context(patch.object(panel, "thread_it", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        for name in ("progress_label", "download_progress_bar", "download_btn"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
+        self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
+
+    def test_batch_submits_download_file_with_the_chapters_stored_on_the_state(self) -> None:
+        chapters = [{"id": "c1"}]
+        resource = ResourceInfo("教材", "https://example.com/book.pdf", "pdf", chapters)
+        save_path = str(Path(self.directory) / "book.pdf")
+        received: list[object] = []
+
+        def fake_download_file(url: str, path: str, chapters_arg: object, state: dict) -> None:
+            received.append(chapters_arg)
+            state["finished"] = True
+
+        with patch.object(panel, "download_file", fake_download_file):
+            panel.start_download_batch([(resource, save_path)], self.directory)
+
+        self.assertEqual(received, [chapters])
+        self.assertIs(panel.download_states[0]["chapters"], chapters)
+
+
 class PlanDownloadWriteTest(unittest.TestCase):
     """坑 1/2/4/6/7/8/9：追加/截断、downloaded_size、total_size、校验子刷新是同一个决定的输出。"""
 

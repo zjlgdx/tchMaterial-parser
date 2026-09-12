@@ -21,6 +21,24 @@ from ..network import REQUEST_TIMEOUT, request_headers, session
 from ..platform_utils import print_error
 
 download_states: list[dict] = [] # 初始化下载状态
+
+class BatchControl:
+    """一个批次（从点下“下载”到批次终结的整段生命周期）的取消/暂停控制状态。
+
+    “已请求暂停”（pause_event）与“批次已经停稳为暂停态”（paused_settled）是两个不同的时刻，
+    中间有一段窗口批次线程仍然存活；paused_settled 只由 handle_batch_outcome 在主线程判定
+    结局为“暂停”时置位，也只由 cancel_current_batch 在主线程读取，不允许工作线程读写。
+    """
+
+    def __init__(self) -> None:
+        self.cancel_event = threading.Event() # 已请求取消
+        self.pause_event = threading.Event() # 已请求暂停
+        self.paused_settled = False # 批次真正停稳为“暂停”后才置位；只在主线程读写
+        self.directory: str | None = None # 解析阶段尚未选定目录；选定后再写入
+        self.lock = threading.Lock() # 只保护 active_responses
+        self.active_responses: dict[int, object] = {} # id(state) -> Response，用于主动断连
+
+_batch_control: BatchControl | None = None # 当前批次；空闲时为 None
 PRIVATE_DOWNLOAD_HOSTS = tuple(f"r{index}-ndr-private.ykt.cbern.com.cn" for index in range(1, 4))
 # 私有 CDN 在短时间连打时会回 400（有时带 InvalidArgument，有时几乎空包）。
 # 立刻换 r2/r3 只会把限流打得更死；同地址稍等再签一次即可。
@@ -389,12 +407,13 @@ def download() -> None: # 下载资源文件
 
     parse_urls_in_background(list(urls), bookmark_var.get(), start_downloads)
 
-def create_download_state(url: str, save_path: str) -> dict:
+def create_download_state(url: str, save_path: str, chapters: list[dict] | None = None) -> dict:
     return {
         "download_url": url, "save_path": save_path,
         "downloaded_size": 0, "total_size": 0,
         "finished": False, "failed_reason": None,
         "validator": None, # 续传校验子：ETag 优先，否则 Last-Modified；都没有则为 None，此时不尝试续传
+        "chapters": chapters, # 续传/暂停后“继续”要重新提交任务，跟着状态字典走，不必另外保留 targets
     }
 
 def parse_content_range(header_value: str | None) -> tuple[int, int, int] | None:
@@ -444,15 +463,15 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
 def start_download_batch(targets: list[tuple[ResourceInfo, str]], directory: str) -> None:
     global download_states
     # 所有排队任务先登记，快速失败或完成的线程也不会漏算尚未启动的任务。
-    states = [create_download_state(resource.url, save_path) for resource, save_path in targets]
+    states = [create_download_state(resource.url, save_path, resource.chapters) for resource, save_path in targets]
     download_states = states
 
     def worker() -> None:
         # 批量勾选可能产生数千个文件，仅保留少量工作线程，其余任务排队。
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = [
-                executor.submit(download_file, resource.url, save_path, resource.chapters, state)
-                for (resource, save_path), state in zip(targets, states)
+                executor.submit(download_file, state["download_url"], state["save_path"], state["chapters"], state)
+                for state in states
             ]
             for future in futures:
                 future.result()
