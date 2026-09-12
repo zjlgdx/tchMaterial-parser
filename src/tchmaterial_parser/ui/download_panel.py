@@ -494,16 +494,48 @@ def finish_download_batch(states: list[dict], directory: str) -> None: # 在主�
     else:
         messagebox.showinfo("下载完成", f"文件已下载到：{directory}")
 
+def close_active_responses(control: BatchControl) -> None:
+    """主动断连该批次所有登记在案的响应，促使阻塞在读取上的线程尽快停下，而不是等它们撞上读超时。"""
+    with control.lock:
+        responses = list(control.active_responses.values())
+    for response in responses:
+        try:
+            response.close()
+        except Exception:
+            pass
+
 def download_file(url: str, save_path: str, chapters: list[dict] | None = None, current_state: dict | None = None) -> None: # 下载文件
     if current_state is None: # 保留单独下载文件的调用方式
         current_state = create_download_state(url, save_path)
         download_states.append(current_state)
+    control: BatchControl | None = current_state.get("control") # 单独调用时没有这个键，等价于没有取消/暂停能力
     temp_path = f"{save_path}.tmp"
 
+    def stop_reason() -> str | None: # 取消优先于暂停；按事件标志分类，不按触发它的异常类型分类
+        if control is not None and control.cancel_event.is_set():
+            return "cancelled"
+        if control is not None and control.pause_event.is_set():
+            return "paused"
+        return None
+
     response = None
+    registered_key = None
+    paused = False # 暂停时 finished 保持 False，留给“继续”重新提交；其余情况都会在 finally 里置为 True
     try:
         with _download_slots:
+            reason = stop_reason()
+            if reason == "cancelled": # 排队中被取消：不发起网络请求，不产生 .tmp
+                current_state["finished"] = True
+                return
+            if reason == "paused": # 排队中被暂停：不发起网络请求，留给“继续”重新提交
+                paused = True
+                return
+
             open_mode, response, attempted_urls = plan_download_write(current_state, temp_path, url)
+            if control is not None: # 登记这次响应，供主线程暂停/取消时主动断连
+                registered_key = id(current_state)
+                with control.lock:
+                    control.active_responses[registered_key] = response
 
             if not response.ok: # 服务器返回表示错误的 HTTP 状态码
                 current_state["failed_reason"] = download_failure_reason(response, attempted_urls)
@@ -517,8 +549,19 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                             file.write(chunk)
                             current_state["downloaded_size"] += len(chunk)
                             refresh_download_progress()
+                        reason = stop_reason()
+                        if reason: # 每写完一块检查一次，命中就停止读取，不再等下一块
+                            break
 
-                if current_state["total_size"] > 0 and current_state["downloaded_size"] != current_state["total_size"]: # 文件下载不完整
+                if reason == "cancelled": # 在飞中被取消：中止写入，删除 .tmp，不算失败
+                    current_state["downloaded_size"], current_state["total_size"] = 0, 0
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+                elif reason == "paused": # 在飞中被暂停：保留已写的 .tmp，不清零已下载量
+                    paused = True
+                elif current_state["total_size"] > 0 and current_state["downloaded_size"] != current_state["total_size"]: # 文件下载不完整
                     current_state["failed_reason"] = f"文件下载不完整，需下载 {current_state['total_size']} 字节，实际下载 {current_state['downloaded_size']} 字节"
                     current_state["downloaded_size"], current_state["total_size"] = 0, 0
                     try:
@@ -533,17 +576,32 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                     os.replace(temp_path, save_path) # 重命名临时文件为目标文件
 
     except Exception as e:
-        print_error(e)
-        current_state["downloaded_size"], current_state["total_size"] = 0, 0
-        current_state["failed_reason"] = redact_access_token(traceback.format_exc().rstrip())
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
+        # 主动断连会让 iter_content/文件写入抛出异常，具体异常类型不保证一致，按事件标志分类更稳定
+        reason = stop_reason()
+        if reason == "cancelled":
+            current_state["downloaded_size"], current_state["total_size"] = 0, 0
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        elif reason == "paused":
+            paused = True
+        else:
+            print_error(e)
+            current_state["downloaded_size"], current_state["total_size"] = 0, 0
+            current_state["failed_reason"] = redact_access_token(traceback.format_exc().rstrip())
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
     finally:
+        if registered_key is not None: # 登记过就一定要注销，避免别的任务的主动断连误关到这次已经用不上的响应
+            with control.lock:
+                control.active_responses.pop(registered_key, None)
         if response is not None:
             response.close()
-        current_state["finished"] = True
+        if not paused:
+            current_state["finished"] = True
 
     refresh_download_progress() # 每个任务结束时刷新一次，重试等待期间也能看到完成数与失败数
 

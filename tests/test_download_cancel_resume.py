@@ -3,10 +3,33 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 import os
 import tempfile
+import threading
+import time
 import unittest
 
 from src.tchmaterial_parser.api import ResourceInfo
 from src.tchmaterial_parser.ui import download_panel as panel
+
+
+class BlockingChunkResponse:
+    """模拟一个卡住的连接：第一块正常返回，第二块必须等 close() 被调用才会“断开”。"""
+
+    def __init__(self) -> None:
+        self.ok = True
+        self.status_code = 200
+        self.headers = {"Content-Length": "10"}
+        self.close_event = threading.Event()
+        self.closed = False
+
+    def iter_content(self, **kwargs) -> object:
+        yield b"12345"
+        if not self.close_event.wait(timeout=5): # 5 秒远小于 REQUEST_TIMEOUT 的 60 秒读超时
+            raise AssertionError("close() 一直没被调用，暂停退化成了挂起读线程")
+        raise ConnectionError("connection closed") # 模拟主动断连后 iter_content 抛出的异常
+
+    def close(self) -> None:
+        self.closed = True
+        self.close_event.set()
 
 
 class FakeRangeResponse:
@@ -410,6 +433,176 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertEqual(state["total_size"], 11)
         self.assertEqual(Path(save_path).read_bytes(), b"HELLO WORLD")
         self.assertFalse(Path(temp_path).exists())
+
+
+class CancelAndPauseInDownloadFileTest(unittest.TestCase):
+    """坑 5（暂停必须断连，不能挂起读线程）、坑 9（信号量不泄漏）、坑 10 前置的 active_responses 登记/注销。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.tmp_dir = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        for name in ("progress_label", "download_progress_bar"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        self.url = "https://example.com/book.pdf"
+
+    def acquire_slots_without_blocking(self, count: int = 3) -> None:
+        for _ in range(count):
+            self.assertTrue(panel._download_slots.acquire(timeout=0.5), "_download_slots 许可数没有恢复，泄漏了")
+        for _ in range(count):
+            panel._download_slots.release()
+
+    def wait_until_first_chunk_written(self, state: dict) -> None:
+        deadline = time.monotonic() + 2
+        while state["downloaded_size"] < 5 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(state["downloaded_size"], 5, "第一块都没写完，测试前置条件不成立")
+
+    def test_pause_disconnects_instead_of_blocking_the_reader(self) -> None:
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        response = BlockingChunkResponse()
+
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            worker = threading.Thread(target=panel.download_file, args=(self.url, save_path, None, state))
+            started_at = time.monotonic()
+            worker.start()
+            self.wait_until_first_chunk_written(state)
+
+            control.pause_event.set()
+            panel.close_active_responses(control)
+            worker.join(timeout=5)
+            elapsed = time.monotonic() - started_at
+
+        self.assertFalse(worker.is_alive(), "暂停没有让工作线程退出")
+        self.assertLess(elapsed, 10) # 远小于 REQUEST_TIMEOUT 的 60 秒读超时
+        self.assertTrue(response.closed)
+        self.assertFalse(state["finished"]) # 暂停：finished 保持 False，留给“继续”
+        self.assertEqual(Path(f"{save_path}.tmp").read_bytes(), b"12345") # 半截内容保留
+
+    def test_active_responses_registered_then_unregistered_on_the_disconnect_path(self) -> None:
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        response = BlockingChunkResponse()
+
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            worker = threading.Thread(target=panel.download_file, args=(self.url, save_path, None, state))
+            worker.start()
+            self.wait_until_first_chunk_written(state)
+
+            self.assertEqual(list(control.active_responses.values()), [response]) # 中途确实登记过
+
+            control.pause_event.set()
+            panel.close_active_responses(control)
+            worker.join(timeout=5)
+
+        self.assertEqual(control.active_responses, {}) # finally 里一定会注销，不会残留已关闭的响应
+
+    def test_active_responses_unregistered_when_write_raises(self) -> None:
+        # 用会记录 set/pop 的字典代替 active_responses，证明确实“先登记、后注销”了一次，
+        # 而不是碰巧全程没登记过、最终自然是空字典。
+        class RecordingDict(dict):
+            def __init__(self) -> None:
+                super().__init__()
+                self.events: list[tuple[str, int]] = []
+
+            def __setitem__(self, key: int, value: object) -> None:
+                self.events.append(("set", key))
+                super().__setitem__(key, value)
+
+            def pop(self, key: int, default: object = None) -> object:
+                self.events.append(("pop", key))
+                return super().pop(key, default)
+
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        control.active_responses = RecordingDict()
+        state["control"] = control
+
+        class RaisingResponse:
+            ok = True
+            status_code = 200
+            headers = {"Content-Length": "5"}
+
+            def iter_content(self, **kwargs) -> object:
+                raise OSError("模拟磁盘写入失败")
+
+            def close(self) -> None:
+                pass
+
+        with patch.object(panel, "request_download", return_value=(RaisingResponse(), [self.url])):
+            panel.download_file(self.url, save_path, None, state)
+
+        registered_key = id(state)
+        self.assertEqual(control.active_responses.events, [("set", registered_key), ("pop", registered_key)])
+        self.assertEqual(control.active_responses, {}) # 写入抛错也要注销，不能只在“正常路径”上配对
+        self.assertTrue(state["finished"])
+        self.assertIsNotNone(state["failed_reason"])
+
+    def test_cancelled_before_request_releases_the_slot_and_marks_finished(self) -> None:
+        state = panel.create_download_state(self.url, str(Path(self.tmp_dir) / "a.pdf"))
+        control = panel.BatchControl()
+        control.cancel_event.set()
+        state["control"] = control
+
+        panel.download_file(self.url, state["save_path"], None, state)
+
+        self.assertTrue(state["finished"])
+        self.assertFalse(Path(f"{state['save_path']}.tmp").exists())
+        self.acquire_slots_without_blocking()
+
+    def test_paused_before_request_releases_the_slot_and_leaves_unfinished(self) -> None:
+        state = panel.create_download_state(self.url, str(Path(self.tmp_dir) / "b.pdf"))
+        control = panel.BatchControl()
+        control.pause_event.set()
+        state["control"] = control
+
+        panel.download_file(self.url, state["save_path"], None, state)
+
+        self.assertFalse(state["finished"]) # 排队中就被暂停：这个任务本身还没跑，留给“继续”
+        self.acquire_slots_without_blocking()
+
+    def test_pause_and_cancel_do_not_leak_download_slots(self) -> None:
+        # 在飞中被暂停（走主动断连那条路径）之后，信号量的许可数必须完整恢复到 3
+        save_path = str(Path(self.tmp_dir) / "c.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        control = panel.BatchControl()
+        state["control"] = control
+        response = BlockingChunkResponse()
+
+        with patch.object(panel, "request_download", return_value=(response, [self.url])):
+            worker = threading.Thread(target=panel.download_file, args=(self.url, save_path, None, state))
+            worker.start()
+            self.wait_until_first_chunk_written(state)
+
+            control.pause_event.set()
+            panel.close_active_responses(control)
+            worker.join(timeout=5)
+
+        self.acquire_slots_without_blocking()
+
+    def test_close_active_responses_ignores_a_response_whose_close_raises(self) -> None:
+        control = panel.BatchControl()
+
+        class ExplodingResponse:
+            def close(self) -> None:
+                raise RuntimeError("已经断开的连接再关一次")
+
+        control.active_responses[1] = ExplodingResponse()
+        panel.close_active_responses(control) # 不应该向上抛出
+
+    def test_close_active_responses_does_nothing_when_empty(self) -> None:
+        control = panel.BatchControl()
+        panel.close_active_responses(control) # 不应该抛出
 
 
 if __name__ == "__main__":
