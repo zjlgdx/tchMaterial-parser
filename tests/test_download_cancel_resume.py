@@ -1,6 +1,6 @@
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 import inspect
 import os
 import re
@@ -174,6 +174,7 @@ class MultiFileCountPromptTest(unittest.TestCase):
         self.context = ExitStack()
         self.addCleanup(self.context.close)
         self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
         for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn", "url_text", "bookmark_var"):
             self.context.enter_context(patch.object(panel, name, Mock(), create=True))
         self.notice = self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
@@ -982,6 +983,153 @@ class BatchControlActionsTest(unittest.TestCase):
 
         mocked_worker.assert_not_called()
         self.assertIsNone(panel._batch_control) # 走了 handle_batch_outcome("completed", ...) 的收尾
+
+
+class DownloadEntryIdleResetTest(unittest.TestCase):
+    """download() 里“放弃这次下载”（不是取消）的五条路径，逐条验证真的回到空闲。
+
+    断言的是 set_ui_phase 被以什么参数调用过（行为），不是等它跑完再看某个控件的最终文案——
+    后者在“压根没触发复位”和“复位了但选错了阶段”两种情况下都可能凑巧对。
+    """
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        self.context.enter_context(patch.object(panel, "thread_it", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn", "url_text", "bookmark_var"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.warning = self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
+        self.notice = self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
+        previous_token = panel.config.access_token
+        self.addCleanup(setattr, panel.config, "access_token", previous_token)
+        panel.config.access_token = None
+        panel.bookmark_var.get.return_value = False
+
+    def test_token_with_non_ascii_characters_resets_to_idle(self) -> None:
+        panel.config.access_token = "无效token"
+        panel.url_text.get.return_value = "https://example.com/1"
+
+        with patch.object(panel, "set_ui_phase") as mocked_phase:
+            panel.download()
+
+        self.assertEqual(mocked_phase.call_args_list, [call("parsing"), call("idle")])
+        self.assertIsNone(panel._batch_control)
+
+    def test_empty_urls_resets_to_idle(self) -> None:
+        panel.url_text.get.return_value = "   \n  "
+
+        with patch.object(panel, "set_ui_phase") as mocked_phase:
+            panel.download()
+
+        self.assertEqual(mocked_phase.call_args_list, [call("parsing"), call("idle")])
+        self.assertIsNone(panel._batch_control)
+
+    def test_askdirectory_cancelled_resets_to_idle(self) -> None:
+        resource_by_url = {
+            f"https://example.com/{index}.pdf": ResourceInfo(f"教材{index}", f"https://example.com/{index}.pdf", "pdf", [])
+            for index in range(2)
+        }
+        panel.url_text.get.return_value = "\n".join(resource_by_url)
+
+        with patch.object(panel, "parse", side_effect=lambda url, bookmarks: [resource_by_url[url]]):
+            with patch.object(panel.filedialog, "askdirectory", return_value=""):
+                with patch.object(panel, "set_ui_phase") as mocked_phase:
+                    panel.download()
+
+        self.assertEqual(mocked_phase.call_args_list, [call("parsing"), call("idle")])
+        self.assertIsNone(panel._batch_control)
+
+    def test_asksaveasfilename_cancelled_resets_to_idle(self) -> None:
+        resource = ResourceInfo("教材", "https://example.com/only.pdf", "pdf", [])
+        panel.url_text.get.return_value = resource.url
+
+        with patch.object(panel, "parse", return_value=[resource]):
+            with patch.object(panel.filedialog, "asksaveasfilename", return_value=""):
+                with patch.object(panel, "set_ui_phase") as mocked_phase:
+                    panel.download()
+
+        self.assertEqual(mocked_phase.call_args_list, [call("parsing"), call("idle")])
+        self.assertIsNone(panel._batch_control)
+
+    def test_no_parseable_resources_resets_to_idle(self) -> None:
+        panel.url_text.get.return_value = "https://example.com/bad"
+
+        with patch.object(panel, "parse", return_value=None):
+            with patch.object(panel, "set_ui_phase") as mocked_phase:
+                panel.download()
+
+        self.assertEqual(mocked_phase.call_args_list, [call("parsing"), call("idle")])
+        self.assertIsNone(panel._batch_control)
+        self.warning.assert_called_once() # 解析失败清单仍然要提示
+
+
+class ParsePhaseCancellationTest(unittest.TestCase):
+    """“取消”要覆盖解析阶段：命中后不再解析下一条 URL，也不弹任何对话框。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        self.context.enter_context(patch.object(panel, "thread_it", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn", "url_text", "bookmark_var"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.warning = self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
+        self.notice = self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
+        previous_token = panel.config.access_token
+        self.addCleanup(setattr, panel.config, "access_token", previous_token)
+        panel.config.access_token = None
+        panel.bookmark_var.get.return_value = False
+
+    def test_cancel_during_parsing_stops_early_and_skips_all_dialogs(self) -> None:
+        urls = [f"https://example.com/{index}" for index in range(5)]
+        panel.url_text.get.return_value = "\n".join(urls)
+        parsed_calls: list[str] = []
+
+        def fake_parse(url: str, bookmarks: bool) -> list[ResourceInfo]:
+            parsed_calls.append(url)
+            if len(parsed_calls) == 2: # 模拟解析到第二条时用户点了取消
+                panel._batch_control.cancel_event.set()
+            return [ResourceInfo(url, url, "pdf", [])]
+
+        with patch.object(panel, "parse", fake_parse):
+            with patch.object(panel.filedialog, "askdirectory") as mocked_askdirectory:
+                with patch.object(panel, "set_ui_phase") as mocked_phase:
+                    panel.download()
+
+        self.assertLess(len(parsed_calls), len(urls)) # 没有解析完剩下的 URL
+        mocked_askdirectory.assert_not_called() # 取消命中后不再弹任何对话框
+        self.notice.assert_not_called()
+        self.assertEqual(mocked_phase.call_args_list, [call("parsing"), call("idle")])
+        self.assertIsNone(panel._batch_control)
+
+
+class ParseAndCopyDoesNotWireCancellationTest(unittest.TestCase):
+    """“解析并复制”是独立路径，不该被顺手接上取消——should_stop 必须保持 None。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        for name in ("copy_btn", "url_text"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+
+    def test_should_stop_is_none_for_the_copy_flow(self) -> None:
+        captured: dict[str, object] = {"called": False}
+
+        def fake_parse_urls_in_background(urls, bookmarks, on_finished, should_stop=None) -> None:
+            captured["called"] = True
+            captured["should_stop"] = should_stop
+
+        panel.url_text.get.return_value = "https://example.com/1"
+        with patch.object(panel, "parse_urls_in_background", fake_parse_urls_in_background):
+            panel.parse_and_copy()
+
+        self.assertTrue(captured["called"])
+        self.assertIsNone(captured["should_stop"])
 
 
 if __name__ == "__main__":

@@ -279,12 +279,19 @@ def collect_parsed_resources(
     urls: list[str],
     bookmarks: bool,
     on_progress: Callable[[int, int], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[list[ResourceInfo], set[str]]:
-    """逐条解析链接并汇总结果：按资源直链去重，解析失败的链接单独收集。"""
+    """逐条解析链接并汇总结果：按资源直链去重，解析失败的链接单独收集。
+
+    should_stop 在每条 URL 开始解析前检查一次，命中就提前结束，返回目前已收集到的结果；
+    不中断正在进行的单次解析请求，只避免开始下一条（对应“取消覆盖解析阶段”的要求）。
+    """
     resources_info_list: list[ResourceInfo] = []
     resource_urls: set[str] = set()
     failed_urls: set[str] = set()
     for index, url in enumerate(urls):
+        if should_stop and should_stop():
+            break
         if on_progress:
             on_progress(index + 1, len(urls))
         resources_info = parse_fn(url, bookmarks)
@@ -302,13 +309,14 @@ def parse_urls_in_background(
     urls: list[str],
     bookmarks: bool,
     on_finished: Callable[[list[ResourceInfo], set[str]], None],
+    should_stop: Callable[[], bool] | None = None,
 ) -> None:
     """在后台线程逐条解析链接，完成后回到主线程执行 on_finished(资源列表, 失败链接集合)。
 
     批量选择的链接可能多达上百条，逐条解析需多次网络请求，放在主线程会让界面未响应。
     """
     def worker() -> None:
-        resources_info_list, failed_urls = collect_parsed_resources(parse, urls, bookmarks, show_parse_progress)
+        resources_info_list, failed_urls = collect_parsed_resources(parse, urls, bookmarks, show_parse_progress, should_stop)
         ui_call(on_finished, resources_info_list, failed_urls)
 
     thread_it(worker)
@@ -349,32 +357,42 @@ def parse_and_copy() -> None: # 解析并复制链接
     parse_urls_in_background(list(urls), False, copy_urls)
 
 def download() -> None: # 下载资源文件
-    global download_states
-    download_btn.config(state="disabled") # 设置下载按钮为禁用状态
+    global download_states, _batch_control
+    control = BatchControl() # 覆盖从这里到批次终结的整段生命周期，解析阶段就能取消
+    _batch_control = control
+    set_ui_phase("parsing") # 解析阶段只有取消有意义，暂停无从谈起
     download_progress_bar.config(value=0) # 重置上一批任务可能残留的进度
     download_states = [] # 初始化下载状态
     urls = {line.strip() for line in url_text.get("1.0", "end").splitlines() if line.strip()} # 获取所有非空行并去重
 
     if config.access_token and not config.access_token.isascii(): # 判断 Access Token 中是否包含非 ASCII 字符
         messagebox.showwarning("警告", "Access Token 不正确（包含非 ASCII 字符），请点击“设置 Token”按钮重新填写。")
-        download_btn.config(state="normal") # 恢复下载按钮为启用状态
+        set_ui_phase("idle")
+        _batch_control = None
         return
 
     if not urls:
-        download_btn.config(state="normal") # 恢复下载按钮为启用状态
+        set_ui_phase("idle")
+        _batch_control = None
         return
 
     def start_downloads(resources_info_list: list[ResourceInfo], failed_urls: set[str]) -> None: # 解析完成后在主线程选择保存位置并开始下载
-        def restore_download_btn() -> None: # 未产生下载任务时恢复界面状态
+        def restore_idle_ui() -> None: # 放弃这次下载（不是取消）：恢复界面到空闲，控制对象也一并收回
+            global _batch_control
             if not downloads_active():
                 progress_label.config(text="等待下载")
-            download_btn.config(state="normal") # 设置下载按钮为启用状态
+            set_ui_phase("idle")
+            _batch_control = None
+
+        if control.cancel_event.is_set(): # 解析阶段被取消：不弹任何对话框，直接回到空闲
+            restore_idle_ui()
+            return
 
         if len(resources_info_list) > 1:
             messagebox.showinfo("提示", f"您将下载 {len(resources_info_list)} 个文件，请选择要下载文件的位置。本程序将在该文件夹中按教材分类创建子文件夹，并以资源名称命名文件。")
             dir_path = filedialog.askdirectory() # 选择文件夹
             if not dir_path: # 用户取消或关闭对话框
-                restore_download_btn()
+                restore_idle_ui()
                 return
             dir_path = os.path.normpath(dir_path)
             # 路径必须在任何线程启动前统一预留，否则同名资源仍可能同时打开同一个 .tmp 文件。
@@ -388,24 +406,24 @@ def download() -> None: # 下载资源文件
                     initialfile=sanitize_filename(resource.title or "download"),
                 )
                 if not save_path: # 用户取消了文件保存操作
-                    restore_download_btn()
+                    restore_idle_ui()
                     return
                 save_path = os.path.normpath(save_path)
                 download_targets.append((resource, save_path))
         else: # 没有可下载的资源
-            restore_download_btn()
+            restore_idle_ui()
             if failed_urls:
                 messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + "\n".join(failed_urls)) # 显示警告对话框
             return
 
         progress_label.config(text=f"正在下载 {len(download_targets)} 个文件")
         directory = dir_path if len(resources_info_list) > 1 else os.path.dirname(download_targets[0][1])
-        start_download_batch(download_targets, directory)
+        start_download_batch(download_targets, directory) # 复用已经存在的 _batch_control，切到“下载中”
 
         if failed_urls:
             messagebox.showwarning("警告", "以下 “行” 无法解析：\n" + "\n".join(failed_urls)) # 显示警告对话框
 
-    parse_urls_in_background(list(urls), bookmark_var.get(), start_downloads)
+    parse_urls_in_background(list(urls), bookmark_var.get(), start_downloads, should_stop=lambda: control.cancel_event.is_set())
 
 def create_download_state(url: str, save_path: str, chapters: list[dict] | None = None) -> dict:
     return {
