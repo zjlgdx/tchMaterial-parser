@@ -98,6 +98,64 @@ class FakeRangeResponse:
         self.closed = True
 
 
+class SlicedRangeResponse:
+    """206 续传响应：从 full_content 的 start 位置起按 chunk_size 分块吐出真实字节（不是随机/
+    占位字节，方便断言最终文件逐字节正确），可选在吐出第 trigger_after_chunks 块之后触发一次
+    回调（例如置位 pause_event），模拟真实传输中途被暂停，而不是靠手工摆状态伪造"续传"。"""
+
+    def __init__(self, full_content: bytes, start: int, chunk_size: int = 100,
+                 trigger=None, trigger_after_chunks: int | None = None) -> None:
+        total = len(full_content)
+        self.ok = True
+        self.status_code = 206
+        self.headers = {
+            "Content-Range": f"bytes {start}-{total - 1}/{total}",
+            "Content-Length": str(total - start),
+            "ETag": '"v1"',
+        }
+        self._body = full_content[start:]
+        self._chunk_size = chunk_size
+        self._trigger = trigger
+        self._trigger_after_chunks = trigger_after_chunks
+        self.closed = False
+
+    def iter_content(self, **kwargs) -> object:
+        for index, offset in enumerate(range(0, len(self._body), self._chunk_size)):
+            if self._trigger is not None and index == self._trigger_after_chunks:
+                self._trigger()
+            yield self._body[offset:offset + self._chunk_size]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class SlicedFullBodyResponse:
+    """200 完整正文响应：把 body 按 chunk_size 分块吐出真实字节，可选在吐出第
+    trigger_after_chunks 块之后触发一次回调（例如置位 pause_event）——用来构造
+    “完整正文下载到一半被真实暂停”的场景，而不是靠手工摆状态伪造暂停后的结果。"""
+
+    def __init__(self, body: bytes, headers: dict | None = None, chunk_size: int = 100,
+                 trigger=None, trigger_after_chunks: int | None = None) -> None:
+        self.ok = True
+        self.status_code = 200
+        self.headers = dict(headers or {})
+        self.headers.setdefault("Content-Length", str(len(body)))
+        self._body = body
+        self._chunk_size = chunk_size
+        self._trigger = trigger
+        self._trigger_after_chunks = trigger_after_chunks
+        self.closed = False
+
+    def iter_content(self, **kwargs) -> object:
+        for index, offset in enumerate(range(0, len(self._body), self._chunk_size)):
+            if self._trigger is not None and index == self._trigger_after_chunks:
+                self._trigger()
+            yield self._body[offset:offset + self._chunk_size]
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class FakeHeaderRecordingSession:
     """按顺序返回预设响应，同时记录每次请求的 URL 与请求头，用于断言续传相关请求头。"""
 
@@ -530,6 +588,55 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertEqual(Path(save_path).read_bytes(), new_version) # 逐字节等于新版本，不是新旧拼接
         self.assertFalse(Path(temp_path).exists())
 
+    def test_ab_resume_preserves_the_validator_across_a_second_pause(self) -> None:
+        # P1-2：本轮修法有两半——"wb 必须无条件覆盖"和"ab 必须完全不碰"。只钉住前一半的话，
+        # 把写回代码换成裸的 `current_state["validator"] = planned_validator`（删掉 ab 保护）
+        # 全量测试依然全绿：续传（ab）成功后校验子会被覆盖成 None（因为 plan_download_write
+        # 对 "resumed" 分支恒返回 planned_validator=None），后果不是损坏，而是已下载的字节
+        # 作废、退化成一次没有意义的全量重下。这里钉住 ab 分支必须原封不动地保留旧校验子，
+        # 且这条续传本身要真的经历一次暂停/继续，不能靠手工摆状态。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        temp_path = f"{save_path}.tmp"
+        total = 2000
+        full_content = os.urandom(total)
+        offset = 500
+        with open(temp_path, "wb") as file:
+            file.write(full_content[:offset])
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = '"v1"'
+        state["downloaded_size"] = offset
+        control = panel.BatchControl()
+        state["control"] = control
+
+        calls: list[tuple] = []
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            calls.append((range_from, validator))
+            if len(calls) == 1:
+                # 第一轮续传：真实写入 3 块（300 字节）之后被真的暂停打断
+                return SlicedRangeResponse(full_content, range_from, chunk_size=100,
+                                            trigger=control.pause_event.set, trigger_after_chunks=2), [url]
+            # 第二轮续传：不再暂停，一次性吐出剩余全部字节，直到完成
+            return SlicedRangeResponse(full_content, range_from, chunk_size=100), [url]
+
+        with patch.object(panel, "request_download", fake_request_download):
+            panel.download_file(self.url, save_path, None, state) # 第一轮续传：真实写入部分字节后被暂停
+
+            self.assertFalse(state["finished"])
+            self.assertEqual(state["validator"], '"v1"') # ab 分支：暂停之后校验子必须原封不动
+            self.assertEqual(Path(temp_path).read_bytes(), full_content[:800]) # 500 + 3 * 100
+            self.assertEqual(state["downloaded_size"], 800)
+
+            control.pause_event.clear()
+            panel.download_file(self.url, save_path, None, state) # 第二轮：真正的继续
+
+        self.assertEqual(calls[0], (offset, '"v1"'))
+        self.assertEqual(calls[1], (800, '"v1"')) # 第二轮仍然带着同一份没被抹掉的校验子发起续传
+        self.assertIsNone(state["failed_reason"])
+        self.assertTrue(state["finished"])
+        self.assertEqual(Path(save_path).read_bytes(), full_content) # 逐字节完整，不是全量重下的另一份内容
+        self.assertFalse(Path(temp_path).exists())
+
     def test_full_body_without_a_validator_header_clears_the_stale_one_instead_of_keeping_it(self) -> None:
         # P0-C：plan_download_write 对“206 续传（保留原校验子）”和“200 完整正文但服务端
         # 没给 ETag/Last-Modified（应当清空）”都返回 validator=None，写回时若用
@@ -539,6 +646,11 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         # 正确做法是：能不能续传（ab）决定要不要保留旧校验子；一旦确定是 wb（全新正文），
         # 不论这次响应有没有给校验子，都要用这次的结果无条件覆盖 current_state["validator"]，
         # 该清空就清空成 None。
+        #
+        # P2-3：第一轮必须真的写入部分正文后被真实暂停打断（而不是一次性吐完、成功之后
+        # 才去检查校验子），否则测不出“校验子是在 open() 那一刻就被清空”还是“下载成功时
+        # 才顺便清空”——后一种写法只要没暂停这条分支就永远不会被走到，以后有人把清空校验子
+        # 误移到“下载成功”那一步，这条测试依然会绿。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         temp_path = f"{save_path}.tmp"
         old_version = os.urandom(5000)
@@ -556,25 +668,30 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
 
         def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
             calls.append((range_from, validator))
-            # 服务端这次回的是完整正文（200），但没有给 ETag/Last-Modified 中的任何一个
+            if len(calls) == 1:
+                # 第一轮：服务端回的是完整正文（200），没有给 ETag/Last-Modified 中的任何一个，
+                # 真实写入 3 块新正文（1500 字节）之后被真的暂停打断——不是一次性吐完再暂停
+                return SlicedFullBodyResponse(new_version, chunk_size=500,
+                                               trigger=control.pause_event.set, trigger_after_chunks=2), [url]
+            # 第二轮：校验子已被清空，理应是不带 Range 的全新请求；一次性吐出完整正文
             return FakeRangeResponse(200, {"Content-Length": str(len(new_version))}, body=new_version), [url]
 
         with patch.object(panel, "request_download", fake_request_download):
-            panel.download_file(self.url, save_path, None, state)
+            panel.download_file(self.url, save_path, None, state) # 第一轮：真实写入部分新正文后被暂停
 
+            self.assertFalse(state["finished"]) # 真的被暂停了，没有走到成功分支
+            self.assertIsNone(state["validator"]) # 校验子在 open() 那一刻就已经清空，不等下载完成
+            self.assertEqual(Path(temp_path).read_bytes(), new_version[:1500]) # 3 块 * 500 字节
+            self.assertEqual(state["downloaded_size"], 1500)
+
+            control.pause_event.clear()
+            panel.download_file(self.url, save_path, None, state) # 第二轮：真正的继续
+
+        self.assertEqual(calls[1], (None, None)) # 校验子已清空：这次是全新请求，不带 Range/If-Range
         self.assertIsNone(state["failed_reason"])
         self.assertTrue(state["finished"])
-        self.assertIsNone(state["validator"]) # 没有校验子的完整正文必须清空旧校验子，不能沿用
         self.assertEqual(Path(save_path).read_bytes(), new_version)
         self.assertFalse(Path(temp_path).exists())
-
-        # 校验子已被清空：下一轮理应发起不带 Range/If-Range 的全新请求，不能再拿旧校验子去续传
-        state["finished"] = False
-        with open(f"{save_path}.tmp", "wb") as file: # 模拟又下到一半后再次暂停留下的 .tmp（内容不重要）
-            file.write(os.urandom(100))
-        with patch.object(panel, "request_download", fake_request_download):
-            panel.download_file(self.url, save_path, None, state)
-        self.assertEqual(calls[1], (None, None))
 
     def test_resume_fallback_to_full_restart_resets_downloaded_size_and_keeps_the_file(self) -> None:
         save_path = str(Path(self.tmp_dir) / "book.pdf")
@@ -870,6 +987,47 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertEqual(state["downloaded_size"], 0)
         self.assertEqual(state["total_size"], 0)
         self.assertFalse(Path(f"{save_path}.tmp").exists()) # 从未写过任何字节，不该凭空产生 .tmp
+
+    def test_pause_during_finalization_does_not_roll_back_to_a_resumable_state(self) -> None:
+        # P1-1：这是"正文与校验子不同源"这个物种的第四个变种，藏在传输循环*之外*——
+        # add_bookmarks 会把 .tmp 整份重写（字节内容、长度都变了，不再是服务端正文的前缀），
+        # 紧接着的 os.replace 若失败（Windows 上目标文件被阅读器/杀软占用很常见），会走进
+        # 外层的 except；此时如果 pause_event 恰好在加书签这几秒里被点了，原代码不分青红皂白
+        # 按 pause_event 分类成"暂停"，把这份已经不是服务端正文前缀的书签重写版 .tmp 留在
+        # 磁盘上，state["validator"]/downloaded_size/total_size 却仍然描述着原始服务端正文。
+        # 下一轮"继续"会用这份 offset（书签版的文件长度）+ 校验子（原始正文的）发起 Range 请求，
+        # 只要服务端仍持有同一版本就会认可，把服务端正文的尾巴接到书签版前缀后面——又是长度
+        # 自洽、无失败提示、内容错误的文件。
+        #
+        # 正确做法：一旦确认传输已经完整、进入"加书签 + 改名"这个收尾阶段，这个任务的下载
+        # 本身就已经结束了，收尾阶段发生的暂停请求不能再把它回滚成"可续传"状态——.tmp 已经
+        # 不再是服务端正文的前缀，没有"继续"这回事，只能判定为失败，清理掉这份不可信的 .tmp，
+        # 逼下一次发起一次全新的下载。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = None
+        control = panel.BatchControl()
+        state["control"] = control
+
+        server_content = os.urandom(2000)
+        bookmarked_content = os.urandom(1600) # 模拟 pypdf 重写之后完全不同的字节与长度
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            return FakeRangeResponse(200, {"Content-Length": str(len(server_content)), "ETag": '"server-etag"'}, body=server_content), [url]
+
+        def fake_add_bookmarks(pdf_path: str, chapters: list[dict]) -> None:
+            Path(pdf_path).write_bytes(bookmarked_content) # 真书签会整份重写 .tmp
+            control.pause_event.set() # 加书签这几秒里，用户点了暂停
+
+        with patch.object(panel, "request_download", fake_request_download), \
+             patch.object(panel, "add_bookmarks", fake_add_bookmarks), \
+             patch.object(panel.os, "replace", side_effect=PermissionError("目标文件被占用")):
+            panel.download_file(self.url, save_path, [{"title": "第一章", "page_index": 1}], state)
+
+        self.assertTrue(state["finished"]) # 不能停在"暂停"这个可续传状态上——.tmp 已经不可信了
+        self.assertIsNotNone(state["failed_reason"]) # 必须报告为失败，而不是悄悄假装暂停
+        self.assertFalse(Path(f"{save_path}.tmp").exists()) # 不可信的书签重写版 .tmp 必须被清理掉
+        self.assertFalse(Path(save_path).exists())
 
     def test_pause_requested_right_before_a_clean_stream_end_preserves_the_partial_file(self) -> None:
         # P0-3：暂停恰好撞上流干净结束（不抛异常）。循环内 break 用的检查不会再被沿用到
