@@ -385,7 +385,7 @@ class PlanDownloadWriteTest(unittest.TestCase):
         self.assertEqual(validator, '"etag-new"') # 重试拿到的是完整正文，要刷新校验子
 
     def test_resume_requires_content_range_start_to_match_requested_offset(self) -> None:
-        # P0-1：206 但起点不匹配，响应体只是那一段，不能直接当整份写下去——必须像 416 一样
+        # 206 但起点不匹配，响应体只是那一段，不能直接当整份写下去——必须像 416 一样
         # 关掉这次响应、重新发一次不带 Range 的请求。用两个不同的总长断言最终数值确实来自
         # 那次重试的响应，而不是继续沿用第一次（不可信）响应里的总长凑巧对上。
         state = self.existing_state(offset=1000)
@@ -451,7 +451,7 @@ class PlanDownloadWriteTest(unittest.TestCase):
         self.assertIsNone(validator)
 
     def test_ok_but_not_200_is_not_treated_as_a_usable_full_body(self) -> None:
-        # P1-1：response.ok 是 status_code < 400，204/304 这类“ok 但没有正文”的响应
+        # response.ok 是 status_code < 400，204/304 这类“ok 但没有正文”的响应
         # 不该被当成完整正文写成一个零字节的“成功”文件。
         state = self.existing_state(offset=0, validator=None)
         os.remove(self.temp_path)
@@ -472,7 +472,7 @@ class PlanDownloadWriteTest(unittest.TestCase):
         self.assertIsNone(validator)
 
     def test_second_response_being_an_unexpected_206_is_not_trusted_either(self) -> None:
-        # P1-1：重试之后的响应也要走同一套“能不能当整份正文用”的判据，不能无条件信任——
+        # 重试之后的响应也要走同一套“能不能当整份正文用”的判据，不能无条件信任——
         # 一个不规范的 CDN 在不带 Range 的重试上仍然回 206 时，不能把这段 partial body 当整份写下去。
         state = self.existing_state(offset=500)
         range_invalid = FakeRangeResponse(416)
@@ -487,7 +487,7 @@ class PlanDownloadWriteTest(unittest.TestCase):
         self.assertIsNone(validator)
 
     def test_unsolicited_206_on_a_plain_download_is_not_trusted(self) -> None:
-        # P1-1：can_attempt_range 为 False 的普通下载（本地无偏移或无校验子）如果服务端
+        # can_attempt_range 为 False 的普通下载（本地无偏移或无校验子）如果服务端
         # 自发回了 206，同样不能落回“wb + 当次 Content-Length”去信任它。
         state = self.existing_state(offset=0, validator=None)
         os.remove(self.temp_path)
@@ -534,7 +534,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
 
     def test_pause_right_after_a_stale_full_body_response_does_not_leak_its_validator(self) -> None:
-        # P0-A（跨两轮）：plan_download_write 已经决定 wb、已经算出新版本的校验子，但 open()
+        # 跨两轮：plan_download_write 已经决定 wb、已经算出新版本的校验子，但 open()
         # 还没真正截断旧 .tmp 之前就被要求暂停——这时不能把新校验子/downloaded_size/total_size
         # 提前写回 current_state，否则磁盘上留着旧正文、内存里却指向新版本，两者不再同源；
         # 下一轮“继续”会带着这份还没被磁盘内容证实过的新校验子发出去，一旦服务端认可，
@@ -578,7 +578,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertFalse(Path(temp_path).exists())
 
     def test_ab_resume_preserves_the_validator_across_a_second_pause(self) -> None:
-        # P1-2：本轮修法有两半——“wb 必须无条件覆盖”和“ab 必须完全不碰”。只钉住前一半的话，
+        # 覆盖校验子的判据有两半——“wb 必须无条件覆盖”和“ab 必须完全不碰”。只钉住前一半的话，
         # 把写回代码换成裸的 `current_state["validator"] = planned_validator`（删掉 ab 保护）
         # 全量测试依然全绿：续传（ab）成功后校验子会被覆盖成 None（因为 plan_download_write
         # 对 "resumed" 分支恒返回 planned_validator=None），后果不是损坏，而是已下载的字节
@@ -627,7 +627,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertFalse(Path(temp_path).exists())
 
     def test_full_body_without_a_validator_header_clears_the_stale_one_instead_of_keeping_it(self) -> None:
-        # P0-C：plan_download_write 对“206 续传（保留原校验子）”和“200 完整正文但服务端
+        # plan_download_write 对“206 续传（保留原校验子）”和“200 完整正文但服务端
         # 没给 ETag/Last-Modified（应当清空）”都返回 validator=None，写回时若用
         # `if planned_validator is not None:` 去判断该不该写，会把后一种也当成“不用管”而
         # 跳过——磁盘上已经换成了新正文，内存里的校验子却还是旧版本，下一轮“继续”会带着
@@ -636,7 +636,7 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         # 不论这次响应有没有给校验子，都要用这次的结果无条件覆盖 current_state["validator"]，
         # 该清空就清空成 None。
         #
-        # P2-3：第一轮必须真的写入部分正文后被真实暂停打断（而不是一次性吐完、成功之后
+        # 第一轮必须真的写入部分正文后被真实暂停打断（而不是一次性吐完、成功之后
         # 才去检查校验子），否则测不出“校验子是在 open() 那一刻就被清空”还是“下载成功时
         # 才顺便清空”——后一种写法只要没暂停这条分支就永远不会被走到，以后有人把清空校验子
         # 误移到“下载成功”那一步，这条测试依然会绿。
@@ -722,9 +722,10 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertEqual(state["validator"], '"new-etag"')
 
     def test_unusable_206_is_never_written_as_if_it_were_the_full_file(self) -> None:
-        # P0-1：起点不匹配的 206——响应体只是那一段，一旦被当整份写下去就是静默损坏
+        # 起点不匹配的 206——响应体只是那一段，一旦被当整份写下去就是静默损坏
         # （文件存在、大小和计数器都对得上、内容却是错的）。必须断言最终文件的字节，
-        # 只断言 open_mode/计数器钉不住这个 bug：旧实现落回 wb 之后计数器照样能自洽。
+        # 只断言 open_mode/计数器钉不住这个问题：落回 wb 之后计数器本身依然自洽，
+        # 唯独磁盘上的字节是错的，只有比对实际内容才能揭穿。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         temp_path = f"{save_path}.tmp"
         with open(temp_path, "wb") as file: # 半截内容：11 字节
@@ -949,7 +950,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(f"{save_path}.tmp").exists()) # 从未写过任何字节，不该凭空产生 .tmp
 
     def test_cancel_in_flight_with_non_ok_response_is_not_treated_as_a_real_failure(self) -> None:
-        # P1-4：与上面暂停那条对称——请求还在飞的时候用户点了取消，随后服务端偏偏回了非 ok
+        # 与上面暂停那条对称——请求还在飞的时候用户点了取消，随后服务端偏偏回了非 ok
         # 状态码。取消同样不该被判成真失败，否则进度汇总会把这个被取消的任务算成“1 个失败”。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         state = panel.create_download_state(self.url, save_path)
@@ -978,10 +979,10 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(f"{save_path}.tmp").exists()) # 从未写过任何字节，不该凭空产生 .tmp
 
     def test_pause_during_finalization_does_not_roll_back_to_a_resumable_state(self) -> None:
-        # P1-1：这是“正文与校验子不同源”这个物种的第四个变种，藏在传输循环*之外*——
+        # 这是“正文与校验子不同源”这个物种的第四个变种，藏在传输循环*之外*——
         # add_bookmarks 会把 .tmp 整份重写（字节内容、长度都变了，不再是服务端正文的前缀），
         # 紧接着的 os.replace 若失败（Windows 上目标文件被阅读器/杀软占用很常见），会走进
-        # 外层的 except；此时如果 pause_event 恰好在加书签这几秒里被点了，原代码不分青红皂白
+        # 外层的 except；此时如果 pause_event 恰好在加书签这几秒里被点了，不能不分青红皂白
         # 按 pause_event 分类成“暂停”，把这份已经不是服务端正文前缀的书签重写版 .tmp 留在
         # 磁盘上，state["validator"]/downloaded_size/total_size 却仍然描述着原始服务端正文。
         # 下一轮“继续”会用这份 offset（书签版的文件长度）+ 校验子（原始正文的）发起 Range 请求，
@@ -1019,13 +1020,14 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(save_path).exists())
 
     def test_finalizing_must_be_set_before_calling_add_bookmarks_not_after(self) -> None:
-        # P2-4：上一条用例是“加书签成功、os.replace 失败”，这条异常恰好发生在 add_bookmarks
-        # 返回之后——如果有人把 finalizing = True 这一行从 add_bookmarks 调用之前挪到调用
-        # 之后（比如误以为“只有 os.replace 会失败，加书签本身失败与我无关”），上一条用例
-        # 依然全绿，测不出这个挪动。这里让 add_bookmarks 自身抛出异常（真实的 add_bookmarks
-        # 会把内部异常都吞掉，但这里是为了钉住“finalizing 必须在调用它之前置位”这条时序
-        # 规则本身，不依赖它是否真的会抛），异常发生在 finalizing 那一行“之后”还是“之前”，
-        # 决定了这次暂停最终会被判成失败还是被误判成可续传的暂停。
+        # 与“加书签成功、os.replace 失败”那条互补：那条的异常发生在 add_bookmarks 返回
+        # 之后，测不出 finalizing = True 这一行是不是真的在调用 add_bookmarks 之前执行的
+        # ——如果被挪到 add_bookmarks 调用之后（比如误以为“只有 os.replace 会失败，加书签
+        # 本身失败与我无关”），那条用例依然全绿，测不出这个挪动。这里让 add_bookmarks 自身
+        # 抛出异常（真实的 add_bookmarks 会把内部异常都吞掉，但这里是为了钉住“finalizing
+        # 必须在调用它之前置位”这条时序规则本身，不依赖它是否真的会抛），异常发生在
+        # finalizing 那一行“之后”还是“之前”，决定了这次暂停最终会被判成失败还是被误判成
+        # 可续传的暂停。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         state = panel.create_download_state(self.url, save_path)
         state["validator"] = None
@@ -1120,7 +1122,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertEqual(Path(f"{save_path}.tmp").read_bytes(), b"x" * 512)
 
     def test_pause_exactly_at_full_length_completes_instead_of_staying_paused(self) -> None:
-        # P2-10：暂停恰好落在最后一块之后——文件其实已经下完，不该判成“暂停”，否则不会改名，
+        # 暂停恰好落在最后一块之后——文件其实已经下完，不该判成“暂停”，否则不会改名，
         # 继续时会因为 offset == total_size 触发 416，退化成一次没有必要的全量重下。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         state = panel.create_download_state(self.url, save_path)
@@ -1285,9 +1287,9 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.acquire_slots_without_blocking()
 
     def test_cancelled_before_request_cleans_up_tmp_left_over_from_a_previous_pause(self) -> None:
-        # P1-5：暂停留下 .tmp 后点“继续”，任务在取得执行机会前又被取消——排队取消分支
-        # 必须清理这个“上一轮留下的” .tmp，不能只在“这次有没有产生过” .tmp 上打转
-        # （改动前这条路径永远拿到一个全新任务，不可能预先存在 .tmp，现在续传场景下会）。
+        # 暂停留下 .tmp 后点“继续”，任务在取得执行机会前又被取消——排队取消分支
+        # 必须清理这个“上一轮留下的” .tmp，不能只按“这次有没有产生过” .tmp 来判断该不该
+        # 清理：续传场景下，进入这一轮之前就可能已经预先存在一个 .tmp，不是每次都是全新任务。
         save_path = str(Path(self.tmp_dir) / "resumed.pdf")
         with open(f"{save_path}.tmp", "wb") as file:
             file.write(b"leftover-from-a-previous-pause")
@@ -1307,7 +1309,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(f"{save_path}.tmp").exists())
 
     def test_non_ok_response_cleans_up_tmp_and_counters_instead_of_leaving_them_stale(self) -> None:
-        # P1-5：plan_download_write 对非 ok 响应的早退不会归零，download_file 必须在这里补上，
+        # plan_download_write 对非 ok 响应的早退不会归零，download_file 必须在这里补上，
         # 否则失败文件的残留字节会被计进批次总进度，且残留 .tmp 会让同一次运行里重下该资源
         # 被 allocate_download_paths 误判成“已存在”，改名成 book (2).pdf。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
@@ -1441,7 +1443,7 @@ class BatchOutcomeTest(unittest.TestCase):
         self.notice.assert_not_called()
 
     def test_pause_event_set_but_nothing_left_pending_settles_as_completed(self) -> None:
-        # P2-a：暂停恰好落在最后一个文件的最后一块之后——批次里已经没有未完成任务了，
+        # 暂停恰好落在最后一个文件的最后一块之后——批次里已经没有未完成任务了，
         # 不该因为 pause_event 还留着置位就落成“暂停”，否则界面会卡在“已暂停 100%”。
         control = panel.BatchControl()
         control.directory = self.directory
@@ -1469,7 +1471,7 @@ class BatchOutcomeTest(unittest.TestCase):
         self.assertIsNone(panel._batch_control) # 走的是取消分支
 
     def test_reclassifies_as_cancelled_when_cancel_arrives_after_outcome_was_computed(self) -> None:
-        # P1-4：_run_batch_worker 算出 outcome="paused" 之后、ui_call 排队的回调真正执行之前，
+        # _run_batch_worker 算出 outcome="paused" 之后、ui_call 排队的回调真正执行之前，
         # 批次线程已经退出，用户在这个窗口点了取消——cancel_event 此刻已经置位，但传进 handle_batch_outcome
         # 的 outcome 参数仍然是算出来时的旧值 "paused"。不重判的话，取消会被静默吞掉：paused_settled
         # 置位、.tmp 全留、finished 仍是 False、cancel_event 也没清，用户再点“继续”会立刻走排队取消分支。
@@ -1730,13 +1732,14 @@ class DownloadEntryIdleResetTest(unittest.TestCase):
         self.assertIsNone(panel._batch_control)
 
     def test_askdirectory_cancelled_also_resets_the_progress_bar(self) -> None:
-        # P2-9：进度条/文案的复位收口进 set_ui_phase 之前，restore_idle_ui 只复位了文案，
-        # 漏了进度条——这条不打桩 set_ui_phase，直接看真实进度条/文案控件收到的调用。
+        # 进度条/文案是否清空收口进 set_ui_phase——这条不打桩 set_ui_phase，直接看真实
+        # 进度条/文案控件收到的调用。
         #
         # 注意：download() 入口的 set_ui_phase("parsing") 本身就会把进度条清零一次，
         # 如果不把这次入口调用排除掉，assert_any_call(value=0) 在“退出路径根本没有复位”
-        # 的旧实现上也会通过（P1-3）。用户点掉 askdirectory 对话框的这一刻，才是真正要
-        # 验证的“退出复位”时机，所以在桩里先清空调用记录，只断言这一刻之后发生的复位。
+        # 时也会通过，测不出退出路径本身有没有复位。用户点掉 askdirectory 对话框的这一刻，
+        # 才是真正要验证的“退出复位”时机，所以在桩里先清空调用记录，只断言这一刻之后
+        # 发生的复位。
         resource_by_url = {
             f"https://example.com/{index}.pdf": ResourceInfo(f"教材{index}", f"https://example.com/{index}.pdf", "pdf", [])
             for index in range(2)
@@ -1850,7 +1853,7 @@ class ParseAndCopyDoesNotWireCancellationTest(unittest.TestCase):
         self.assertIsNone(captured["should_stop"]) # 唯一的实质断言：不能被顺手接上取消
 
     def test_copy_btn_is_not_re_enabled_while_a_download_batch_is_active(self) -> None:
-        # P2-11：copy_urls 此前无条件把 copy_btn 设回 normal，若这次“解析并复制”的完成回调
+        # copy_urls 不能无条件把 copy_btn 设回 normal：若这次“解析并复制”的完成回调
         # 恰好在下载流程自己的“解析中”阶段（_batch_control 不是 None）才触发，会把
         # set_ui_phase 刚设好的 disabled 状态抢回来，导致同一个按钮同时在做两件事。
         resource = ResourceInfo("教材", "https://example.com/parsed.pdf", "pdf", [])
@@ -1866,8 +1869,8 @@ class ParseAndCopyDoesNotWireCancellationTest(unittest.TestCase):
         self.assertNotIn(call(state="normal"), panel.copy_btn.config.call_args_list)
 
     def test_progress_label_not_overwritten_while_a_download_batch_is_active(self) -> None:
-        # P2-b：同一个漏洞的另一半——紧跟着 copy_btn 那行的 progress_label.config(text="等待
-        # 下载") 原来只看 downloads_active()（只反映“下载中”子阶段），下载流程自己的“解析中”
+        # 同一个问题的另一半——紧跟着 copy_btn 那行的 progress_label.config(text="等待
+        # 下载") 不能只看 downloads_active()（只反映“下载中”子阶段）：下载流程自己的“解析中”
         # 子阶段这时 download_states 还是空的，会被误判成“没有下载活动”，把“正在解析链接
         # 3/50”这样的文案覆盖掉。
         resource = ResourceInfo("教材", "https://example.com/parsed.pdf", "pdf", [])
@@ -1884,7 +1887,7 @@ class ParseAndCopyDoesNotWireCancellationTest(unittest.TestCase):
 
 
 class SetUiPhaseProgressResetTest(unittest.TestCase):
-    """P2-9：进度条/文案是否清空收口进 set_ui_phase，不再由各个调用方各写一份。"""
+    """进度条/文案是否清空收口进 set_ui_phase，不由各个调用方各写一份。"""
 
     def setUp(self) -> None:
         self.context = ExitStack()
