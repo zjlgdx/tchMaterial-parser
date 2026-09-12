@@ -178,8 +178,11 @@ def request_download(url: str, range_from: int | None = None, validator: str | N
             if response.ok:
                 return response, attempted_urls
 
-            # 401/403 换镜像也过不了。400 多半是突发限流，连打镜像会更糟。
-            if response.status_code in (401, 403):
+            # 401/403 换镜像也过不了。416 同理：各镜像服务的是同一个对象，偏移在一个镜像上
+            # 越界，在别的镜像上同样越界；继续轮换不但救不回来，还会让后面镜像的无关错误
+            # （404/500）把“是你的范围有问题”这个信号盖掉——而这恰恰是唯一能救回来的情形，
+            # 调用方正要靠它去发一次不带 Range 的请求重来。400 多半是突发限流，连打镜像会更糟。
+            if response.status_code in (401, 403, 416):
                 return last_response, attempted_urls
             if response.status_code == 400:
                 if retry < len(_400_RETRY_DELAYS):

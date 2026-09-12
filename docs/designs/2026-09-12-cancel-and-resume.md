@@ -85,7 +85,7 @@ issue 里引用的行号是撰写时的快照，本节按当前工作树（基�
 
 8. **镜像轮换与续传：不同镜像续传时 `If-Range` 是唯一的安全网，且要防止“接上错误的位置”。**
    核实：属实，`download_mirror_urls` 会在 r1/r2/r3 之间轮换，且轮换逻辑与续传逻辑目前完全不相交（续传还不存在）；另外光凭状态码 206 不能保证服务端真的从我们请求的偏移开始返回——服务端也可能因为自身实现而回一个别的区间。
-   应对：`request_download` 的镜像轮换逻辑保持不变、原样复用，续传只是多带了 `Range`/`If-Range`/`Accept-Encoding`，这些头在每一个候选镜像上都会原样发送。是否可追加不只看状态码是不是 206，还要看 `Content-Range` 解析出的起始位置是否等于本次请求的偏移（见 Architecture (b)）；一旦不等，按不可续传处理。因此不管最终由哪个镜像应答、应答的区间是否符合预期，正确性都由这个校验兜底，不依赖“猜哪个镜像会命中”。
+   应对：`request_download` 的镜像轮换照常进行，续传只是多带了 `Range`/`If-Range`/`Accept-Encoding`，这些头在每一个候选镜像上都会原样发送。唯一的例外是 416：它和 401/403 一样**立即返回、不再换镜像**——各镜像服务的是同一个对象，偏移在一个镜像上越界在别的镜像上同样越界，继续轮换既救不回来，又会让后面镜像的无关错误（404/500）覆盖掉 `last_response`，把“是你的范围有问题”这个信号弄丢；而这恰恰是唯一能救回来的情形，调用方正要靠它去走坑 4 的回退。此时 `attempted_urls` 只含真正试过的那个镜像，“已尝试 N 个下载镜像”的文案照旧成立。416 之后回退发起的那条不带 Range 的请求不受此影响，仍然走完整的镜像轮换。是否可追加不只看状态码是不是 206，还要看 `Content-Range` 解析出的起始位置是否等于本次请求的偏移（见 Architecture (b)）；一旦不等，按不可续传处理。因此不管最终由哪个镜像应答、应答的区间是否符合预期，正确性都由这个校验兜底，不依赖“猜哪个镜像会命中”。
    测试：`test_resume_across_mirror_rotation_still_sends_if_range`、`test_resume_requires_content_range_start_to_match_requested_offset`、`test_unusable_206_is_never_written_as_if_it_were_the_full_file`、`test_206_with_unparseable_content_range_is_never_written_as_if_it_were_the_full_file`（后两条走完整的 `download_file`，断言最终文件的字节，不只是 `open_mode` 与计数器）。
 
 9. **信号量/全局锁在取消/暂停时不能泄漏。**
@@ -261,7 +261,7 @@ else:
   | 批次层面兜底清理（`handle_batch_outcome` 对非“暂停”结局遍历未完成任务；(d) 里暂停期间点取消的收尾） | 尽力删除（同上，可能删不掉） | 不碰 | 不写 | `True` | **不会** |
 
   表里真正“活着”、会被下一轮实际读回去拼 Range 请求的只有 `finished` 仍是 `False` 的那四行，这四行里 `.tmp` 的字节与 `validator`/`downloaded_size` 全部同源；`finished = True` 的那些行里，`.tmp` 是否被成功删除只是“尽力而为”，从不是正确性的保证来源，因为不管有没有删成，这个已经终结的 `state` 都不会再被拿来发起下一次请求——它也不会被将来某次全新的下载复用：全新下载走 `create_download_state`，`validator` 永远从 `None` 起算，与这个终结掉的旧 `state` 毫无关系。
-- 镜像轮换（坑 8）：`request_download` 的镜像轮换逻辑不改，续传只是多带了 `Range`/`If-Range`/`Accept-Encoding`，这些头在每一个候选镜像上都会原样发送；是否可追加完全由 `plan_download_write` 里那组条件判定，不依赖“猜哪个镜像会命中”。
+- 镜像轮换（坑 8）：`request_download` 的镜像轮换照常进行（416 除外，见坑 8 的应对），续传只是多带了 `Range`/`If-Range`/`Accept-Encoding`，这些头在每一个候选镜像上都会原样发送；是否可追加完全由 `plan_download_write` 里那组条件判定，不依赖“猜哪个镜像会命中”。
 
 `download_file` 用 `plan_download_write` 的结果替换现有的“直接取 `Content-Length` 再以 `wb` 打开”那几行，其余（分块写入、chunk 大小按 `total_size` 分档、`refresh_download_progress`）不变。
 

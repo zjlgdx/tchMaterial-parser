@@ -201,6 +201,19 @@ class RequestDownloadHeadersTest(unittest.TestCase):
         self.assertNotIn("Range", headers)
         self.assertNotIn("If-Range", headers)
 
+    def test_416_returns_immediately_instead_of_rotating_mirrors(self) -> None:
+        # 416 是“你要的范围本身不可满足”。各镜像服务的是同一个对象，换一个也同样不可满足；
+        # 继续轮换只会让后面镜像的无关错误盖掉这个信号，调用方就再也判不出该走回退路径。
+        fake_session = FakeHeaderRecordingSession([FakeRangeResponse(416), FakeRangeResponse(500), FakeRangeResponse(500)])
+        panel.session = fake_session
+        url = "https://r1-ndr-private.ykt.cbern.com.cn/book.pdf"
+
+        response, attempted_urls = panel.request_download(url, range_from=4000, validator='"etag"')
+
+        self.assertEqual(response.status_code, 416) # 返回的必须是那个 416 本身
+        self.assertEqual(attempted_urls, [url])
+        self.assertEqual(fake_session.requested_urls, [url]) # r2/r3 一条都不该再打
+
     def test_resume_across_mirror_rotation_still_sends_if_range(self) -> None:
         # r1 打不通，r2 才回 206；两次请求都必须带着同一个 If-Range，
         # 正确性交给服务端按 HTTP 语义判断，不依赖“猜哪个镜像会命中”。
@@ -832,6 +845,43 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
         self.assertIsNone(state["failed_reason"])
         self.assertTrue(state["finished"])
         self.assertEqual(Path(save_path).read_bytes(), full_content)
+
+    def test_416_on_the_first_mirror_still_falls_back_to_a_full_restart(self) -> None:
+        # 走真实的 request_download（不打桩），因为要测的正是它内部的镜像轮换：
+        # r1 明确回答“是你的范围有问题”，r2/r3 恰好在闹别扭回 500。416 之后若继续轮换，
+        # 返回给 plan_download_write 的就只剩那个 500，“不带 Range 重来一次”的回退路径
+        # 根本不走，任务判失败、半截 .tmp 被删——而对 r1 发一条不带 Range 的请求本来就会成功。
+        url = "https://r1-ndr-private.ykt.cbern.com.cn/book.pdf"
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        temp_path = f"{save_path}.tmp"
+        full_content = b"P" * 4000
+        with open(temp_path, "wb") as file: # 上一轮留下的半截其实已经满长，续传必然越界
+            file.write(full_content)
+        state = panel.create_download_state(url, save_path)
+        state["validator"] = '"v1"'
+        requests_sent: list[tuple[str, bool]] = []
+
+        def fake_get(request_url: str, headers: dict | None = None, **kwargs) -> object:
+            has_range = "Range" in (headers or {})
+            requests_sent.append((request_url, has_range))
+            if not has_range:
+                return FakeRangeResponse(200, {"Content-Length": str(len(full_content)), "ETag": '"v1"'}, body=full_content)
+            if request_url.startswith("https://r1-"):
+                return FakeRangeResponse(416, {"Content-Range": f"bytes */{len(full_content)}"})
+            return FakeRangeResponse(500) # r2/r3 恰好在闹别扭
+
+        self.context.enter_context(patch.object(panel, "_MIN_REQUEST_INTERVAL", 0))
+        self.context.enter_context(patch.object(panel, "request_headers", lambda request_url: {}))
+        self.context.enter_context(patch.object(panel, "session", Mock(get=fake_get)))
+
+        panel.download_file(url, save_path, None, state)
+
+        # 恰好两条：一条带 Range 的（r1，撞 416 就此打住，不再去打 r2/r3），一条不带 Range 的回退
+        self.assertEqual([has_range for _request_url, has_range in requests_sent], [True, False])
+        self.assertIsNone(state["failed_reason"])
+        self.assertTrue(state["finished"])
+        self.assertEqual(Path(save_path).read_bytes(), full_content)
+        self.assertFalse(Path(temp_path).exists())
 
     def test_resume_completes_integrity_check_successfully(self) -> None:
         save_path = str(Path(self.tmp_dir) / "book2.pdf")
