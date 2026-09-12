@@ -157,6 +157,45 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(self.lines(), {self.url("a"), self.url("b")})
         self.assertEqual(self.count.cget("text"), "已选 2 项")
 
+    def test_pending_catalog_shows_placeholder_until_resources_arrive(self):
+        pane = ttk.Frame(self.root)
+        urls = tk.Text(self.root, undo=True)
+        apply_resource_list = resource_tree.build_resource_tree(pane, {}, urls, "正在加载资源列表…")
+        tree = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Treeview))
+        self.root.update()
+        self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["正在加载资源列表…"])
+
+        tree.event_generate("<Motion>", x=10, y=10) # 悬停在占位行上不应报错
+        self.root.after(600, self.root.quit)
+        self.root.mainloop()
+        self.root.update()
+
+        urls.insert("1.0", self.url("a")) # 目录还没到时用户就先粘贴了链接
+        self.root.update()
+
+        self.tree = tree # 让 assert_state 作用于这棵新建的树
+        apply_resource_list(RESOURCES)
+        self.root.update()
+        self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["电子教材"])
+        tree.item("books", open=True)
+        tree.item("books:primary", open=True)
+        self.root.update()
+        self.assert_state("books:primary:a", "checked") # 目录到达后按输入框里的链接恢复勾选
+        count = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Label) and widget.grid_info().get("column") == 1)
+        self.assertEqual(count.cget("text"), "已选 1 项")
+
+        tree.selection_set("books:primary:b") # 目录到达后点选资源仍能写回链接
+        tree.focus("books:primary:b")
+        command = re.search(r"\[([^\s]+)", tree.bind("<space>")).group(1)
+        self.root.tk.call(command, "unused")
+        self.root.update()
+        pasted = {line.strip() for line in urls.get("1.0", "end").splitlines() if line.strip()}
+        self.assertEqual(pasted, {self.url("a"), self.url("b")})
+
+        apply_resource_list({}, "获取资源列表失败，请手动填写资源链接，或重新打开本程序")
+        self.root.update()
+        self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["获取资源列表失败，请手动填写资源链接，或重新打开本程序"])
+
     def test_paste_whitespace_and_undo_sync_without_changing_other_urls(self):
         external = "https://example.com/manual"
         self.urls.insert("1.0", f"  {self.url('b')}  \n{external}")

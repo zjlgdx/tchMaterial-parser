@@ -3,7 +3,7 @@
 
 import io
 import tkinter as tk
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from tkinter import ttk
 import tkinter.font as tkfont
 from PIL import Image, ImageDraw, ImageOps, ImageTk
@@ -87,7 +87,11 @@ def draw_checkbox_image(size: int, state: str, colors: dict[str, str]) -> Image.
         draw.line((inset, size / 2, size - inset, size / 2), fill=colors["selbg"], width=border_width)
     return image.resize((target_size, target_size), Image.Resampling.LANCZOS)
 
-def build_resource_tree(pane: ttk.Frame, resource_list: dict[str, dict], url_text: tk.Text) -> None: # 在给定的子框架内构建资源列表
+STATUS_ITEM_ID = "__internal_status" # 资源目录尚未就绪时，树视图中提示行的树项 ID
+
+def build_resource_tree(
+    pane: ttk.Frame, resource_list: dict[str, dict], url_text: tk.Text, status: str = "",
+) -> Callable[..., None]: # 在给定的子框架内构建资源列表；status 非空表示资源目录尚未就绪，先用提示行占位，返回的函数用于随后填入资源目录
     pane.columnconfigure(0, weight=1)
     pane.rowconfigure(2, weight=1)
 
@@ -131,6 +135,7 @@ def build_resource_tree(pane: ttk.Frame, resource_list: dict[str, dict], url_tex
     loading_tree_images: set[str] = set()
     checked_items: set[str] = set() # 已勾选末级资源的树项路径，搜索重建树视图后仍保留
     leaf_urls = {item_id: build_resource_url(item_id, data) for item_id, data in iter_leaf_resources(resource_list)}
+    catalog_status = status # 资源目录就绪后置空，此前树视图中只显示一行提示
     checkbox_pils: dict[str, Image.Image] = {} # 三态复选框底图，跟随主题配色重建
     checkbox_icons: dict[str, ImageTk.PhotoImage] = {} # 无封面树项直接使用的复选框图标（已含右侧间距）
     tree_font = tkfont.nametofont("AppBodyFont")
@@ -268,10 +273,15 @@ def build_resource_tree(pane: ttk.Frame, resource_list: dict[str, dict], url_tex
         tree_content_width = 0
         build_tree_items("", visible_items, (), expand_all=bool(query))
         resize_tree_column(treeview.winfo_width())
+        clear_search_btn.state(["!disabled"] if query else ["disabled"])
+
+        if catalog_status: # 资源目录尚未就绪，用一行提示占位
+            treeview.insert("", "end", iid=STATUS_ITEM_ID, text=catalog_status)
+            search_status_label.config(text="")
+            return
 
         result_count = count_resource_items(visible_items)
         search_status_label.config(text=f"{result_count} 项" if result_count else "无匹配资源")
-        clear_search_btn.state(["!disabled"] if query else ["disabled"])
         ui_call(load_visible_tree_icons)
 
     def insert_resource_urls(urls: list[str]) -> None: # 将链接追加到 URL 输入框，跳过已存在的行
@@ -385,7 +395,9 @@ def build_resource_tree(pane: ttk.Frame, resource_list: dict[str, dict], url_tex
         if item_id != hovered_tree_item or not treeview.exists(item_id):
             return
 
-        path_names = tree_item_paths[item_id]
+        path_names = tree_item_paths.get(item_id)
+        if not path_names: # 资源目录尚未就绪时的提示行没有分类路径
+            return
         tooltip_window = tk.Toplevel(runtime.root)
         tooltip_window.overrideredirect(True)
         tooltip_body = tk.Frame(
@@ -479,6 +491,15 @@ def build_resource_tree(pane: ttk.Frame, resource_list: dict[str, dict], url_tex
         delta_unit = 1 if os_name == "Darwin" else 120
         return scroll_tree_horizontally(-event.delta / delta_unit)
 
+    def apply_resource_list(items: dict[str, dict], status: str = "") -> None: # 填入后台加载到的资源目录并重建树视图；status 非空表示加载未成功，改为在树视图中显示原因
+        nonlocal resource_list, catalog_status
+        resource_list = items
+        catalog_status = status
+        leaf_urls.clear()
+        leaf_urls.update({item_id: build_resource_url(item_id, data) for item_id, data in iter_leaf_resources(resource_list)})
+        refresh_resource_tree()
+        sync_checked_items() # 资源目录就绪前用户可能已粘贴链接，据此恢复勾选状态
+
     rebuild_checkbox_images() # 构建树项前先生成三态复选框图标
     theme.on_theme_applied(on_theme_changed) # 主题切换后重建复选框配色并刷新树项图标
     update_checked_count()
@@ -501,3 +522,5 @@ def build_resource_tree(pane: ttk.Frame, resource_list: dict[str, dict], url_tex
     runtime.root.bind("<Control-f>", focus_search)
     if os_name == "Darwin":
         runtime.root.bind("<Command-f>", focus_search)
+
+    return apply_resource_list

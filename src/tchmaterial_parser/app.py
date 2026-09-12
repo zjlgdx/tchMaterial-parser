@@ -15,7 +15,7 @@ from .platform_utils import ctypes, os_name, print_error, resource_path, win32ap
 from .ui import download_panel, runtime, theme
 from .ui.about_window import show_about_window
 from .ui.resource_tree import build_resource_tree
-from .ui.runtime import scaled
+from .ui.runtime import scaled, thread_it, ui_call
 from .ui.token_window import show_access_token_window
 from .ui.widgets import auto_hide_scrollbar, bind_context_menu, bind_tab_navigation, center_window
 
@@ -44,14 +44,6 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     # 配置只读取一次，同时用于恢复 Access Token 与主题
     saved_config = load_config()
     load_access_token(saved_config)
-
-    # 获取资源列表
-    try:
-        resource_list = ResourceHelper().fetch_resource_list()
-    except Exception as e:
-        print_error(e)
-        resource_list = {}
-        messagebox.showwarning("警告", "获取资源列表失败，请手动填写资源链接，或重新打开本程序") # 弹出警告窗口
 
     # GUI
     root = tk.Tk()
@@ -245,7 +237,19 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     text_scrollbar.grid(row=1, column=1, sticky="ns")
     url_text.focus()
 
-    build_resource_tree(treeview_pane, resource_list, url_text) # 构建左侧资源列表（需要 URL 输入框以便选中资源时写入网址）
+    # 构建左侧资源列表（需要 URL 输入框以便选中资源时写入网址）；资源目录在后台加载，此时先显示提示
+    apply_resource_list = build_resource_tree(treeview_pane, {}, url_text, "正在加载资源列表…")
+
+    def load_resource_list() -> None: # 在后台线程获取资源列表，避免窗口迟迟不出现；加载期间仍可手动填写资源链接并下载
+        try:
+            resource_list = ResourceHelper().fetch_resource_list()
+        except Exception as e:
+            print_error(e)
+            ui_call(apply_resource_list, {}, "获取资源列表失败，请手动填写资源链接，或重新打开本程序")
+            return
+        ui_call(apply_resource_list, resource_list)
+
+    root.after(0, thread_it, load_resource_list) # 待主循环启动后再开线程，否则加载结果可能无法通过 ui_call 回到主线程
 
     # 底部状态栏：下载进度标签与横向铺满的进度条
     # 底部各栏都以 side="bottom" 先行打包，最后才打包上方的内容区，这样窗口高度不足时被压缩的是内容区，而不是把底部控件挤出窗口
