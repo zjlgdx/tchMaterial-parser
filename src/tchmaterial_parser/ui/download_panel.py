@@ -57,7 +57,7 @@ def _pace_request() -> None:
             time.sleep(wait)
         _last_request_at = time.monotonic()
 
-def request_download(url: str):
+def request_download(url: str, range_from: int | None = None, validator: str | None = None):
     """请求资源并在镜像出错时自动切换，返回最终响应和已尝试的无凭据地址。
 
     鉴权只放在 request_headers 生成的 X-ND-AUTH 里，URL 保持原样。
@@ -67,7 +67,18 @@ def request_download(url: str):
     导致的 400 InvalidArgument（#81）。有真实 MAC 时，#76 和专题课都不需要它。
 
     400 也按鉴权/限流处理：同地址用新 nonce 退避重试，不要立刻改打 r2/r3。
+
+    所有下载请求统一带 Accept-Encoding: identity——压缩传输下字节偏移没有意义，
+    首次下载与续传若协商出不同的编码，两次响应的字节内容、长度、校验子都可能对不上。
+    传入 range_from 时附加 Range 续传；再带上 validator（ETag 或 Last-Modified）时
+    一并附加 If-Range，远端内容已变化时服务端会回整个 200 而不是 206。
     """
+    extra_headers = {"Accept-Encoding": "identity"}
+    if range_from is not None:
+        extra_headers["Range"] = f"bytes={range_from}-"
+        if validator:
+            extra_headers["If-Range"] = validator
+
     attempted_urls: list[str] = []
     last_response = None
     last_exception: RequestException | None = None
@@ -80,7 +91,7 @@ def request_download(url: str):
                 _pace_request()
                 response = session.get(
                     candidate_url,
-                    headers=request_headers(candidate_url),
+                    headers={**request_headers(candidate_url), **extra_headers},
                     stream=True,
                     timeout=REQUEST_TIMEOUT,
                 )
