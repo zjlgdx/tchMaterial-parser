@@ -1,7 +1,9 @@
 from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
+import inspect
 import os
+import re
 import tempfile
 import threading
 import time
@@ -248,9 +250,10 @@ class ChaptersTravelThroughBatchSubmissionTest(unittest.TestCase):
         self.root_directory.mkdir(exist_ok=True)
         self.directory = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
         self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
         self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
         self.context.enter_context(patch.object(panel, "thread_it", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
-        for name in ("progress_label", "download_progress_bar", "download_btn"):
+        for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn"):
             self.context.enter_context(patch.object(panel, name, Mock(), create=True))
         self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
         self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
@@ -709,6 +712,257 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
     def test_close_active_responses_does_nothing_when_empty(self) -> None:
         control = panel.BatchControl()
         panel.close_active_responses(control) # 不应该抛出
+
+
+class BatchOutcomeTest(unittest.TestCase):
+    """_run_batch_worker 的终态判定，以及 handle_batch_outcome 对 _batch_control/paused_settled 的处置。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.directory = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.notice = self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
+        self.warning = self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
+
+    def make_state(self, finished: bool = True, failed_reason: str | None = None) -> dict:
+        state = panel.create_download_state("https://example.com/book.pdf", str(Path(self.directory) / "book.pdf"))
+        state["finished"] = finished
+        state["failed_reason"] = failed_reason
+        return state
+
+    def test_outcome_is_completed_when_neither_flag_is_set(self) -> None:
+        control = panel.BatchControl()
+        control.directory = self.directory
+        panel.download_states = [self.make_state()]
+        panel._batch_control = control
+
+        panel._run_batch_worker([], control) # 空列表：没有任务要跑，只关心终态判定本身
+
+        self.notice.assert_called_once_with("下载完成", f"文件已下载到：{self.directory}")
+        self.assertIsNone(panel._batch_control)
+
+    def test_outcome_is_cancelled_when_cancel_event_is_set(self) -> None:
+        control = panel.BatchControl()
+        control.directory = self.directory
+        control.cancel_event.set()
+        panel.download_states = [self.make_state()]
+        panel._batch_control = control
+
+        panel._run_batch_worker([], control)
+
+        self.notice.assert_not_called() # 取消不弹“下载完成”
+        self.warning.assert_not_called()
+        self.assertIsNone(panel._batch_control)
+
+    def test_outcome_is_paused_when_only_pause_event_is_set(self) -> None:
+        control = panel.BatchControl()
+        control.directory = self.directory
+        control.pause_event.set()
+        panel.download_states = [self.make_state(finished=False)]
+        panel._batch_control = control
+
+        panel._run_batch_worker([], control)
+
+        self.assertTrue(control.paused_settled)
+        self.assertIs(panel._batch_control, control) # 暂停不清空控制对象，留给“继续”使用
+        self.notice.assert_not_called()
+
+    def test_cancel_takes_priority_over_pause_when_both_are_set(self) -> None:
+        control = panel.BatchControl()
+        control.directory = self.directory
+        control.pause_event.set()
+        control.cancel_event.set()
+        panel.download_states = [self.make_state(finished=False)]
+        panel._batch_control = control
+
+        panel._run_batch_worker([], control)
+
+        self.assertFalse(control.paused_settled) # 没有走到“暂停”分支
+        self.assertIsNone(panel._batch_control) # 走的是取消分支
+
+    def test_cancelled_outcome_force_finishes_any_leftover_unfinished_state(self) -> None:
+        # 批次生命周期边界上的最后一道保险：正常情况下 download_file 内部已经处理过，这里只兜底。
+        control = panel.BatchControl()
+        control.directory = self.directory
+        control.cancel_event.set()
+        leftover = self.make_state(finished=False)
+        panel.download_states = [leftover]
+        panel._batch_control = control
+
+        panel._run_batch_worker([], control)
+
+        self.assertTrue(leftover["finished"])
+        self.assertEqual(leftover["downloaded_size"], 0)
+        self.assertEqual(leftover["total_size"], 0)
+
+
+class PausedSettledInvariantTest(unittest.TestCase):
+    """paused_settled 只能被置位（= True）一次；置为 False 属于“开始新一轮”的合法复位
+    （BatchControl 的初始值、resume_current_batch 里的复位），不算第二个置位点。"""
+
+    def test_only_handle_batch_outcome_ever_sets_it_to_true(self) -> None:
+        source = inspect.getsource(panel)
+        true_assignments = re.findall(r"\.paused_settled\s*=\s*True\b", source)
+        self.assertEqual(len(true_assignments), 1, f"paused_settled 应该只有一处被置为 True，实际找到 {len(true_assignments)} 处")
+        self.assertIn("paused_settled = True", inspect.getsource(panel.handle_batch_outcome))
+
+
+class BatchControlActionsTest(unittest.TestCase):
+    """暂停/取消/继续三个按钮回调；重点是 paused_settled 划分出的两条取消路径不能走错。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.tmp_dir = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        self.context.enter_context(patch.object(panel, "_batch_control", None))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        self.context.enter_context(patch.object(panel, "thread_it", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        for name in ("progress_label", "download_progress_bar", "download_btn", "copy_btn"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.notice = self.context.enter_context(patch.object(panel.messagebox, "showinfo"))
+        self.warning = self.context.enter_context(patch.object(panel.messagebox, "showwarning"))
+
+    def make_in_progress_state(self, content: bytes = b"partial") -> dict:
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        with open(f"{save_path}.tmp", "wb") as file:
+            file.write(content)
+        state = panel.create_download_state("https://example.com/book.pdf", save_path)
+        state["finished"] = False
+        return state
+
+    def test_no_op_when_idle(self) -> None:
+        panel._batch_control = None
+        panel.cancel_current_batch() # 不应该抛出
+        panel.pause_current_batch()
+        panel.resume_current_batch()
+
+    def test_pause_sets_the_event_and_closes_active_responses(self) -> None:
+        control = panel.BatchControl()
+        panel._batch_control = control
+        closed = []
+
+        class FakeResponse:
+            def close(self) -> None:
+                closed.append(True)
+
+        control.active_responses[1] = FakeResponse()
+
+        panel.pause_current_batch()
+
+        self.assertTrue(control.pause_event.is_set())
+        self.assertEqual(closed, [True])
+
+    def test_cancel_while_batch_thread_still_running_does_not_touch_files_or_go_idle(self) -> None:
+        control = panel.BatchControl() # 从未请求过暂停：典型的“下载中点取消”
+        panel._batch_control = control
+        state = self.make_in_progress_state()
+        panel.download_states = [state]
+
+        with patch.object(panel, "set_ui_phase") as mocked_set_ui_phase:
+            panel.cancel_current_batch()
+
+        self.assertTrue(control.cancel_event.is_set())
+        self.assertIs(panel._batch_control, control) # 批次线程还活着，控制对象留给它自己收尾
+        self.assertTrue(Path(f"{state['save_path']}.tmp").exists()) # 没有被这次调用删掉
+        self.assertFalse(state["finished"])
+        mocked_set_ui_phase.assert_not_called() # 界面复位交给 handle_batch_outcome，这里不越权
+
+    def test_cancel_immediately_after_pause_request_is_handled_by_the_batch_thread(self) -> None:
+        # 设计文档 (d) 描述的窗口：已经点了暂停（pause_event 置位），但批次线程还没退出、
+        # handle_batch_outcome 还没跑（paused_settled 仍是 False）——这一刻点取消。
+        control = panel.BatchControl()
+        control.pause_event.set()
+        self.assertFalse(control.paused_settled) # 前置条件：确实还在窗口里，不是已经停稳
+        panel._batch_control = control
+        state = self.make_in_progress_state()
+        panel.download_states = [state]
+
+        with patch.object(panel, "set_ui_phase") as mocked_set_ui_phase:
+            panel.cancel_current_batch()
+
+        self.assertTrue(control.cancel_event.is_set()) # 批次线程稍后会自己发现并按取消收尾
+        self.assertIs(panel._batch_control, control) # 没有被同步清空——批次线程仍然存活
+        self.assertTrue(Path(f"{state['save_path']}.tmp").exists()) # 没有被主线程删掉
+        self.assertFalse(state["finished"]) # 没有被主线程强制终结
+        mocked_set_ui_phase.assert_not_called() # 没有走同步收尾分支
+
+    def test_cancel_while_truly_paused_cleans_up_without_a_live_batch_thread(self) -> None:
+        control = panel.BatchControl()
+        control.pause_event.set()
+        control.paused_settled = True # 已经由 handle_batch_outcome 确认批次线程退出
+        panel._batch_control = control
+        state = self.make_in_progress_state()
+        panel.download_states = [state]
+
+        panel.cancel_current_batch()
+
+        self.assertIsNone(panel._batch_control) # 没有线程会来清空，只能自己清
+        self.assertFalse(Path(f"{state['save_path']}.tmp").exists())
+        self.assertTrue(state["finished"])
+        self.assertEqual(state["downloaded_size"], 0)
+        self.assertEqual(state["total_size"], 0)
+        panel.download_btn.config.assert_called_once_with(text="下载", state="normal", command=panel.download)
+
+    def test_resume_does_nothing_before_the_batch_has_settled_as_paused(self) -> None:
+        control = panel.BatchControl()
+        control.pause_event.set() # 已经请求暂停，但还没停稳
+        panel._batch_control = control
+        panel.download_states = [self.make_in_progress_state()]
+
+        with patch.object(panel, "_run_batch_worker") as mocked_worker:
+            panel.resume_current_batch()
+
+        mocked_worker.assert_not_called()
+        self.assertTrue(control.pause_event.is_set()) # 没有被这次误判的“继续”清掉
+
+    def test_resume_clears_flags_and_resubmits_only_unfinished_states(self) -> None:
+        control = panel.BatchControl()
+        control.pause_event.set()
+        control.paused_settled = True
+        panel._batch_control = control
+        finished_state = panel.create_download_state("https://example.com/done.pdf", str(Path(self.tmp_dir) / "done.pdf"))
+        finished_state["finished"] = True
+        pending_state = self.make_in_progress_state()
+        panel.download_states = [finished_state, pending_state]
+        submitted: list[tuple] = []
+
+        def fake_run_batch_worker(states_to_run: list[dict], passed_control: "panel.BatchControl") -> None:
+            submitted.append((states_to_run, passed_control))
+
+        with patch.object(panel, "_run_batch_worker", fake_run_batch_worker):
+            panel.resume_current_batch()
+
+        self.assertFalse(control.pause_event.is_set())
+        self.assertFalse(control.paused_settled)
+        self.assertEqual(len(submitted), 1)
+        resubmitted_states, passed_control = submitted[0]
+        self.assertEqual(resubmitted_states, [pending_state]) # 只续传未完成的
+        self.assertIs(passed_control, control)
+
+    def test_resume_with_no_pending_states_settles_as_completed_defensively(self) -> None:
+        control = panel.BatchControl()
+        control.pause_event.set()
+        control.paused_settled = True
+        panel._batch_control = control
+        finished_state = panel.create_download_state("https://example.com/done.pdf", str(Path(self.tmp_dir) / "done.pdf"))
+        finished_state["finished"] = True
+        panel.download_states = [finished_state]
+
+        with patch.object(panel, "_run_batch_worker") as mocked_worker:
+            panel.resume_current_batch()
+
+        mocked_worker.assert_not_called()
+        self.assertIsNone(panel._batch_control) # 走了 handle_batch_outcome("completed", ...) 的收尾
 
 
 if __name__ == "__main__":

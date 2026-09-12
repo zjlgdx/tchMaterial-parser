@@ -460,29 +460,136 @@ def plan_download_write(current_state: dict, temp_path: str, url: str) -> tuple[
 
     return open_mode, response, attempted_urls
 
+def set_ui_phase(phase: str) -> None:
+    """统一切换底部两个按钮在四个阶段的文案/命令/启用状态；是所有离开/进入批次的路径共用的唯一收口点。
+
+    只改 text/command/state，不改 ttk style，因此浅色/深色主题不需要额外适配。
+    """
+    if phase == "idle":
+        copy_btn.config(text="解析并复制", state="normal", command=parse_and_copy)
+        download_btn.config(text="下载", state="normal", command=download)
+    elif phase == "parsing": # 点了“下载”触发的解析：暂停无从谈起，只有取消有意义
+        copy_btn.config(text="解析并复制", state="disabled", command=parse_and_copy)
+        download_btn.config(text="取消", state="normal", command=cancel_current_batch)
+    elif phase == "downloading":
+        copy_btn.config(text="暂停", state="normal", command=pause_current_batch)
+        download_btn.config(text="取消", state="normal", command=cancel_current_batch)
+    elif phase == "paused":
+        copy_btn.config(text="继续", state="normal", command=resume_current_batch)
+        download_btn.config(text="取消", state="normal", command=cancel_current_batch)
+    else:
+        raise ValueError(f"未知的界面阶段：{phase}")
+
+def pause_current_batch() -> None: # “暂停”按钮：只是发出请求，批次线程自己去发现并停稳
+    control = _batch_control
+    if control is None:
+        return
+    control.pause_event.set()
+    close_active_responses(control) # 促使在飞的请求尽快断开，而不是等它们各自撞上读超时
+
+def cancel_current_batch() -> None: # “取消”按钮：解析中/下载中/已暂停三种阶段都可能点到
+    global _batch_control
+    control = _batch_control
+    if control is None:
+        return
+    control.cancel_event.set()
+    close_active_responses(control) # 若批次线程仍存活（不论是不是刚被要求暂停），促使它尽快停下
+
+    if control.paused_settled:
+        # 批次线程已经在 handle_batch_outcome 里确认退出，没有人会再来收尾，这里同步收尾
+        for state in download_states:
+            if not state["finished"]:
+                try:
+                    os.remove(f"{state['save_path']}.tmp")
+                except OSError:
+                    pass
+                state["downloaded_size"], state["total_size"] = 0, 0
+                state["finished"] = True
+        download_progress_bar.config(value=0)
+        progress_label.config(text="等待下载")
+        set_ui_phase("idle")
+        _batch_control = None
+    # 否则批次线程仍然存活（不论是解析中、下载中，还是刚发出暂停请求但还没停稳），
+    # 交给它自己在 _run_batch_worker 退出后通过 handle_batch_outcome 收尾。
+
+def resume_current_batch() -> None: # “继续”按钮：只在批次真正停稳为暂停态时才有意义
+    control = _batch_control
+    if control is None or not control.paused_settled:
+        return # 批次线程还没确认退出（可能只是刚点了暂停），不能贸然再起一个批次线程
+    control.pause_event.clear()
+    control.paused_settled = False
+
+    pending = [state for state in download_states if not state["finished"]]
+    if not pending: # 理论上不会发生：判定为“暂停”的前提就是仍有未完成任务；防御性处理避免卡死
+        ui_call(handle_batch_outcome, "completed", control)
+        return
+
+    set_ui_phase("downloading")
+    progress_label.config(text=f"正在下载 {len(pending)} 个文件")
+    thread_it(lambda: _run_batch_worker(pending, control))
+
 def start_download_batch(targets: list[tuple[ResourceInfo, str]], directory: str) -> None:
-    global download_states
+    global download_states, _batch_control
+    if _batch_control is None: # 未经 download() 创建控制对象时（如直接调用本函数），现建一个
+        _batch_control = BatchControl()
+    control = _batch_control
+    control.directory = directory
+
     # 所有排队任务先登记，快速失败或完成的线程也不会漏算尚未启动的任务。
     states = [create_download_state(resource.url, save_path, resource.chapters) for resource, save_path in targets]
+    for state in states:
+        state["control"] = control
     download_states = states
 
-    def worker() -> None:
-        # 批量勾选可能产生数千个文件，仅保留少量工作线程，其余任务排队。
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            futures = [
-                executor.submit(download_file, state["download_url"], state["save_path"], state["chapters"], state)
-                for state in states
-            ]
-            for future in futures:
-                future.result()
-        ui_call(finish_download_batch, states, directory) # 全部线程退出后，仅由批次通知一次
+    set_ui_phase("downloading")
+    thread_it(lambda: _run_batch_worker(states, control))
 
-    thread_it(worker)
+def _run_batch_worker(states_to_run: list[dict], control: BatchControl) -> None:
+    # 批量勾选可能产生数千个文件，仅保留少量工作线程，其余任务排队；
+    # “继续”复用同一个函数，只是只提交未完成的子集，终态判定逻辑完全一致。
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(download_file, state["download_url"], state["save_path"], state["chapters"], state)
+            for state in states_to_run
+        ]
+        for future in futures:
+            future.result()
 
-def finish_download_batch(states: list[dict], directory: str) -> None: # 在主线程统一恢复控件并显示整批结果
+    if control.cancel_event.is_set(): # 取消优先于暂停
+        outcome = "cancelled"
+    elif control.pause_event.is_set():
+        outcome = "paused"
+    else:
+        outcome = "completed"
+    ui_call(handle_batch_outcome, outcome, control) # 全部线程退出后，仅由批次通知一次
+
+def handle_batch_outcome(outcome: str, control: BatchControl) -> None: # 在主线程判定/收尾一个批次的终态
+    global _batch_control
+
+    if outcome == "paused":
+        control.paused_settled = True # 批次线程确认退出后才置位；全模块唯一的赋值点
+        set_ui_phase("paused")
+        refresh_download_progress()
+        return
+
+    states = download_states
+    directory = control.directory
+    for state in states: # 批次生命周期边界上的最后一道保险；正常情况下 download_file 内部已经各自处理过
+        if not state["finished"]:
+            try:
+                os.remove(f"{state['save_path']}.tmp")
+            except OSError:
+                pass
+            state["downloaded_size"], state["total_size"] = 0, 0
+            state["finished"] = True
+
     download_progress_bar.config(value=0)
     progress_label.config(text="等待下载")
-    download_btn.config(state="normal")
+    set_ui_phase("idle")
+    _batch_control = None
+
+    if outcome == "cancelled": # 取消不弹“下载完成”弹窗
+        return
 
     failed_states = [state for state in states if state["failed_reason"]]
     if failed_states:
