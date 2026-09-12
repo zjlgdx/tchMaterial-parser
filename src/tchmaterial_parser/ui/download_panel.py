@@ -720,8 +720,11 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
                     # 磁盘状态与即将写入的 current_state 必然同源，这才应用“计划”里的值。
                     current_state["downloaded_size"] = planned_downloaded_size
                     current_state["total_size"] = planned_total_size
-                    if planned_validator is not None:
+                    if open_mode == "wb": # 全新正文：无条件覆盖校验子，哪怕这次响应没给、该清空成 None
                         current_state["validator"] = planned_validator
+                    # open_mode == "ab"（续传）：不动校验子，沿用发起这次请求时用的旧值——
+                    # planned_validator 在这条分支上恒为 None，不代表"应当清空"，只是"不归它管"，
+                    # 不能用同一个 None 表达两种语义，只能靠 open_mode 来分辨该不该写。
                     for chunk in response.iter_content( # 分块下载；total_size 续传时也是文件全长，分档依据不变
                         chunk_size=131072 if current_state["total_size"] < 20971520 else 262144 if current_state["total_size"] < 52428800 else 524288
                     ):
