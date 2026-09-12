@@ -98,49 +98,38 @@ class FakeRangeResponse:
         self.closed = True
 
 
-class SlicedRangeResponse:
-    """206 续传响应：从 full_content 的 start 位置起按 chunk_size 分块吐出真实字节（不是随机/
-    占位字节，方便断言最终文件逐字节正确），可选在吐出第 trigger_after_chunks 块之后触发一次
-    回调（例如置位 pause_event），模拟真实传输中途被暂停，而不是靠手工摆状态伪造"续传"。"""
+class SlicedResponse:
+    """按 chunk_size 分块吐出真实字节（不是随机/占位字节，方便断言最终文件逐字节正确），
+    可选在吐出第 trigger_after_chunks 块之后触发一次回调（例如置位 pause_event），用来
+    构造“传输到一半被真实暂停”的场景，而不是靠手工摆状态伪造暂停/续传后的结果——注意
+    trigger_after_chunks 是被吐出的块的下标（从 0 起），实际已写入的块数是这个值 + 1
+    （例如 trigger_after_chunks=2 会在第 3 块吐出后触发回调，届时已经写入 3 块）。
 
-    def __init__(self, full_content: bytes, start: int, chunk_size: int = 100,
-                 trigger=None, trigger_after_chunks: int | None = None) -> None:
-        total = len(full_content)
+    `start` 给出时是 206 续传响应，从 full_content 的这个位置切片，带 Content-Range/ETag；
+    `start` 为 None 时是 200 完整正文响应，把 body 整份按 chunk_size 分块吐出。"""
+
+    def __init__(self, body: bytes, start: int | None = None, chunk_size: int = 100,
+                 headers: dict | None = None, trigger=None, trigger_after_chunks: int | None = None) -> None:
         self.ok = True
-        self.status_code = 206
-        self.headers = {
-            "Content-Range": f"bytes {start}-{total - 1}/{total}",
-            "Content-Length": str(total - start),
-            "ETag": '"v1"',
-        }
-        self._body = full_content[start:]
-        self._chunk_size = chunk_size
-        self._trigger = trigger
-        self._trigger_after_chunks = trigger_after_chunks
-        self.closed = False
-
-    def iter_content(self, **kwargs) -> object:
-        for index, offset in enumerate(range(0, len(self._body), self._chunk_size)):
-            if self._trigger is not None and index == self._trigger_after_chunks:
-                self._trigger()
-            yield self._body[offset:offset + self._chunk_size]
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class SlicedFullBodyResponse:
-    """200 完整正文响应：把 body 按 chunk_size 分块吐出真实字节，可选在吐出第
-    trigger_after_chunks 块之后触发一次回调（例如置位 pause_event）——用来构造
-    “完整正文下载到一半被真实暂停”的场景，而不是靠手工摆状态伪造暂停后的结果。"""
-
-    def __init__(self, body: bytes, headers: dict | None = None, chunk_size: int = 100,
-                 trigger=None, trigger_after_chunks: int | None = None) -> None:
-        self.ok = True
-        self.status_code = 200
-        self.headers = dict(headers or {})
-        self.headers.setdefault("Content-Length", str(len(body)))
-        self._body = body
+        if start is None:
+            self.status_code = 200
+            self.headers = dict(headers or {})
+            self.headers.setdefault("Content-Length", str(len(body)))
+            self._body = body
+        else:
+            total = len(body)
+            self.status_code = 206
+            self.headers = {
+                "Content-Range": f"bytes {start}-{total - 1}/{total}",
+                "Content-Length": str(total - start),
+                # 这个 ETag 只是凑一个“看起来完整”的 206 响应头，从不会被下游代码读到：
+                # _response_usability 判定 "resumed" 时，plan_download_write 对这个分支
+                # 恒返回 validator=None（ab 分支“不归它管”），下游断言的是“旧校验子原封
+                # 不动”，不是“这个响应头真的被采纳”——调用方若断言 calls[1] 里出现了
+                # 这个值，证的不是响应头生效，而是校验子压根没被这次响应动过。
+                "ETag": '"v1"',
+            }
+            self._body = body[start:]
         self._chunk_size = chunk_size
         self._trigger = trigger
         self._trigger_after_chunks = trigger_after_chunks
@@ -614,10 +603,10 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
             calls.append((range_from, validator))
             if len(calls) == 1:
                 # 第一轮续传：真实写入 3 块（300 字节）之后被真的暂停打断
-                return SlicedRangeResponse(full_content, range_from, chunk_size=100,
-                                            trigger=control.pause_event.set, trigger_after_chunks=2), [url]
+                return SlicedResponse(full_content, start=range_from, chunk_size=100,
+                                      trigger=control.pause_event.set, trigger_after_chunks=2), [url]
             # 第二轮续传：不再暂停，一次性吐出剩余全部字节，直到完成
-            return SlicedRangeResponse(full_content, range_from, chunk_size=100), [url]
+            return SlicedResponse(full_content, start=range_from, chunk_size=100), [url]
 
         with patch.object(panel, "request_download", fake_request_download):
             panel.download_file(self.url, save_path, None, state) # 第一轮续传：真实写入部分字节后被暂停
@@ -671,8 +660,8 @@ class DownloadFileResumeIntegrationTest(unittest.TestCase):
             if len(calls) == 1:
                 # 第一轮：服务端回的是完整正文（200），没有给 ETag/Last-Modified 中的任何一个，
                 # 真实写入 3 块新正文（1500 字节）之后被真的暂停打断——不是一次性吐完再暂停
-                return SlicedFullBodyResponse(new_version, chunk_size=500,
-                                               trigger=control.pause_event.set, trigger_after_chunks=2), [url]
+                return SlicedResponse(new_version, chunk_size=500,
+                                      trigger=control.pause_event.set, trigger_after_chunks=2), [url]
             # 第二轮：校验子已被清空，理应是不带 Range 的全新请求；一次性吐出完整正文
             return FakeRangeResponse(200, {"Content-Length": str(len(new_version))}, body=new_version), [url]
 
@@ -933,7 +922,7 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertEqual(Path(f"{save_path}.tmp").read_bytes(), b"12345") # 半截内容保留
 
     def test_pause_in_flight_with_non_ok_response_is_not_treated_as_a_real_failure(self) -> None:
-        # P0-2：请求还在飞的时候用户点了暂停，随后服务端偏偏回了非 ok 状态码。
+        # 请求还在飞的时候用户点了暂停，随后服务端偏偏回了非 ok 状态码。
         # 响应是否 ok 已经不重要——这一轮不管拿到什么，都该按暂停收场，不能判成真失败。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
         state = panel.create_download_state(self.url, save_path)
@@ -1063,8 +1052,39 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
         self.assertFalse(Path(f"{save_path}.tmp").exists())
         self.assertFalse(Path(save_path).exists())
 
+    def test_finalizing_is_set_even_when_there_are_no_chapters_to_bookmark(self) -> None:
+        # 没有勾选书签时 add_bookmarks 根本不会被调用，.tmp 仍是服务端正文的逐字节完整
+        # 副本；但 finalizing 必须在“加书签 + 改名”这个收尾阶段一开始就统一置位，不能
+        # 挪进 `if chapters:` 里只在有书签时才生效——否则这条用例（没有章节、os.replace
+        # 失败、恰好命中暂停）会被误判成“暂停”而不是失败，留下一个看似可续传、实则下一轮
+        # 发起 Range 请求必然撞 416（offset 已经等于全长）的死状态，且用户会一直看到
+        # “已暂停”而不是失败提示。
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+        state["validator"] = None
+        control = panel.BatchControl()
+        state["control"] = control
+
+        server_content = os.urandom(2000)
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None):
+            return FakeRangeResponse(200, {"Content-Length": str(len(server_content)), "ETag": '"server-etag"'}, body=server_content), [url]
+
+        def failing_replace(src: str, dst: str) -> None:
+            control.pause_event.set() # os.replace 这一刻恰好被要求暂停
+            raise PermissionError("目标文件被占用")
+
+        with patch.object(panel, "request_download", fake_request_download), \
+             patch.object(panel.os, "replace", side_effect=failing_replace):
+            panel.download_file(self.url, save_path, None, state) # chapters=None，不涉及 add_bookmarks
+
+        self.assertTrue(state["finished"]) # 不能落成“暂停”——没有章节也不例外
+        self.assertIsNotNone(state["failed_reason"])
+        self.assertFalse(Path(f"{save_path}.tmp").exists())
+        self.assertFalse(Path(save_path).exists())
+
     def test_pause_requested_right_before_a_clean_stream_end_preserves_the_partial_file(self) -> None:
-        # P0-3：暂停恰好撞上流干净结束（不抛异常）。循环内 break 用的检查不会再被沿用到
+        # 暂停恰好撞上流干净结束（不抛异常）。循环内 break 用的检查不会再被沿用到
         # 循环之后的分类判断上——分类必须重新读一次 stop_reason()，否则会被当成“下载不完整”，
         # 把好不容易保住的半截文件删掉，直接打掉暂停功能本身的意义。
         save_path = str(Path(self.tmp_dir) / "book.pdf")
