@@ -65,6 +65,9 @@ class BatchControl:
         return True
 
 _batch_control: BatchControl | None = None # 当前批次；空闲时为 None
+# “解析并复制”自己的那次后台解析是否仍在进行；只在主线程读写。它与 _batch_control 是两件事：
+# 一次复制解析可以横跨整个下载批次的生命周期，批次回到空闲时它未必已经结束。
+_copy_parse_active = False
 PRIVATE_DOWNLOAD_HOSTS = tuple(f"r{index}-ndr-private.ykt.cbern.com.cn" for index in range(1, 4))
 # 私有 CDN 在短时间连打时会回 400（有时带 InvalidArgument，有时几乎空包）。
 # 立刻换 r2/r3 只会把限流打得更死；同地址稍等再签一次即可。
@@ -151,8 +154,13 @@ def request_download(url: str, range_from: int | None = None, validator: str | N
         attempted_urls.append(candidate_url)
         retry = 0
         while True:
+            _pace_request()
+            # 限流间隔会被几个工作线程争用而叠起来，停止请求完全可能落在这段等待里。
+            # 醒来后必须再看一眼：这条请求一旦发出，响应头到达之前它既不在 active_responses
+            # 里、也没有别的检查点，只能等满 REQUEST_TIMEOUT，所以宁可不发。
+            if control is not None and control.stop_requested():
+                raise close_and_stop()
             try:
-                _pace_request()
                 response = session.get(
                     candidate_url,
                     headers={**request_headers(candidate_url), **extra_headers},
@@ -372,6 +380,7 @@ def parse_urls_in_background(
     thread_it(worker)
 
 def parse_and_copy() -> None: # 解析并复制链接
+    global _copy_parse_active
     urls = {line.strip() for line in url_text.get("1.0", "end").splitlines() if line.strip()} # 获取所有非空行并去重
     if not urls:
         return
@@ -379,6 +388,8 @@ def parse_and_copy() -> None: # 解析并复制链接
     copy_btn.config(state="disabled") # 解析期间禁用按钮，避免重复触发
 
     def copy_urls(resources_info_list: list[ResourceInfo], failed_urls: set[str]) -> None: # 解析完成后在主线程复制链接
+        global _copy_parse_active
+        _copy_parse_active = False # 这次解析已经结束，无条件清位；恢复按钮则另有条件，见下一行
         if _batch_control is None: # 没有下载批次在跑才由这里恢复界面；否则听 set_ui_phase/show_parse_progress 的
             copy_btn.config(state="normal")
             progress_label.config(text="等待下载") # 解析进度已无用，恢复默认文案
@@ -404,6 +415,7 @@ def parse_and_copy() -> None: # 解析并复制链接
                 print_error(e)
                 messagebox.showerror("错误", "无法将链接复制到剪贴板，请手动复制。")
 
+    _copy_parse_active = True # 线程真起来了才置位：上面的早退路径不该留下一个永远不会被清掉的标志
     parse_urls_in_background(list(urls), False, copy_urls)
 
 def download() -> None: # 下载资源文件
@@ -566,7 +578,9 @@ def set_ui_phase(phase: str) -> None:
     只改按钮的 text/command/state，不改 ttk style，因此浅色/深色主题不需要额外适配。
     """
     if phase == "idle":
-        copy_btn.config(text="解析并复制", state="normal", command=parse_and_copy)
+        # “解析并复制”自己的那次解析可能还在飞（用户没等它结束就点了“下载”）：文案与命令照常
+        # 复位，但按钮留在禁用态，等它自己的回调来恢复，否则同一次解析会被重复触发。
+        copy_btn.config(text="解析并复制", state="disabled" if _copy_parse_active else "normal", command=parse_and_copy)
         download_btn.config(text="下载", state="normal", command=download)
         download_progress_bar.config(value=0)
         progress_label.config(text="等待下载")

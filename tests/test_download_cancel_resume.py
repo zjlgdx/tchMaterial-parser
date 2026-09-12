@@ -1684,6 +1684,69 @@ class StopBeforeResponseHeadersTest(unittest.TestCase):
             _response, rotated_urls = panel.request_download(self.url)
         self.assertEqual(len(rotated_urls), 3) # 500 依次走满 r1/r2/r3
 
+    def test_stop_during_the_pacing_wait_sends_no_request_at_all(self) -> None:
+        # 限流间隔被几个工作线程争用时会叠起来，停止请求完全可能落在这段等待里。醒来后必须
+        # 再看一眼：这条请求一旦发出，响应头到达之前既不在 active_responses 里、也没有别的
+        # 检查点，只能等满 REQUEST_TIMEOUT。把 _pace_request 打桩成可控的慢等待，不依赖真实时序。
+        # 取消和暂停都要跑一遍：这个检查点读的是“是否已请求停止”，不是“是否已请求取消”。
+        for event_name in ("cancel_event", "pause_event"):
+            with self.subTest(event=event_name):
+                state, control = self.state_with_a_paused_leftover()
+                entered_pacing = threading.Event()
+                release_pacing = threading.Event()
+                requested_urls: list[str] = []
+
+                def blocking_pace() -> None:
+                    entered_pacing.set()
+                    self.assertTrue(release_pacing.wait(timeout=5), "限流等待一直没被放行")
+
+                def fake_get(url: str, **kwargs) -> object:
+                    requested_urls.append(url)
+                    return FakeRangeResponse(200, {"Content-Length": "0"})
+
+                with patch.object(panel, "_pace_request", blocking_pace), \
+                     patch.object(panel, "session", Mock(get=fake_get)):
+                    worker = threading.Thread(target=panel.download_file, args=(self.url, self.save_path, None, state), daemon=True)
+                    worker.start()
+                    self.assertTrue(entered_pacing.wait(timeout=5), "没能进到限流等待里，测试前置条件不成立")
+                    getattr(control, event_name).set() # 用户就在这一小段等待里点了取消/暂停
+                    release_pacing.set()
+                    worker.join(timeout=5)
+
+                self.assertFalse(worker.is_alive(), "停止请求没能在限流等待之后把这条请求拦下来")
+                self.assertEqual(requested_urls, []) # 明知要停，一条请求都不该再发出去
+                self.assertIsNone(state["failed_reason"]) # 停止不是下载失败
+
+                if event_name == "cancel_event":
+                    self.assertTrue(state["finished"])
+                    self.assertFalse(Path(self.temp_path).exists()) # 取消回收尚未完整的半成品
+                else:
+                    self.assertFalse(state["finished"]) # 暂停：留给“继续”重新提交
+                    self.assertEqual(Path(self.temp_path).read_bytes(), self.PARTIAL) # 半截原样保留
+                    self.assertEqual(state["validator"], '"etag-v1"') # 校验子没被这一轮动过，仍与磁盘同源
+                    self.assert_resumes_to_completion(state, control)
+
+    def test_stop_between_mirrors_is_caught_before_the_pacing_wait(self) -> None:
+        # 换镜像之前那个检查点单独的价值：停止已经置位时，下一个镜像连限流等待都不该进，
+        # 而不是先白等一轮再被 session.get 之前的复查拦下来。
+        control = panel.BatchControl()
+        paced = []
+        requested_urls: list[str] = []
+
+        def fake_get(url: str, **kwargs) -> object:
+            requested_urls.append(url)
+            control.cancel_event.set() # 第一个镜像的请求在飞时用户点了取消
+            return FakeRangeResponse(500) # 500 会继续换镜像
+
+        self.context.enter_context(patch.object(panel, "_pace_request", lambda: paced.append(1)))
+        self.context.enter_context(patch.object(panel, "session", Mock(get=fake_get)))
+
+        with self.assertRaises(panel.BatchStopped):
+            panel.request_download(self.url, control=control)
+
+        self.assertEqual(requested_urls, [self.url])
+        self.assertEqual(len(paced), 1) # r2 连限流等待都没进
+
     def test_request_download_closes_the_useless_response_when_it_stops(self) -> None:
         # 命中停止时手上那个已经用不上的响应必须关掉，不能留着不管。
         control = panel.BatchControl()
@@ -2151,6 +2214,7 @@ class ParseAndCopyDoesNotWireCancellationTest(unittest.TestCase):
         self.addCleanup(self.context.close)
         self.context.enter_context(patch.object(panel, "download_states", []))
         self.context.enter_context(patch.object(panel, "_batch_control", None))
+        self.context.enter_context(patch.object(panel, "_copy_parse_active", False)) # 这些用例会真的起一次复制解析
         for name in ("copy_btn", "url_text", "progress_label"):
             self.context.enter_context(patch.object(panel, name, Mock(), create=True))
         self.context.enter_context(patch.object(panel.messagebox, "showinfo"))

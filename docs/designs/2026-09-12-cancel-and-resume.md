@@ -134,7 +134,7 @@ _batch_control: BatchControl | None = None  # 当前批次；空闲时为 None
   - `paused_settled` 只由 `handle_batch_outcome` 在判定结局为“暂停”时置位为 `True`，只由 `cancel_current_batch` 读取；`resume_current_batch` 在重新发起下载前把它连同 `pause_event` 一起清回初始状态，让这一轮可能再次发生的暂停从头计起。两端都在主线程（Tkinter 的事件循环单线程执行），不需要加锁，也不允许工作线程读写这个字段——它表达的是“已经请求暂停”与“暂停已经生效、线程已经退出”这两件不同的事，不能用 `pause_event` 兼职表达，否则无法区分坑 10 描述的那段窗口期。
   - 工作线程在 `request_download` 成功拿到响应后，把自己的响应对象登记进 `active_responses`（`with control.lock: control.active_responses[id(state)] = response`），下载结束/失败/暂停时移除。
 - **读取方**：工作线程在“每写完一个 chunk 之后”“开始处理下一个排队任务之前”两个点读 `cancel_event.is_set()` / `pause_event.is_set()`；两者都命中时取消优先（更彻底的操作胜出），这个优先级在 (c) 的判定逻辑与 `download_file` 的分类逻辑里保持一致。
-- **响应头到达之前的那段等待也要受约束**：响应还没登记进 `active_responses` 之前，主动断连无从下手，而 `request_download` 内部的镜像轮换与 400 退避会把一次停止的生效延迟叠成“镜像数 × 每个镜像的退避次数”条请求。因此 `request_download` 额外接收一个带默认值的关键字参数 `control`（不传时逐字保持原有行为），并在两处读这两个事件：换下一个候选镜像之前各一次、每次 400 退避重试之前各一次；退避本身改用 `control.wait_or_stop(delay)`，把等待切成小片轮询现有的两个 Event，命中就立刻醒来。判据全部从 `cancel_event`/`pause_event` 派生，不新增“取消或暂停”的合并标志——那会多出一条必须在每个置位处人工维持的不变量。命中时抛出模块级的 `BatchStopped`，由 `download_file` 现有的 `except Exception` 分支按 `stop_reason()` 分类收尾（取消→清理、暂停且未 `finalizing`→保留半截）；**不**用“返回空响应”或“`open_mode` 为 `None`”表达，那两种表达会落进“响应不可信”的失败路径，把一次正常的停止误报成下载失败。这样一次停止的生效延迟上界就只剩当前这一条在飞的请求（见 Assumptions 第 10 条）。
+- **响应头到达之前的那段等待也要受约束**：响应还没登记进 `active_responses` 之前，主动断连无从下手，而 `request_download` 内部的镜像轮换与 400 退避会把一次停止的生效延迟叠成“镜像数 × 每个镜像的退避次数”条请求。因此 `request_download` 额外接收一个带默认值的关键字参数 `control`（不传时逐字保持原有行为），并在三处读这两个事件：换下一个候选镜像之前各一次、紧邻每次 `session.get()` 之前各一次、每次 400 退避重试之前各一次。中间那一处不能省：`_pace_request()` 的限流间隔会被几个工作线程争用而叠起来，停止请求完全可能落在这段等待里，醒来后不复查就会把一条明知要停的请求发出去——它在响应头到达之前既不在 `active_responses` 里、也没有别的检查点，只能等满 `REQUEST_TIMEOUT`。这段等待本身不改成可唤醒的：它的上界只有 0.2 秒量级，且持着 `_rate_lock`，为它引入唤醒机制的复杂度远大于收益，真正昂贵的是那条被发出去的请求。退避本身则改用 `control.wait_or_stop(delay)`，把等待切成小片轮询现有的两个 Event，命中就立刻醒来。判据全部从 `cancel_event`/`pause_event` 派生，不新增“取消或暂停”的合并标志——那会多出一条必须在每个置位处人工维持的不变量。命中时抛出模块级的 `BatchStopped`，由 `download_file` 现有的 `except Exception` 分支按 `stop_reason()` 分类收尾（取消→清理、暂停且未 `finalizing`→保留半截）；**不**用“返回空响应”或“`open_mode` 为 `None`”表达，那两种表达会落进“响应不可信”的失败路径，把一次正常的停止误报成下载失败。这样一次停止的生效延迟上界就只剩当前这一条在飞的请求（见 Assumptions 第 10 条）。
 - **线程安全**：
   - `threading.Event.set/clear/is_set` 本身是线程安全的原子操作，标准库保证。
   - 唯一在工作线程与主线程之间共享的可变结构是 `active_responses`，用一个专门的 `threading.Lock` 保护增删和“遍历并关闭”，临界区只做字典操作和调用 `.close()`（`.close()` 不会长时间阻塞），与文件里现有的 `_rate_lock` 用法是同一套约定，没有引入新的加锁风格。
@@ -364,7 +364,7 @@ def cancel_current_batch() -> None:
 
 | 阶段 | `copy_btn`（左） | `download_btn`（右，强调色） |
 |---|---|---|
-| 空闲 | “解析并复制”，启用，`command=parse_and_copy` | “下载”，启用，`command=download` |
+| 空闲 | “解析并复制”，`command=parse_and_copy`；通常启用，但“解析并复制”自己的那次后台解析仍在进行时保持**禁用**，等它自己的回调来恢复 | “下载”，启用，`command=download` |
 | 解析中（点了“下载”触发的解析，非“解析并复制”自己的解析） | “解析并复制”，**禁用**（暂停无从谈起，且避免和下载共用同一次解析产生混淆）| “取消”，启用，`command=cancel_current_batch` |
 | 下载中 | “暂停”，启用，`command=pause_current_batch` | “取消”，启用，`command=cancel_current_batch` |
 | 已暂停 | “继续”，启用，`command=resume_current_batch` | “取消”，启用，`command=cancel_current_batch`（走 (d) 的同步收尾分支） |
@@ -380,6 +380,8 @@ def cancel_current_batch() -> None:
 3. 已暂停时点取消，批次线程已退出 → `cancel_current_batch` 的同步收尾分支（(d)）。
 4. 解析阶段被取消 → `start_downloads` 检测到 `cancel_event` 已置位（(c)）。
 5. 解析完成后，用户关闭了目录/保存路径对话框（不是取消，是正常放弃这次下载）→ 现有 `restore_download_btn` 分支同样改为调用 `set_ui_phase("idle")`，并把 `_batch_control` 置回 `None`（这次批次不会再继续，留着控制对象没有意义）。
+
+“空闲”这一格里 `copy_btn` 的启用状态还要多问一件事：**“解析并复制”自己的那次后台解析可能横跨整个批次的生命周期**——用户可以点完“解析并复制”不等它结束就点“下载”，批次回到空闲时它未必已经跑完。这两条路径各自只知道自己那一半，所以用一个只在主线程读写的模块级标志 `_copy_parse_active` 把它们接起来：`parse_and_copy` 在真正起线程时置位（`urls` 为空的早退路径不置位，否则会留下一个永远不会被清掉的标志），它自己的回调 `copy_urls` **无条件**清位；清位与“把按钮设回启用”必须分开写——清位总是要做，设回启用仍然只在 `_batch_control is None` 时做，否则会把正显示“暂停/继续”的批次按钮抢成“解析并复制”。`set_ui_phase("idle")` 读到标志置位时，文案与 `command` 照常复位成“解析并复制”，只把 `state` 留在 `disabled`，等那次解析自己回来恢复。这与反方向上已有的守卫（`copy_urls` 里的 `if _batch_control is None:`）正好凑成一对，两边都不会把对方正在用的按钮抢走。解析线程若抛出异常，`on_finished` 不会被调用，按钮本来就会一直停在禁用态；标志沿用同一套生命周期，不额外增加“标志永远置位”的新路径。
 
 第 2、3、4 三条路径都会让离开批次的任务最终 `finished == True`（见 (c) 的终值规定，(d) 里额外补一次强制置位），因此 `downloads_active()` 之后正确变回 `False`：`on_closing` 不会再误弹“下载任务未完成，是否退出？”，`show_parse_progress` 的进度标签也能正常复位。
 
