@@ -230,7 +230,7 @@ def plan_download_write(current_state: dict, temp_path: str, url: str):
 **下载阶段**：由**批次工作线程自己**（`start_download_batch`/续传复用的 `_run_batch_worker` 里，`with ThreadPoolExecutor(...) as executor: ...` 代码块**退出之后**）判定，判定时机是所有提交的 `future.result()` 都已经返回（即所有工作线程函数调用都已经返回，不代表文件本身处理完）：
 
 ```python
-def _run_batch_worker(states_to_run, control, all_states):
+def _run_batch_worker(states_to_run, control):
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = [executor.submit(download_file, state["download_url"], state["save_path"], state["chapters"], state) for state in states_to_run]
         for future in futures:
@@ -242,13 +242,15 @@ def _run_batch_worker(states_to_run, control, all_states):
         outcome = "paused"
     else:
         outcome = "completed"
-    ui_call(handle_batch_outcome, outcome, all_states, control)
+    ui_call(handle_batch_outcome, outcome, control)
 ```
+
+`states_to_run` 只是这一轮（初次或“继续”）实际提交给线程池的子集；批次真正的全量任务列表跟着模块级 `download_states` 走（下载面板本来就用它汇总/展示整批进度），`handle_batch_outcome` 直接读这个模块级变量，不需要单独传一份 `all_states` 进来。
 
 `handle_batch_outcome`（主线程）按结局收尾：
 
 - `"completed"`：现有 `finish_download_batch` 的行为原样保留（弹“下载完成”，展示失败清单），额外调用 `set_ui_phase("idle")`，把 `_batch_control` 置回 `None`。
-- `"cancelled"`：不弹“下载完成”弹窗；对 `all_states` 里仍是 `finished == False` 的任务做兜底清理（正常情况下这些任务在 `download_file` 内部已经各自处理过，这里只是批次生命周期边界上的最后一道保险，不是给理论上不会发生的情况加复杂逻辑）；调用 `set_ui_phase("idle")`，把 `_batch_control` 置回 `None`。
+- `"cancelled"`：不弹“下载完成”弹窗；对 `download_states` 里仍是 `finished == False` 的任务做兜底清理（正常情况下这些任务在 `download_file` 内部已经各自处理过，这里只是批次生命周期边界上的最后一道保险，不是给理论上不会发生的情况加复杂逻辑）；调用 `set_ui_phase("idle")`，把 `_batch_control` 置回 `None`。
 - `"paused"`：把 `control.paused_settled` 置为 `True`，更新界面到“已暂停”对应的按钮/文案（见 (e)），**不**清空 `_batch_control`、**不**清空 `download_states`——两者都要留给“继续”使用。
 
 `download_file` 内部对“单个文件为什么停下来”的分类，判据同样是读 `control.cancel_event`/`control.pause_event`（取消优先），并且明确规定每种情况下 `finished` 字段的终值：
