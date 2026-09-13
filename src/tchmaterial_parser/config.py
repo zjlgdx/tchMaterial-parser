@@ -19,6 +19,7 @@ mac_key: str | None = None
 token_diff: int = 0 # 与 UC Token JSON 的 diff 对应，单位毫秒
 
 REGISTRY_PATH = "Software\\tchMaterial-parser" # Windows 下存放配置的注册表键
+CONFIG_FILE_MODE = 0o600 # 配置文件保存着 Access Token，只允许文件所有者读写
 CONFIG_KEYS = { # 配置项名称到注册表值名称的映射（JSON 文件直接使用配置项名称）
     "access_token": "AccessToken",
     "mac_key": "MacKey",
@@ -52,6 +53,17 @@ def config_location() -> str: # 获取配置存放位置的描述文本，用于
     else:
         return "本工具尚未支持该操作系统下 Access Token 的持久化，下次启动时仍需手动输入 Access Token。"
 
+def restrict_config_file(target_file: Path) -> None: # 尽力把配置文件权限收紧到 0600，失败时静默忽略
+    if os_name == "Windows": # Windows 的配置存放于注册表，且 chmod 只能改只读位
+        return
+    try:
+        current = os.stat(target_file).st_mode & 0o777
+        desired = current & CONFIG_FILE_MODE # 只去掉不允许的权限位，不添新位，例如 0444 收紧为 0400
+        if desired != current:
+            os.chmod(target_file, desired)
+    except OSError: # 只读文件系统、文件不属于当前用户等情况下收紧会失败，不能影响读取配置
+        pass
+
 def load_config() -> dict[str, str]: # 读取本地存储的配置
     config: dict[str, str] = {}
 
@@ -78,6 +90,7 @@ def load_config() -> dict[str, str]: # 读取本地存储的配置
         target_file = config_file_path() # 在其他平台上，从 JSON 文件读取
         if not target_file or not os.path.exists(target_file): # 文件不存在表示尚未保存过配置
             return {}
+        restrict_config_file(target_file) # 旧版本创建的配置文件可能是 0644，读取时顺带收紧
         with open(target_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
@@ -107,8 +120,11 @@ def save_config(**updates: str) -> None: # 保存配置，并与已有配置合�
     data = load_config() # 先读取已有配置，避免覆盖其他配置项
     data.update(updates)
     os.makedirs(os.path.dirname(target_file), exist_ok=True)
-    with open(target_file, "w", encoding="utf-8") as f:
+    # 新建时就以 0600 落盘，避免写入 Access Token 后才收紧权限而留下窗口期
+    fd = os.open(target_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, CONFIG_FILE_MODE)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
+    restrict_config_file(target_file) # os.open 的权限参数只在创建文件时生效，已存在的旧文件需显式收紧
 
 def apply_static_headers() -> None:
     """更新全局占位头。私有下载不要用这份 X-ND-AUTH，应走 network.request_headers。"""
