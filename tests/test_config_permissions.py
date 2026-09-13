@@ -29,6 +29,8 @@ class ConfigFilePermissionTest(unittest.TestCase):
 
     def write_existing_file(self, mode: int, **values: str) -> None: # 造一个指定权限的现存配置文件
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.config_path.exists(): # 上一轮可能留下不可写的权限
+            os.chmod(self.config_path, 0o600)
         self.config_path.write_text(json.dumps(values), encoding="utf-8")
         os.chmod(self.config_path, mode)
 
@@ -70,13 +72,26 @@ class ConfigFilePermissionTest(unittest.TestCase):
         self.assertEqual(stored["theme"], "dark") # 其他配置项仍应被合并保留
 
     def test_save_tightens_existing_file_without_help_from_the_read_path(self) -> None:
-        # save_config 会先调用 load_config，为验证写入路径自身也会收紧权限，这里屏蔽读取路径的收紧
+        # save_config 会先调用 load_config，为验证写入路径自身也会收紧权限，这里屏蔽读取已有配置这一步
         self.write_existing_file(0o644, access_token="old-token")
 
-        with patch.object(config, "restrict_config_file", lambda target_file: None):
+        with patch.object(config, "load_config", dict):
             config.save_config(access_token=TOKEN)
 
         self.assertEqual(self.file_mode(), 0o600)
+        self.assertEqual(config.load_config().get("access_token"), TOKEN)
+
+    def test_save_does_not_fail_when_tightening_fails(self) -> None:
+        # 文件可写但改不了权限（属于别的 UID、exFAT/网络盘等）时，收紧失败不能让已经写成功的保存报错：
+        # 调用方 app.switch_theme() 没有兜底，token_window 也只接住 ValueError
+        self.write_existing_file(0o644, theme="dark") # 用现存的 0644 文件，确保写入后确实会尝试 chmod
+
+        with patch("os.chmod", side_effect=PermissionError("Operation not permitted")):
+            config.save_config(access_token=TOKEN) # 不应抛出异常
+
+        stored = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["access_token"], TOKEN)
+        self.assertEqual(stored["theme"], "dark")
         self.assertEqual(config.load_config().get("access_token"), TOKEN)
 
     def test_shorter_save_overwrites_the_whole_file(self) -> None:
@@ -99,6 +114,33 @@ class ConfigFilePermissionTest(unittest.TestCase):
 
         self.assertEqual(config.load_config().get("access_token"), TOKEN)
         self.assertEqual(self.file_mode(), 0o600)
+
+    def test_load_does_not_add_the_owner_write_bit(self) -> None:
+        self.write_existing_file(0o444, access_token=TOKEN) # 用户特意设成只读，防止配置被改写
+
+        self.assertEqual(config.load_config().get("access_token"), TOKEN)
+        self.assertEqual(self.file_mode(), 0o400) # 收紧只应去掉同组与其他人的读权限，不能把属主写位加回来
+
+    def test_restrict_only_removes_the_extra_permission_bits(self) -> None:
+        for current, expected in {
+            0o644: 0o600, 0o444: 0o400, 0o604: 0o600, 0o640: 0o600,
+            0o666: 0o600, 0o400: 0o400, 0o200: 0o200, 0o000: 0o000,
+        }.items():
+            with self.subTest(mode=oct(current)):
+                self.write_existing_file(current, access_token=TOKEN)
+
+                config.restrict_config_file(self.config_path)
+
+                self.assertEqual(self.file_mode(), expected)
+                self.assertEqual(expected, current & 0o600) # 结果始终是「原权限去掉不允许的位」
+
+    def test_restrict_leaves_an_already_tight_file_untouched(self) -> None:
+        self.write_existing_file(0o600, access_token=TOKEN)
+
+        with patch("os.chmod") as chmod_spy:
+            config.restrict_config_file(self.config_path)
+
+        chmod_spy.assert_not_called() # 权限已经合规时不做无谓的写入，只读文件系统上也就不会白白失败
 
     def test_load_keeps_permission_stricter_than_owner_read_write(self) -> None:
         self.write_existing_file(0o400, access_token=TOKEN)

@@ -57,8 +57,10 @@ def restrict_config_file(target_file: Path) -> None: # 尽力把配置文件权�
     if os_name == "Windows": # Windows 的配置存放于注册表，且 chmod 只能改只读位
         return
     try:
-        if os.stat(target_file).st_mode & 0o777 & ~CONFIG_FILE_MODE: # 存在超出 0600 的权限位才收紧
-            os.chmod(target_file, CONFIG_FILE_MODE)
+        current = os.stat(target_file).st_mode & 0o777
+        desired = current & CONFIG_FILE_MODE # 只去掉不允许的权限位，不添新位，例如 0444 收紧为 0400
+        if desired != current:
+            os.chmod(target_file, desired)
     except OSError: # 只读文件系统、文件不属于当前用户等情况下收紧会失败，不能影响读取配置
         pass
 
@@ -122,7 +124,7 @@ def save_config(**updates: str) -> None: # 保存配置，并与已有配置合�
     fd = os.open(target_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, CONFIG_FILE_MODE)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
-    os.chmod(target_file, CONFIG_FILE_MODE) # os.open 的权限参数只在创建文件时生效，已存在的旧文件需显式收紧
+    restrict_config_file(target_file) # os.open 的权限参数只在创建文件时生效，已存在的旧文件需显式收紧
 
 def apply_static_headers() -> None:
     """更新全局占位头。私有下载不要用这份 X-ND-AUTH，应走 network.request_headers。"""
