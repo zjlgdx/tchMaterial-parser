@@ -2,6 +2,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 import inspect
+import io
 import os
 import re
 import tempfile
@@ -9,6 +10,9 @@ import threading
 import time
 import unittest
 
+from pypdf import PdfReader, PdfWriter
+
+from src.tchmaterial_parser import bookmarks
 from src.tchmaterial_parser.api import ResourceInfo
 from src.tchmaterial_parser.ui import download_panel as panel
 
@@ -1529,6 +1533,55 @@ class CancelAndPauseInDownloadFileTest(unittest.TestCase):
     def test_close_active_responses_does_nothing_when_empty(self) -> None:
         control = panel.BatchControl()
         panel.close_active_responses(control) # 不应该抛出
+
+
+class BookmarkFailureStillDeliversAnIntactPdfTest(unittest.TestCase):
+    """书签写入中途失败时，这次下载从用户视角看仍然是成功的：交付一份完好的、只是没有书签的 PDF。"""
+
+    def setUp(self) -> None:
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        self.root_directory = Path(__file__).resolve().parents[1] / ".tmp"
+        self.root_directory.mkdir(exist_ok=True)
+        self.tmp_dir = self.context.enter_context(tempfile.TemporaryDirectory(dir=self.root_directory))
+        self.context.enter_context(patch.object(panel, "download_states", []))
+        for name in ("progress_label", "download_progress_bar"):
+            self.context.enter_context(patch.object(panel, name, Mock(), create=True))
+        self.context.enter_context(patch.object(panel, "ui_call", lambda fn, *args, **kwargs: fn(*args, **kwargs)))
+        self.url = "https://example.com/book.pdf"
+
+    def test_bookmark_write_failure_delivers_the_downloaded_pdf_without_bookmarks(self) -> None:
+        # 端到端：走真实的 add_bookmarks（不打桩），让写书签在中途失败。几十 MB 已经完整下完的
+        # 正文不能因为一次书签写入的小故障被整个丢弃，也不能交付一份被截断的半截 PDF——
+        # 最终必须是一份能被 PdfReader 打开的完好 PDF，failed_reason 为 None。
+        writer = PdfWriter()
+        for _ in range(5):
+            writer.add_blank_page(width=200, height=200)
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        server_content = buffer.getvalue()
+
+        save_path = str(Path(self.tmp_dir) / "book.pdf")
+        state = panel.create_download_state(self.url, save_path)
+
+        def fake_request_download(url: str, range_from: int | None = None, validator: str | None = None, *, control: panel.BatchControl | None = None):
+            return FakeRangeResponse(200, {"Content-Length": str(len(server_content))}, body=server_content), [url]
+
+        def failing_write(self_writer, stream) -> None: # 先写出若干字节，再抛异常
+            stream.write(b"%PDF-1.7\n" + b"0" * 4096)
+            stream.flush()
+            raise OSError("No space left on device")
+
+        with patch.object(panel, "request_download", fake_request_download), \
+             patch.object(bookmarks.PdfWriter, "write", failing_write):
+            panel.download_file(self.url, save_path, [{"title": "第一章", "page_index": 1}], state)
+
+        self.assertTrue(state["finished"])
+        self.assertIsNone(state["failed_reason"]) # 用户视角：这次下载仍然成功，只是没有书签
+        self.assertEqual(Path(save_path).read_bytes(), server_content) # 交付的就是服务端正文本身
+        with open(save_path, "rb") as file:
+            self.assertEqual(len(PdfReader(file).pages), 5) # 且确实是一份能打开的完好 PDF
+        self.assertEqual({entry.name for entry in Path(self.tmp_dir).iterdir()}, {"book.pdf"}) # 不留任何临时文件
 
 
 class WaitOrStopTest(unittest.TestCase):
