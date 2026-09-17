@@ -321,6 +321,36 @@ class ResourceTreeUITest(unittest.TestCase):
             self.hover(tree, "books:primary:c0")
             self.assertTrue(any(label.cget("image") for label in self.tooltip_labels()))
 
+    def test_hover_reload_dispatches_once_while_all_slots_are_busy(self):
+        started = []
+        with patch.object(resource_tree, "COVER_WORKERS", 1), \
+                patch.object(resource_tree, "thread_it", lambda worker, *args: started.append((worker, args))), \
+                patch.object(resource_tree, "visible_tree_rows", lambda _treeview: ["books:primary:c1"]):
+            tree = self.build_tree(COVER_RESOURCES)
+            self.assertEqual([args[0] for _worker, args in started], ["books:primary:c1"]) # 唯一的名额已占满
+
+            self.hover(tree, "books:primary:c0") # 预览图没有缓存，悬停会重新取
+            self.hover(tree, "books:primary:c2")
+            self.hover(tree, "books:primary:c0")
+            dispatched = [args[0] for _worker, args in started]
+            self.assertEqual(dispatched.count("books:primary:c0"), 1) # 已在下载的项不重复派发
+
+            self.scan(tree)
+            self.assertEqual([args[0] for _worker, args in started], dispatched) # 可见扫描也不会再派发它
+
+    def test_hover_reload_dispatches_immediately_when_slots_are_free(self):
+        started = []
+        with patch.object(resource_tree, "thread_it", lambda worker, *args: started.append((worker, args))), \
+                patch.object(resource_tree, "visible_tree_rows", lambda _treeview: []):
+            tree = self.build_tree(COVER_RESOURCES)
+            self.assertEqual(started, []) # 没有可见行就没有封面排队
+
+            self.hover(tree, "books:primary:c0")
+            self.assertEqual([args[0] for _worker, args in started], ["books:primary:c0"])
+            self.hover(tree, "books:primary:c1")
+            self.hover(tree, "books:primary:c0")
+            self.assertEqual([args[0] for _worker, args in started].count("books:primary:c0"), 1)
+
     def test_cover_and_checkbox_survive_search_clear_and_theme_changes(self):
         self.expand("books:primary")
         width = self.image("books:primary:b").width

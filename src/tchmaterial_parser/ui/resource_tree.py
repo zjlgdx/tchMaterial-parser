@@ -288,9 +288,13 @@ def build_resource_tree(
         if item_id in loading_tree_images or item_id in failed_tree_images:
             return
         thumbnails = (tree_item_data.get(item_id) or {}).get("custom_properties", {}).get("thumbnails")
-        if thumbnails:
-            pending_covers.insert(0, (item_id, thumbnails[0])) # 用户正看着这一项，排在可见行前面
-            pump_cover_queue()
+        if not thumbnails:
+            return
+
+        # 用户正看着这一项，直接下载而不排队：排队会被下一次可见扫描的整体替换挤掉，名额占满时更是永远轮不到
+        pending_covers[:] = [cover for cover in pending_covers if cover[0] != item_id]
+        loading_tree_images.add(item_id)
+        thread_it(load_tree_icon, item_id, thumbnails[0])
 
     def apply_tree_icon(item_id: str, image: Image.Image | None) -> None:
         loading_tree_images.discard(item_id)
@@ -324,6 +328,8 @@ def build_resource_tree(
     def pump_cover_queue() -> None: # 在并发上限内把待载封面交给后台线程
         while pending_covers and len(loading_tree_images) < COVER_WORKERS:
             item_id, url = pending_covers.pop(0)
+            if item_id in loading_tree_images: # 已经在下载的项不占名额，也不重复派发
+                continue
             loading_tree_images.add(item_id)
             thread_it(load_tree_icon, item_id, url)
 
