@@ -310,6 +310,7 @@ class ResourceTreeUITest(unittest.TestCase):
                 patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)):
             tree = self.build_tree(COVER_RESOURCES)
             self.assertEqual(len(started), resource_tree.COVER_WORKERS) # 同时在下载的封面不超过并发上限
+            self.assertTrue(all(worker.__name__ == "load_tree_icon" for worker, _args in started))
 
             visible[:] = [f"books:primary:c{index}" for index in range(6, 10)]
             self.scan(tree)
@@ -398,6 +399,22 @@ class ResourceTreeUITest(unittest.TestCase):
                 self.root.update()
 
             self.assertEqual([args[0] for _worker, args in started], ["books:primary:c0", "books:primary:c1"])
+
+    def test_cover_downloads_run_on_daemon_threads(self):
+        created = []
+        real_thread = threading.Thread
+
+        def recording_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            created.append(thread)
+            return thread
+
+        with patch.object(resource_tree, "thread_it", runtime.thread_it), \
+                patch.object(threading, "Thread", recording_thread):
+            self.expand("books:primary") # 展开后的扫描会真的起线程去下载封面
+
+        self.assertTrue(created)
+        self.assertTrue(all(thread.daemon for thread in created)) # 关窗时不会被在飞的封面请求拖住
 
     def test_hover_reload_dispatches_once_while_all_slots_are_busy(self):
         started = []
@@ -577,15 +594,6 @@ def test_visible_rows_are_empty_without_items():
     tree = FakeTreeview(0)
     assert resource_tree.visible_tree_rows(tree) == []
     assert tree.identify_calls == []
-
-
-def test_cover_downloads_run_on_daemon_threads():
-    # 封面下载走 thread_it，退出时不能因为还有请求在飞而卡住主进程
-    finished = threading.Event()
-    daemon = []
-    runtime.thread_it(lambda: (daemon.append(threading.current_thread().daemon), finished.set()))
-    assert finished.wait(5)
-    assert daemon == [True]
 
 
 @pytest.mark.parametrize("case", unittest.defaultTestLoader.getTestCaseNames(ResourceTreeUITest))
