@@ -88,6 +88,32 @@ def draw_checkbox_image(size: int, state: str, colors: dict[str, str]) -> Image.
     return image.resize((target_size, target_size), Image.Resampling.LANCZOS)
 
 STATUS_ITEM_ID = "__internal_status" # 资源目录尚未就绪时，树视图中提示行的树项 ID
+PLACEHOLDER_SUFFIX = ":__internal_placeholder" # 占位子项的树项 ID 后缀；Tk 只给有子项的行画展开箭头
+SCAN_DEBOUNCE_MS = 80 # 滚动停下多久后扫描一次可见行
+SCAN_MAX_WAIT_MS = 250 # 连续滚动时两次扫描的最长间隔，避免去抖一直被推迟
+VISIBLE_SCAN_PROBE_STEP = 2 # 扫描起点的试探步长，用于跨过树视图上边框
+PREVIEW_CACHE_SIZE = 200 # 悬停预览缓存的封面张数
+COVER_WORKERS = 4 # 同时下载封面的线程数
+
+def visible_tree_rows(treeview: ttk.Treeview) -> list[str]: # 逐行取出当前屏幕上的树项
+    if not treeview.get_children():
+        return []
+
+    rows: list[str] = []
+    height = treeview.winfo_height()
+    y = 0
+    while y < height:
+        item_id = treeview.identify_row(y)
+        # 上边框那几个像素要么取不到行，要么取到视口上方的行（其 bbox 为空），两种都算未命中
+        box = treeview.bbox(item_id) if item_id else None
+        if not box:
+            if rows:
+                break
+            y += VISIBLE_SCAN_PROBE_STEP
+            continue
+        rows.append(item_id)
+        y = box[1] + box[3] + 1
+    return rows
 
 def build_resource_tree(
     pane: ttk.Frame, resource_list: dict[str, dict], url_text: tk.Text, status: str = "",

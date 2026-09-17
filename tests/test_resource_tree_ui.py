@@ -18,6 +18,8 @@ if __name__ == "__main__":
 from src.tchmaterial_parser.ui import resource_tree, runtime, theme
 
 
+treeview_bbox = ttk.Treeview.bbox # 未打桩的实现，供需要真实几何的用例使用
+
 RESOURCES = {"books": {"display_name": "电子教材", "children": {
     "primary": {"display_name": "小学", "children": {
         "a": {"display_name": "语文 一年级上册", "content_id": "a"},
@@ -118,6 +120,23 @@ class ResourceTreeUITest(unittest.TestCase):
         top = (image.height - expected.height) // 2
         self.assertEqual(image.crop((0, top, 18, top + 18)).convert("RGBA").tobytes(), expected.tobytes())
 
+    def test_visible_rows_follow_real_scrolling(self):
+        with patch.object(ttk.Treeview, "bbox", treeview_bbox): # 本用例要的就是真实几何
+            window = tk.Toplevel(self.root)
+            window.geometry("360x300+60+60")
+            tree = ttk.Treeview(window, style="Custom.Treeview", show="tree", height=8)
+            tree.pack(fill="both", expand=True)
+            for index in range(60):
+                tree.insert("", "end", iid=f"row{index}", text=f"条目 {index}")
+            self.root.update()
+            tree.yview_scroll(1, "units")
+            self.root.update()
+
+            rows = resource_tree.visible_tree_rows(tree)
+            self.assertTrue(rows)
+            self.assertTrue(tree.bbox(rows[0]))
+            self.assertNotIn("row0", rows) # 上边框里取到的是视口上方那一行，不能算可见
+
     def test_cover_and_checkbox_survive_search_clear_and_theme_changes(self):
         width = self.image("books:primary:b").width
         self.assertGreater(width, 24)
@@ -212,6 +231,56 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assert_state("books:primary:b", "checked")
         self.toggle("books:primary:b")
         self.assertEqual(self.lines(), {external})
+
+
+class FakeTreeview: # 按 Tk 的真实几何模拟树视图：上边框内取不到可见行，bbox 是唯一的可见性判据
+    def __init__(self, item_count, height=460, first_row=0, border=4, row_height=38):
+        self.items = [f"n{index}" for index in range(item_count)]
+        self.height = height
+        self.first_row = first_row
+        self.border = border
+        self.row_height = row_height
+        self.identify_calls = []
+
+    def get_children(self, item=""):
+        return tuple(self.items) if not item else ()
+
+    def winfo_height(self):
+        return self.height
+
+    def identify_row(self, y):
+        self.identify_calls.append(y)
+        # 上边框带：未滚动时取不到行，滚动后取到的是视口上方那一行
+        index = self.first_row - 1 if y < self.border else self.first_row + (y - self.border) // self.row_height
+        return self.items[index] if 0 <= index < len(self.items) else ""
+
+    def bbox(self, item):
+        index = self.items.index(item)
+        top = self.border + (index - self.first_row) * self.row_height
+        return "" if index < self.first_row or top >= self.height else (0, top, 100, self.row_height)
+
+
+def test_visible_rows_start_below_the_top_border():
+    tree = FakeTreeview(50)
+    assert resource_tree.visible_tree_rows(tree) == [f"n{index}" for index in range(12)]
+    assert max(tree.identify_calls) < tree.height
+
+
+def test_visible_rows_skip_the_row_above_the_viewport_after_scrolling():
+    tree = FakeTreeview(50, first_row=1)
+    assert resource_tree.visible_tree_rows(tree) == [f"n{index}" for index in range(1, 13)]
+
+
+def test_visible_rows_probe_the_top_border_a_bounded_number_of_times():
+    tree = FakeTreeview(50, border=6)
+    assert resource_tree.visible_tree_rows(tree)[0] == "n0"
+    assert [y for y in tree.identify_calls if y < tree.border] == [0, 2, 4]
+
+
+def test_visible_rows_are_empty_without_items():
+    tree = FakeTreeview(0)
+    assert resource_tree.visible_tree_rows(tree) == []
+    assert tree.identify_calls == []
 
 
 @pytest.mark.parametrize("case", unittest.defaultTestLoader.getTestCaseNames(ResourceTreeUITest))
