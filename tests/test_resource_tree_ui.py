@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 import unittest
@@ -193,13 +194,20 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(image.crop((0, top, 18, top + 18)).convert("RGBA").tobytes(), expected.tobytes())
 
     def test_visible_rows_follow_real_scrolling(self):
-        window = tk.Toplevel(self.root)
-        window.geometry("360x300+60+60")
-        tree = ttk.Treeview(window, style="Custom.Treeview", show="tree", height=8)
+        # 真实几何只有被窗口管理器映射后才有；Windows 上隐藏窗口的子窗口不会被映射，所以直接用主窗口。
+        self.root.geometry("360x300+60+60")
+        self.root.deiconify()
+        self.addCleanup(self.root.withdraw)
+        tree = ttk.Treeview(self.root, style="Custom.Treeview", show="tree", height=8)
         tree.pack(fill="both", expand=True)
         for index in range(60):
             tree.insert("", "end", iid=f"row{index}", text=f"条目 {index}")
-        self.root.update()
+
+        deadline = time.monotonic() + 5 # 映射由窗口管理器异步完成，等待要有上限
+        while not tree.winfo_ismapped() and time.monotonic() < deadline:
+            self.root.update()
+        self.assertTrue(tree.winfo_ismapped(), "窗口未被映射，取不到真实几何")
+
         tree.yview_scroll(1, "units")
         self.root.update()
 
