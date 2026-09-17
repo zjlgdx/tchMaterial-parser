@@ -338,12 +338,9 @@ def build_resource_tree(
         pump_cover_queue()
 
     scan_after_id: str | None = None
-    last_cover_scan = 0.0
+    deferred_since = 0.0 # 本轮推迟从何时开始，用来限制扫描最多被推迟多久
 
     def refresh_visible_items(queue_covers: bool) -> None: # 只处理屏幕上的行，开销与目录规模无关
-        nonlocal last_cover_scan
-        if queue_covers:
-            last_cover_scan = time.monotonic()
         covers: list[tuple[str, str]] = []
         for item_id in visible_tree_rows(treeview):
             resource_data = tree_item_data.get(item_id) # 提示行与占位子项不是资源
@@ -359,23 +356,27 @@ def build_resource_tree(
         if queue_covers:
             queue_tree_icons(covers)
 
+    def run_cover_scan() -> None: # 推迟到期，扫一次可见行并重新开始计时
+        nonlocal scan_after_id, deferred_since
+        scan_after_id = None
+        deferred_since = 0.0
+        refresh_visible_items(True)
+
     def schedule_visible_refresh() -> None: # 滚动期间只保留一个待执行的扫描
-        nonlocal scan_after_id
-        if scan_after_id:
+        nonlocal scan_after_id, deferred_since
+        now = time.monotonic()
+        if scan_after_id is None: # 新一轮推迟从这一刻算起，手势的第一个事件不会当场扫描
+            deferred_since = now
+        else:
             runtime.root.after_cancel(scan_after_id)
             scan_after_id = None
-        waited = (time.monotonic() - last_cover_scan) * 1000
-        if waited >= SCAN_MAX_WAIT_MS: # 一直滚动时也要按时补上封面
-            refresh_visible_items(True)
-            return
-
-        def run_scan() -> None:
-            nonlocal scan_after_id
-            scan_after_id = None
-            refresh_visible_items(True)
 
         # 每次重排都缩短到距最长间隔的剩余时间，滚动不停时扫描也不会被一再推迟
-        scan_after_id = runtime.root.after(min(SCAN_DEBOUNCE_MS, round(SCAN_MAX_WAIT_MS - waited)), run_scan)
+        delay = min(SCAN_DEBOUNCE_MS, round(SCAN_MAX_WAIT_MS - (now - deferred_since) * 1000))
+        if delay <= 0:
+            run_cover_scan()
+            return
+        scan_after_id = runtime.root.after(delay, run_cover_scan)
 
     def on_tree_view_change(first: str, last: str) -> None:
         auto_hide_scrollbar(treeview_scrollbar, first, last)
