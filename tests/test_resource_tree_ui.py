@@ -18,7 +18,16 @@ if __name__ == "__main__":
 from src.tchmaterial_parser.ui import resource_tree, runtime, theme
 
 
-treeview_bbox = ttk.Treeview.bbox # 未打桩的实现，供需要真实几何的用例使用
+visible_tree_rows = resource_tree.visible_tree_rows # 未打桩的实现，供需要真实几何的用例使用
+
+
+def all_tree_rows(treeview): # 隐藏窗口没有真实几何，测试里把已插入的树项全部视为可见
+    def walk(parent):
+        for item in treeview.get_children(parent):
+            yield item
+            yield from walk(item)
+
+    return list(walk(""))
 
 RESOURCES = {"books": {"display_name": "电子教材", "children": {
     "primary": {"display_name": "小学", "children": {
@@ -59,7 +68,7 @@ class ResourceTreeUITest(unittest.TestCase):
         theme.apply_theme("light")
         enter(patch.object(resource_tree, "thread_it", lambda fn, *args: fn(*args)))
         # 隐藏测试窗口，单独模拟封面进入可视区域，仍执行真实的加载与图片合成代码。
-        enter(patch.object(ttk.Treeview, "bbox", return_value=(0, 0, 100, 38)))
+        enter(patch.object(resource_tree, "visible_tree_rows", all_tree_rows))
         cover = io.BytesIO()
         Image.new("RGB", (80, 112), "#c4ded2").save(cover, format="PNG")
         response = type("CoverResponse", (), {"ok": True, "content": cover.getvalue()})()
@@ -121,21 +130,20 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(image.crop((0, top, 18, top + 18)).convert("RGBA").tobytes(), expected.tobytes())
 
     def test_visible_rows_follow_real_scrolling(self):
-        with patch.object(ttk.Treeview, "bbox", treeview_bbox): # 本用例要的就是真实几何
-            window = tk.Toplevel(self.root)
-            window.geometry("360x300+60+60")
-            tree = ttk.Treeview(window, style="Custom.Treeview", show="tree", height=8)
-            tree.pack(fill="both", expand=True)
-            for index in range(60):
-                tree.insert("", "end", iid=f"row{index}", text=f"条目 {index}")
-            self.root.update()
-            tree.yview_scroll(1, "units")
-            self.root.update()
+        window = tk.Toplevel(self.root)
+        window.geometry("360x300+60+60")
+        tree = ttk.Treeview(window, style="Custom.Treeview", show="tree", height=8)
+        tree.pack(fill="both", expand=True)
+        for index in range(60):
+            tree.insert("", "end", iid=f"row{index}", text=f"条目 {index}")
+        self.root.update()
+        tree.yview_scroll(1, "units")
+        self.root.update()
 
-            rows = resource_tree.visible_tree_rows(tree)
-            self.assertTrue(rows)
-            self.assertTrue(tree.bbox(rows[0]))
-            self.assertNotIn("row0", rows) # 上边框里取到的是视口上方那一行，不能算可见
+        rows = visible_tree_rows(tree)
+        self.assertTrue(rows)
+        self.assertTrue(tree.bbox(rows[0]))
+        self.assertNotIn("row0", rows) # 上边框里取到的是视口上方那一行，不能算可见
 
     def test_cover_and_checkbox_survive_search_clear_and_theme_changes(self):
         width = self.image("books:primary:b").width

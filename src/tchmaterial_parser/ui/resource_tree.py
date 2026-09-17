@@ -2,6 +2,7 @@
 # 左侧资源列表：勾选教材或分类、搜索筛选、封面按需加载与悬停预览
 
 import io
+import time
 import tkinter as tk
 from collections.abc import Callable, Iterator
 from tkinter import ttk
@@ -278,14 +279,39 @@ def build_resource_tree(
             loading_tree_images.add(item_id)
             thread_it(load_tree_icon, item_id, thumbnails[0])
 
-    def load_visible_tree_icons() -> None: # 搜索或滚动后只加载当前可见资源的封面
-        for item_id, resource_data in tree_item_data.items():
-            if not resource_data.get("children") and treeview.bbox(item_id):
+    scan_after_id: str | None = None
+    last_cover_scan = 0.0
+
+    def refresh_visible_items(queue_covers: bool) -> None: # 只处理屏幕上的行，开销与目录规模无关
+        nonlocal last_cover_scan
+        if queue_covers:
+            last_cover_scan = time.monotonic()
+        for item_id in visible_tree_rows(treeview):
+            resource_data = tree_item_data.get(item_id) # 提示行与占位子项不是资源
+            if resource_data is None:
+                continue
+            if queue_covers and not resource_data.get("children"):
                 queue_tree_icon(item_id)
+
+    def schedule_visible_refresh() -> None: # 滚动期间只保留一个待执行的扫描
+        nonlocal scan_after_id
+        if scan_after_id:
+            runtime.root.after_cancel(scan_after_id)
+            scan_after_id = None
+        if time.monotonic() - last_cover_scan >= SCAN_MAX_WAIT_MS / 1000: # 一直滚动时也要按时补上封面
+            refresh_visible_items(True)
+            return
+
+        def run_scan() -> None:
+            nonlocal scan_after_id
+            scan_after_id = None
+            refresh_visible_items(True)
+
+        scan_after_id = runtime.root.after(SCAN_DEBOUNCE_MS, run_scan)
 
     def on_tree_view_change(first: str, last: str) -> None:
         auto_hide_scrollbar(treeview_scrollbar, first, last)
-        ui_call(load_visible_tree_icons)
+        schedule_visible_refresh()
 
     def refresh_resource_tree() -> None: # 根据搜索词重建树视图
         nonlocal tree_content_width
@@ -308,7 +334,7 @@ def build_resource_tree(
 
         result_count = count_resource_items(visible_items)
         search_status_label.config(text=f"{result_count} 项" if result_count else "无匹配资源")
-        ui_call(load_visible_tree_icons)
+        ui_call(refresh_visible_items, True)
 
     def insert_resource_urls(urls: list[str]) -> None: # 将链接追加到 URL 输入框，跳过已存在的行
         existing_lines = {line.strip() for line in url_text.get("1.0", "end").splitlines()}
@@ -536,7 +562,6 @@ def build_resource_tree(
     search_var.trace_add("write", schedule_search)
     treeview.configure(yscrollcommand=on_tree_view_change)
     treeview.bind("<space>", on_tree_space)
-    treeview.bind("<<TreeviewOpen>>", lambda _event: ui_call(load_visible_tree_icons))
     treeview.bind("<Configure>", lambda event: resize_tree_column(event.width))
     treeview.bind("<Motion>", on_tree_motion)
     treeview.bind("<Leave>", lambda _event: leave_tree())
