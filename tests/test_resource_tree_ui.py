@@ -178,8 +178,15 @@ class ResourceTreeUITest(unittest.TestCase):
         enter = self.context.enter_context
 
         def after(delay, callback=None, *args):
-            timers.append([delay, callback, f"timer{len(timers)}"])
-            return timers[-1][2]
+            record = [delay, None, f"timer{len(timers)}"]
+
+            def fire(): # Tk 里定时器触发一次就失效，这里照做
+                record[1] = None
+                callback(*args)
+
+            record[1] = fire
+            timers.append(record)
+            return record[2]
 
         def after_cancel(timer_id):
             for timer in timers:
@@ -393,6 +400,12 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(len(scans) - before, 1) # 到点后只扫一次
         self.assertEqual(started, ["books:primary:c0"])
 
+        clock[0] += 0.005
+        self.scroll(tree) # 扫过之后再滚动，重新进入一轮推迟
+        pending = self.live_timers(timers)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0][0], resource_tree.SCAN_DEBOUNCE_MS)
+
     def test_first_event_after_an_idle_period_is_still_deferred(self):
         clock = [1000.0]
         tree, started, _scans = self.cover_scan_probe(clock)
@@ -423,6 +436,12 @@ class ResourceTreeUITest(unittest.TestCase):
         self.scroll(tree)
         self.assertEqual(started, ["books:primary:c0"]) # 立刻扫一次
         self.assertEqual(self.live_timers(timers), []) # 并重新开始计时
+
+        clock[0] += 0.005
+        self.scroll(tree)
+        pending = self.live_timers(timers)
+        self.assertEqual(len(pending), 1) # 下一次事件重新进入一轮推迟
+        self.assertEqual(pending[0][0], resource_tree.SCAN_DEBOUNCE_MS)
 
     def test_second_scan_does_not_repaint_unchanged_rows(self):
         tree = self.build_tree(MANY_RESOURCES)
