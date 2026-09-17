@@ -522,6 +522,24 @@ class ResourceTreeUITest(unittest.TestCase):
             self.scan(tree)
             self.assertEqual([args[0] for _worker, args in started], dispatched) # 可见扫描也不会再派发它
 
+    def test_covers_in_flight_are_not_queued_again(self):
+        started = []
+        with patch.object(resource_tree, "COVER_WORKERS", 2), \
+                patch.object(resource_tree, "thread_it", lambda worker, *args: started.append((worker, args))), \
+                patch.object(resource_tree, "visible_tree_rows", lambda _treeview: [f"books:primary:c{index}" for index in range(3)]):
+            tree = self.build_tree(COVER_RESOURCES)
+            self.assertEqual([args[0] for _worker, args in started], ["books:primary:c0", "books:primary:c1"])
+
+            self.scan(tree) # 再扫一次，c0、c1 还在下载，不该重新排队
+            worker, args = started[0]
+            worker(*args) # c0 完成，空出一个名额
+            self.root.update()
+
+            self.assertEqual(
+                [args[0] for _worker, args in started],
+                ["books:primary:c0", "books:primary:c1", "books:primary:c2"],
+            )
+
     def test_hover_on_a_queued_cover_downloads_it_once(self):
         started = []
         with patch.object(resource_tree, "COVER_WORKERS", 2), \
