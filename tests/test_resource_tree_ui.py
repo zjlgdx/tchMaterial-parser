@@ -172,8 +172,8 @@ class ResourceTreeUITest(unittest.TestCase):
         tooltip = next(widget for widget in self.root.winfo_children() if isinstance(widget, tk.Toplevel))
         return tooltip.winfo_children()[0].winfo_children()
 
-    def install_fake_timers(self, clock):
-        # 不真正计时：记录下每个定时器，由用例决定何时触发，并让产品代码读到受控时钟
+    def install_fake_timers(self):
+        # 不真正计时：记录下每个定时器，由用例决定何时触发
         timers = []
         enter = self.context.enter_context
 
@@ -188,8 +188,6 @@ class ResourceTreeUITest(unittest.TestCase):
 
         enter(patch.object(self.root, "after", after))
         enter(patch.object(self.root, "after_cancel", after_cancel))
-        # 只替换资源树模块看到的时钟，别冻住整个进程的 time.monotonic
-        enter(patch.object(resource_tree, "time", SimpleNamespace(monotonic=lambda: clock[0])))
         return timers
 
     def live_timers(self, timers):
@@ -357,20 +355,24 @@ class ResourceTreeUITest(unittest.TestCase):
             self.hover(tree, "books:primary:c0")
             self.assertTrue(any(label.cget("image") for label in self.tooltip_labels()))
 
-    def cover_scan_probe(self):
+    def cover_scan_probe(self, clock):
+        # 受控时钟从建树前就生效：建树期间记下的时刻也得来自它，否则调度看到的是两套时间
         # 可见行里放一张还没开始下载的封面，派发记录就等于"跑了几次带封面排队的扫描"
         started = []
         visible = []
-        self.context.enter_context(patch.object(resource_tree, "thread_it", lambda _worker, *args: started.append(args[0])))
-        self.context.enter_context(patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)))
+        enter = self.context.enter_context
+        # 只替换资源树模块看到的时钟，别冻住整个进程的 time.monotonic
+        enter(patch.object(resource_tree, "time", SimpleNamespace(monotonic=lambda: clock[0])))
+        enter(patch.object(resource_tree, "thread_it", lambda _worker, *args: started.append(args[0])))
+        enter(patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)))
         tree = self.build_tree(COVER_RESOURCES)
         visible.append("books:primary:c0")
         return tree, started
 
     def test_scroll_events_leave_one_pending_cover_scan(self):
         clock = [1000.0]
-        tree, started = self.cover_scan_probe()
-        timers = self.install_fake_timers(clock)
+        tree, started = self.cover_scan_probe(clock)
+        timers = self.install_fake_timers()
         for _index in range(5):
             clock[0] += 0.005
             self.scroll(tree)
@@ -384,8 +386,8 @@ class ResourceTreeUITest(unittest.TestCase):
 
     def test_first_event_after_an_idle_period_is_still_deferred(self):
         clock = [1000.0]
-        tree, started = self.cover_scan_probe()
-        timers = self.install_fake_timers(clock)
+        tree, started = self.cover_scan_probe(clock)
+        timers = self.install_fake_timers()
 
         clock[0] += 10 # 用户停了很久才继续滚动
         self.scroll(tree)
@@ -397,8 +399,8 @@ class ResourceTreeUITest(unittest.TestCase):
 
     def test_continuous_scrolling_scans_at_the_longest_interval(self):
         clock = [1000.0]
-        tree, started = self.cover_scan_probe()
-        timers = self.install_fake_timers(clock)
+        tree, started = self.cover_scan_probe(clock)
+        timers = self.install_fake_timers()
 
         self.scroll(tree) # 本轮推迟从这里开始计时
         clock[0] += resource_tree.SCAN_MAX_WAIT_MS / 1000 - 0.010
