@@ -160,7 +160,9 @@ def build_resource_tree(
     tree_item_images: dict[str, ImageTk.PhotoImage] = {} # 持有树项图标（复选框与封面的合成图）的引用防止被回收，筛选后继续复用
     tree_cover_images: dict[str, Image.Image] = {} # 已加载封面的缩放图，勾选状态变化时与复选框重新合成
     tree_preview_images: dict[str, ImageTk.PhotoImage] = {} # 缓存大尺寸封面，用于悬停预览
-    loading_tree_images: set[str] = set()
+    loading_tree_images: set[str] = set() # 正在下载的封面，与 pending_covers 一样只在主线程改动
+    failed_tree_images: set[str] = set() # 下载失败的封面，本次运行不再重复请求
+    pending_covers: list[tuple[str, str]] = [] # 最近一次可见扫描得出的待载封面（树项 ID 与封面地址）
     checked_items: set[str] = set() # 已勾选末级资源的树项路径，搜索重建树视图后仍保留
     leaf_urls = {item_id: build_resource_url(item_id, data) for item_id, data in iter_leaf_resources(resource_list)}
     catalog_status = status # 资源目录就绪后置空，此前树视图中只显示一行提示
@@ -278,18 +280,19 @@ def build_resource_tree(
     def apply_tree_icon(item_id: str, image: Image.Image | None) -> None:
         loading_tree_images.discard(item_id)
         if image is None:
-            return
-
-        tree_image = fit_cover_image(image, tree_cover_size)
-        # 搜索重建后树项可能暂不在当前视图中，仍缓存封面供下次合成复用
-        resource_data = tree_item_data.get(item_id) or find_tree_node(resource_list, item_id) or {}
-        cover_gap = get_tree_cover_gap(resource_data.get("display_name", ""))
-        if cover_gap:
-            tree_image = ImageOps.expand(tree_image, border=(0, 0, cover_gap, 0), fill=(0, 0, 0, 0))
-        tree_cover_images[item_id] = tree_image
-        tree_preview_images[item_id] = ImageTk.PhotoImage(image)
-        item_icon_generation.pop(item_id, None) # 封面到了，图标要重新合成
-        refresh_visible_items(False)
+            failed_tree_images.add(item_id)
+        else:
+            tree_image = fit_cover_image(image, tree_cover_size)
+            # 搜索重建后树项可能暂不在当前视图中，仍缓存封面供下次合成复用
+            resource_data = tree_item_data.get(item_id) or find_tree_node(resource_list, item_id) or {}
+            cover_gap = get_tree_cover_gap(resource_data.get("display_name", ""))
+            if cover_gap:
+                tree_image = ImageOps.expand(tree_image, border=(0, 0, cover_gap, 0), fill=(0, 0, 0, 0))
+            tree_cover_images[item_id] = tree_image
+            tree_preview_images[item_id] = ImageTk.PhotoImage(image)
+            item_icon_generation.pop(item_id, None) # 封面到了，图标要重新合成
+            refresh_visible_items(False)
+        pump_cover_queue() # 空出的并发名额立刻交给下一张封面
 
     def load_tree_icon(item_id: str, url: str) -> None: # 在线程中下载封面，在主线程中更新控件
         try:
@@ -303,12 +306,15 @@ def build_resource_tree(
             print_error(e)
             ui_call(apply_tree_icon, item_id, None)
 
-    def queue_tree_icon(item_id: str) -> None:
-        resource_data = tree_item_data[item_id]
-        thumbnails = resource_data.get("custom_properties", {}).get("thumbnails")
-        if thumbnails and item_id not in tree_cover_images and item_id not in loading_tree_images:
+    def pump_cover_queue() -> None: # 在并发上限内把待载封面交给后台线程
+        while pending_covers and len(loading_tree_images) < COVER_WORKERS:
+            item_id, url = pending_covers.pop(0)
             loading_tree_images.add(item_id)
-            thread_it(load_tree_icon, item_id, thumbnails[0])
+            thread_it(load_tree_icon, item_id, url)
+
+    def queue_tree_icons(covers: list[tuple[str, str]]) -> None: # 待载封面始终取自最近一次可见扫描，滚出视野的项随之作废
+        pending_covers[:] = [cover for cover in covers if cover[0] not in loading_tree_images]
+        pump_cover_queue()
 
     scan_after_id: str | None = None
     last_cover_scan = 0.0
@@ -317,14 +323,20 @@ def build_resource_tree(
         nonlocal last_cover_scan
         if queue_covers:
             last_cover_scan = time.monotonic()
+        covers: list[tuple[str, str]] = []
         for item_id in visible_tree_rows(treeview):
             resource_data = tree_item_data.get(item_id) # 提示行与占位子项不是资源
             if resource_data is None:
                 continue
             if item_icon_generation.get(item_id) != icon_generation:
                 refresh_item_image(item_id)
-            if queue_covers and not resource_data.get("children"):
-                queue_tree_icon(item_id)
+            if not queue_covers or item_id in tree_cover_images or item_id in failed_tree_images:
+                continue
+            thumbnails = resource_data.get("custom_properties", {}).get("thumbnails")
+            if thumbnails:
+                covers.append((item_id, thumbnails[0]))
+        if queue_covers:
+            queue_tree_icons(covers)
 
     def schedule_visible_refresh() -> None: # 滚动期间只保留一个待执行的扫描
         nonlocal scan_after_id

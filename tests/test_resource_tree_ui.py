@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import tkinter as tk
 from tkinter import ttk
 import unittest
@@ -38,6 +39,7 @@ def all_tree_rows(treeview): # 隐藏窗口没有真实几何，测试里把已�
 
     return list(walk(""))
 
+
 RESOURCES = {"books": {"display_name": "电子教材", "children": {
     "primary": {"display_name": "小学", "children": {
         "a": {"display_name": "语文 一年级上册", "content_id": "a"},
@@ -48,6 +50,17 @@ RESOURCES = {"books": {"display_name": "电子教材", "children": {
 MANY_RESOURCES = {"books": {"display_name": "电子教材", "children": { # 末级资源远多于一屏，用来确认刷新只落在可见行上
     "primary": {"display_name": "小学", "children": {
         f"n{index}": {"display_name": f"语文 第 {index} 册", "content_id": f"n{index}"} for index in range(40)
+    }},
+}}}
+
+COVER_RESOURCES = {"books": {"display_name": "电子教材", "children": { # 带封面的末级多于并发上限，用来观察待载队列
+    "primary": {"display_name": "小学", "children": {
+        f"c{index}": {
+            "display_name": f"语文 第 {index} 册",
+            "content_id": f"c{index}",
+            "custom_properties": {"thumbnails": [f"https://example.com/cover{index}.png"]},
+        }
+        for index in range(10)
     }},
 }}}
 
@@ -129,14 +142,20 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.mainloop()
         self.root.update()
 
-    def build_many_tree(self):
+    def build_tree(self, resources):
         pane = ttk.Frame(self.root)
         self.urls = tk.Text(self.root, undo=True)
-        resource_tree.build_resource_tree(pane, MANY_RESOURCES, self.urls)
+        resource_tree.build_resource_tree(pane, resources, self.urls)
         self.tree = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Treeview))
         self.root.update()
         self.expand("books:primary")
         return self.tree
+
+    def scan(self, tree):
+        self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
+        self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit) # 等去抖后的封面扫描跑完
+        self.root.mainloop()
+        self.root.update()
 
     def filter(self, query):
         self.search.delete(0, "end")
@@ -193,7 +212,7 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assert_state("books:primary:b", "unchecked")
 
     def test_checking_a_large_category_only_repaints_visible_rows(self):
-        tree = self.build_many_tree()
+        tree = self.build_tree(MANY_RESOURCES)
         visible = ["books:primary:n0", "books:primary:n1"]
         calls = []
         with patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)), \
@@ -206,7 +225,7 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assert_state("books:primary:n1", "checked")
 
     def test_rows_scrolled_into_view_show_the_new_check_state(self):
-        tree = self.build_many_tree()
+        tree = self.build_tree(MANY_RESOURCES)
         visible = ["books:primary:n0"]
         with patch.object(resource_tree, "SCAN_MAX_WAIT_MS", 60000), \
                 patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)):
@@ -235,13 +254,39 @@ class ResourceTreeUITest(unittest.TestCase):
         resource_tree.build_resource_tree(pane, {}, urls, "正在加载资源列表…")
         tree = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Treeview))
         self.root.update()
-        self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
-        self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit) # 等去抖后的封面扫描也跑一遍
-        self.root.mainloop()
-        self.root.update()
+        self.scan(tree)
 
         self.assertEqual(tree.item(resource_tree.STATUS_ITEM_ID, "image"), "")
         self.assertEqual(resource_tree.session.get.call_count, requests_before)
+
+    def test_failed_cover_is_not_requested_again(self):
+        failed = type("FailedResponse", (), {"ok": False})()
+        with patch.object(resource_tree.session, "get", return_value=failed) as failed_get:
+            self.expand("books:primary") # 展开后的扫描会请求「语文 一年级下册」的封面
+            self.assertEqual(failed_get.call_count, 1)
+            self.scan(self.tree)
+            self.assertEqual(failed_get.call_count, 1) # 失败已记入负缓存，不再重复请求
+
+    def test_cover_queue_is_replaced_by_the_latest_visible_scan(self):
+        visible = [f"books:primary:c{index}" for index in range(6)]
+        started = []
+        with patch.object(resource_tree, "thread_it", lambda worker, *args: started.append((worker, args))), \
+                patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)):
+            tree = self.build_tree(COVER_RESOURCES)
+            self.assertEqual(len(started), resource_tree.COVER_WORKERS) # 同时在下载的封面不超过并发上限
+
+            visible[:] = [f"books:primary:c{index}" for index in range(6, 10)]
+            self.scan(tree)
+            self.assertEqual(len(started), resource_tree.COVER_WORKERS)
+
+            for worker, args in list(started): # 前几张下载完成，空出的名额交给最近一次扫描的结果
+                worker(*args)
+            self.root.update()
+
+        requested = [args[0] for _worker, args in started]
+        self.assertEqual(requested[resource_tree.COVER_WORKERS:], [f"books:primary:c{index}" for index in range(6, 10)])
+        self.assertNotIn("books:primary:c4", requested) # 滚出视野且还没开始的项被新扫描替换掉
+        self.assertNotIn("books:primary:c5", requested)
 
     def test_cover_and_checkbox_survive_search_clear_and_theme_changes(self):
         self.expand("books:primary")
@@ -391,6 +436,15 @@ def test_visible_rows_are_empty_without_items():
     tree = FakeTreeview(0)
     assert resource_tree.visible_tree_rows(tree) == []
     assert tree.identify_calls == []
+
+
+def test_cover_downloads_run_on_daemon_threads():
+    # 封面下载走 thread_it，退出时不能因为还有请求在飞而卡住主进程
+    finished = threading.Event()
+    daemon = []
+    runtime.thread_it(lambda: (daemon.append(threading.current_thread().daemon), finished.set()))
+    assert finished.wait(5)
+    assert daemon == [True]
 
 
 @pytest.mark.parametrize("case", unittest.defaultTestLoader.getTestCaseNames(ResourceTreeUITest))
