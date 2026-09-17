@@ -182,8 +182,12 @@ class ResourceTreeUITest(unittest.TestCase):
         # 不真正计时：记录下每个定时器，由用例决定何时触发
         timers = []
         enter = self.context.enter_context
+        real_after = self.root.after
 
         def after(delay, callback=None, *args):
+            if delay == "idle": # after_idle 走的也是 after，交回真实实现，别记成永不触发的定时器
+                return real_after(delay, callback, *args)
+
             record = [delay, None, f"timer{len(timers)}"]
 
             def fire(): # Tk 里定时器触发一次就失效，这里照做
@@ -204,7 +208,7 @@ class ResourceTreeUITest(unittest.TestCase):
         return timers
 
     def live_timers(self, timers):
-        return [timer for timer in timers if timer[1] is not None]
+        return [timer for timer in timers if timer[1] is not None and isinstance(timer[0], int)]
 
     def scroll(self, tree):
         self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
