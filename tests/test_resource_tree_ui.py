@@ -206,7 +206,8 @@ class ResourceTreeUITest(unittest.TestCase):
         deadline = time.monotonic() + 5 # 映射由窗口管理器异步完成，等待要有上限
         while not tree.winfo_ismapped() and time.monotonic() < deadline:
             self.root.update()
-        self.assertTrue(tree.winfo_ismapped(), "窗口未被映射，取不到真实几何")
+        if not tree.winfo_ismapped(): # 例如 Windows 服务会话，有 Tk 但没有交互桌面
+            self.skipTest("窗口管理器没有映射窗口，取不到真实几何")
 
         tree.yview_scroll(1, "units")
         self.root.update()
