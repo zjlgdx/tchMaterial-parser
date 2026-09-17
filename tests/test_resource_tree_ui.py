@@ -105,6 +105,15 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.tk.call(command, "unused")
         self.root.update()
 
+    def expand(self, item_id):
+        # 复刻 Tk 展开分类的顺序：先设焦点并发出事件，再把该项置为展开。
+        self.tree.focus(item_id)
+        self.tree.event_generate("<<TreeviewOpen>>")
+        self.tree.item(item_id, open=True)
+        self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit) # 等去抖后的可见行扫描跑完
+        self.root.mainloop()
+        self.root.update()
+
     def filter(self, query):
         self.search.delete(0, "end")
         self.search.insert(0, query)
@@ -145,7 +154,22 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertTrue(tree.bbox(rows[0]))
         self.assertNotIn("row0", rows) # 上边框里取到的是视口上方那一行，不能算可见
 
+    def test_category_children_are_inserted_on_first_expand(self):
+        self.assertTrue(self.tree.exists("books:primary"))
+        self.assertFalse(self.tree.exists("books:primary:a"))
+        self.assertEqual(self.tree.get_children("books:primary"), (f"books:primary{resource_tree.PLACEHOLDER_SUFFIX}",))
+        self.expand("books:primary")
+        self.assertEqual(self.tree.get_children("books:primary"), ("books:primary:a", "books:primary:b"))
+
+    def test_expanded_children_show_current_check_state(self):
+        self.urls.insert("1.0", self.url("a"))
+        self.root.update()
+        self.expand("books:primary")
+        self.assert_state("books:primary:a", "checked")
+        self.assert_state("books:primary:b", "unchecked")
+
     def test_cover_and_checkbox_survive_search_clear_and_theme_changes(self):
+        self.expand("books:primary")
         width = self.image("books:primary:b").width
         self.assertGreater(width, 24)
         self.toggle("books:primary:b")
@@ -153,6 +177,8 @@ class ResourceTreeUITest(unittest.TestCase):
             theme.apply_theme(name)
             for query in ("下册", ""):
                 self.filter(query)
+                if not query: # 清除搜索后树回到只展开一级的状态
+                    self.expand("books:primary")
                 self.assertEqual(self.image("books:primary:b").width, width)
                 self.assert_state("books:primary:b", "checked")
 
@@ -162,6 +188,7 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(self.lines(), {self.url("b")})
         self.assert_state("books:primary", "checked")
         self.filter("")
+        self.expand("books:primary")
         self.assert_state("books:primary", "partial")
         self.assert_state("books:primary:a", "unchecked")
 
@@ -175,6 +202,7 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assert_state("books:primary", "partial")
 
     def test_manual_deletion_then_parent_selection_restores_both_urls(self):
+        self.expand("books:primary")
         self.toggle("books:primary:b")
         self.urls.delete("1.0", "end")
         self.root.update()
@@ -204,9 +232,7 @@ class ResourceTreeUITest(unittest.TestCase):
         apply_resource_list(RESOURCES)
         self.root.update()
         self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["电子教材"])
-        tree.item("books", open=True)
-        tree.item("books:primary", open=True)
-        self.root.update()
+        self.expand("books:primary")
         self.assert_state("books:primary:a", "checked") # 目录到达后按输入框里的链接恢复勾选
         count = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Label) and widget.grid_info().get("column") == 1)
         self.assertEqual(count.cget("text"), "已选 1 项")
@@ -224,6 +250,7 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["获取资源列表失败，请手动填写资源链接，或重新打开本程序"])
 
     def test_paste_whitespace_and_undo_sync_without_changing_other_urls(self):
+        self.expand("books:primary")
         external = "https://example.com/manual"
         self.urls.insert("1.0", f"  {self.url('b')}  \n{external}")
         self.urls.edit_separator()

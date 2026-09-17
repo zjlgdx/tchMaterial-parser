@@ -176,7 +176,7 @@ def build_resource_tree(
     def get_tree_cover_gap(display_name: str) -> int: # 名称以中文左括号开头时不添加封面与标题间隔
         return 0 if display_name.startswith("（") else tree_cover_gap
 
-    def build_tree_items(parent: str, items: dict[str, dict], parent_names: tuple[str, ...], expand_all: bool) -> None: # 递归构建树视图项
+    def insert_tree_level(parent: str, items: dict[str, dict], parent_names: tuple[str, ...], expand_all: bool) -> None: # 插入一层树项
         nonlocal tree_content_width
         for option_id, option_data in items.items():
             item_id = f"{parent}:{option_id}" if parent else option_id
@@ -185,17 +185,20 @@ def build_resource_tree(
             tree_item_data[item_id] = option_data
             tree_item_paths[item_id] = path_names
             tree_item_images[item_id] = compose_item_image(item_id)
+            open_item = expand_all or not parent
             treeview.insert(
                 parent,
                 "end",
                 iid=item_id,
                 text=display_name,
                 image=tree_item_images[item_id],
-                open=expand_all or not parent,
+                open=open_item,
             )
             children: dict[str, dict] = option_data.get("children", {})
-            if children: # 如果有子项，递归构建子树项
-                build_tree_items(item_id, children, path_names, expand_all)
+            if children and open_item: # 展开的分类立即填充下一层
+                insert_tree_level(item_id, children, path_names, expand_all)
+            elif children: # 折叠的分类先挂占位子项，Tk 才会给它画展开箭头
+                treeview.insert(item_id, "end", iid=f"{item_id}{PLACEHOLDER_SUFFIX}", text="")
 
             depth_width = len(path_names) * scaled(20)
             if option_data.get("custom_properties", {}).get("thumbnails"):
@@ -203,6 +206,22 @@ def build_resource_tree(
             else:
                 image_width = checkbox_size + checkbox_gap
             tree_content_width = max(tree_content_width, depth_width + image_width + tree_font.measure(display_name) + scaled(20))
+
+    def on_tree_open(_event: tk.Event) -> None: # 首次展开分类时才插入它的子项
+        item_id = treeview.focus()
+        node = tree_item_data.get(item_id)
+        if node is None: # 资源目录尚未就绪时的提示行没有子项数据
+            return
+
+        children = treeview.get_children(item_id)
+        # 方向键右在末级资源上也会发这个事件；已经填充过的分类，子项不再是占位项
+        if len(children) != 1 or not children[0].endswith(PLACEHOLDER_SUFFIX):
+            return
+
+        treeview.delete(children[0])
+        insert_tree_level(item_id, node["children"], tree_item_paths[item_id], expand_all=False)
+        resize_tree_column(treeview.winfo_width()) # 新插入的项可能比现有内容更宽
+        schedule_visible_refresh()
 
     def resize_tree_column(width: int) -> None: # 让树列至少铺满可视区域，内容过长时启用横向滚动
         treeview.column("#0", width=max(tree_content_width, width - scaled(2)))
@@ -323,7 +342,7 @@ def build_resource_tree(
         tree_item_data.clear()
         tree_item_paths.clear()
         tree_content_width = 0
-        build_tree_items("", visible_items, (), expand_all=bool(query))
+        insert_tree_level("", visible_items, (), expand_all=bool(query))
         resize_tree_column(treeview.winfo_width())
         clear_search_btn.state(["!disabled"] if query else ["disabled"])
 
@@ -562,6 +581,7 @@ def build_resource_tree(
     search_var.trace_add("write", schedule_search)
     treeview.configure(yscrollcommand=on_tree_view_change)
     treeview.bind("<space>", on_tree_space)
+    treeview.bind("<<TreeviewOpen>>", on_tree_open)
     treeview.bind("<Configure>", lambda event: resize_tree_column(event.width))
     treeview.bind("<Motion>", on_tree_motion)
     treeview.bind("<Leave>", lambda _event: leave_tree())
