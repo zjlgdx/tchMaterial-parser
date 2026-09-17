@@ -4,6 +4,7 @@
 import io
 import time
 import tkinter as tk
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from tkinter import ttk
 import tkinter.font as tkfont
@@ -159,7 +160,7 @@ def build_resource_tree(
     item_icon_generation: dict[str, int] = {} # 各树项图标合成时的代际，与当前代际不符即为待刷新
     tree_item_images: dict[str, ImageTk.PhotoImage] = {} # 持有树项图标（复选框与封面的合成图）的引用防止被回收，筛选后继续复用
     tree_cover_images: dict[str, Image.Image] = {} # 已加载封面的缩放图，勾选状态变化时与复选框重新合成
-    tree_preview_images: dict[str, ImageTk.PhotoImage] = {} # 缓存大尺寸封面，用于悬停预览
+    preview_cover_pils: OrderedDict[str, Image.Image] = OrderedDict() # 悬停预览用的大尺寸封面，按最近使用保留
     loading_tree_images: set[str] = set() # 正在下载的封面，与 pending_covers 一样只在主线程改动
     failed_tree_images: set[str] = set() # 下载失败的封面，本次运行不再重复请求
     pending_covers: list[tuple[str, str]] = [] # 最近一次可见扫描得出的待载封面（树项 ID 与封面地址）
@@ -277,6 +278,20 @@ def build_resource_tree(
         if treeview.exists(item_id):
             treeview.item(item_id, image=image)
 
+    def remember_preview_cover(item_id: str, image: Image.Image) -> None: # 只留最近看过的若干张预览图，整个目录的大图不常驻
+        preview_cover_pils[item_id] = image
+        preview_cover_pils.move_to_end(item_id)
+        while len(preview_cover_pils) > PREVIEW_CACHE_SIZE:
+            preview_cover_pils.popitem(last=False)
+
+    def reload_preview_cover(item_id: str) -> None: # 预览图已被淘汰时重新取一次，下次悬停即可显示
+        if item_id in loading_tree_images or item_id in failed_tree_images:
+            return
+        thumbnails = (tree_item_data.get(item_id) or {}).get("custom_properties", {}).get("thumbnails")
+        if thumbnails:
+            pending_covers.insert(0, (item_id, thumbnails[0])) # 用户正看着这一项，排在可见行前面
+            pump_cover_queue()
+
     def apply_tree_icon(item_id: str, image: Image.Image | None) -> None:
         loading_tree_images.discard(item_id)
         if image is None:
@@ -289,7 +304,7 @@ def build_resource_tree(
             if cover_gap:
                 tree_image = ImageOps.expand(tree_image, border=(0, 0, cover_gap, 0), fill=(0, 0, 0, 0))
             tree_cover_images[item_id] = tree_image
-            tree_preview_images[item_id] = ImageTk.PhotoImage(image)
+            remember_preview_cover(item_id, image)
             item_icon_generation.pop(item_id, None) # 封面到了，图标要重新合成
             refresh_visible_items(False)
         pump_cover_queue() # 空出的并发名额立刻交给下一张封面
@@ -470,19 +485,21 @@ def build_resource_tree(
 
     tooltip_window: tk.Toplevel | None = None
     tooltip_after_id: str | None = None
+    tooltip_preview: ImageTk.PhotoImage | None = None # 持有预览图引用防止被回收
     hovered_tree_item = ""
 
     def hide_tree_tooltip() -> None:
-        nonlocal tooltip_window, tooltip_after_id
+        nonlocal tooltip_window, tooltip_after_id, tooltip_preview
         if tooltip_after_id:
             runtime.root.after_cancel(tooltip_after_id)
             tooltip_after_id = None
         if tooltip_window:
             tooltip_window.destroy()
             tooltip_window = None
+            tooltip_preview = None
 
     def show_tree_tooltip(item_id: str, x_root: int, y_root: int) -> None: # 悬停时显示完整名称与分类路径
-        nonlocal tooltip_window, tooltip_after_id
+        nonlocal tooltip_window, tooltip_after_id, tooltip_preview
         tooltip_after_id = None
         if item_id != hovered_tree_item or not treeview.exists(item_id):
             return
@@ -502,16 +519,20 @@ def build_resource_tree(
         )
         tooltip_body.pack()
 
-        preview_image = tree_preview_images.get(item_id)
-        if preview_image:
+        preview_cover = preview_cover_pils.get(item_id)
+        if preview_cover is None:
+            reload_preview_cover(item_id) # 预览图已被淘汰，重新取一次，本次先只显示文字
+        else:
+            preview_cover_pils.move_to_end(item_id)
+            tooltip_preview = ImageTk.PhotoImage(preview_cover)
             tk.Label(
                 tooltip_body,
-                image=preview_image,
+                image=tooltip_preview,
                 background=theme.current_colors["surface"],
                 borderwidth=0,
             ).grid(row=0, column=0, rowspan=2, padx=(0, scaled(12)))
 
-        text_column = 1 if preview_image else 0
+        text_column = 1 if preview_cover is not None else 0
         tk.Label(
             tooltip_body,
             text=path_names[-1],

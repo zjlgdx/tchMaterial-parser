@@ -151,6 +151,17 @@ class ResourceTreeUITest(unittest.TestCase):
         self.expand("books:primary")
         return self.tree
 
+    def hover(self, tree, item_id):
+        y = next(y for y in range(4, 800, 4) if tree.identify_row(y) == item_id)
+        tree.event_generate("<Motion>", x=10, y=y)
+        self.root.after(600, self.root.quit) # 悬停提示有 450 毫秒延迟
+        self.root.mainloop()
+        self.root.update()
+
+    def tooltip_labels(self):
+        tooltip = next(widget for widget in self.root.winfo_children() if isinstance(widget, tk.Toplevel))
+        return tooltip.winfo_children()[0].winfo_children()
+
     def scan(self, tree):
         self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
         self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit) # 等去抖后的封面扫描跑完
@@ -287,6 +298,19 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(requested[resource_tree.COVER_WORKERS:], [f"books:primary:c{index}" for index in range(6, 10)])
         self.assertNotIn("books:primary:c4", requested) # 滚出视野且还没开始的项被新扫描替换掉
         self.assertNotIn("books:primary:c5", requested)
+
+    def test_evicted_preview_is_fetched_again_on_hover(self):
+        with patch.object(resource_tree, "PREVIEW_CACHE_SIZE", 2):
+            tree = self.build_tree(COVER_RESOURCES)
+            requests_before = resource_tree.session.get.call_count
+
+            self.hover(tree, "books:primary:c0") # 这一册的预览图早已被挤出缓存
+            self.assertFalse(any(label.cget("image") for label in self.tooltip_labels()))
+            self.assertEqual(resource_tree.session.get.call_count, requests_before + 1)
+
+            self.hover(tree, "books:primary:c1") # 换一行再回来，否则沿用同一次悬停
+            self.hover(tree, "books:primary:c0")
+            self.assertTrue(any(label.cget("image") for label in self.tooltip_labels()))
 
     def test_cover_and_checkbox_survive_search_clear_and_theme_changes(self):
         self.expand("books:primary")
