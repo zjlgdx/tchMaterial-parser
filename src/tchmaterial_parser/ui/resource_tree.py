@@ -2,7 +2,9 @@
 # 左侧资源列表：勾选教材或分类、搜索筛选、封面按需加载与悬停预览
 
 import io
+import time
 import tkinter as tk
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
 from tkinter import ttk
 import tkinter.font as tkfont
@@ -88,6 +90,32 @@ def draw_checkbox_image(size: int, state: str, colors: dict[str, str]) -> Image.
     return image.resize((target_size, target_size), Image.Resampling.LANCZOS)
 
 STATUS_ITEM_ID = "__internal_status" # 资源目录尚未就绪时，树视图中提示行的树项 ID
+PLACEHOLDER_SUFFIX = ":__internal_placeholder" # 占位子项的树项 ID 后缀；Tk 只给有子项的行画展开箭头
+SCAN_DEBOUNCE_MS = 80 # 滚动停下多久后扫描一次可见行
+SCAN_MAX_WAIT_MS = 250 # 连续滚动时两次扫描的最长间隔，避免去抖一直被推迟
+VISIBLE_SCAN_PROBE_STEP = 2 # 扫描起点的试探步长，用于跨过树视图上边框
+PREVIEW_CACHE_SIZE = 200 # 悬停预览缓存的封面张数
+COVER_WORKERS = 4 # 同时下载封面的线程数
+
+def visible_tree_rows(treeview: ttk.Treeview) -> list[str]: # 逐行取出当前屏幕上的树项
+    if not treeview.get_children():
+        return []
+
+    rows: list[str] = []
+    height = treeview.winfo_height()
+    y = 0
+    while y < height:
+        item_id = treeview.identify_row(y)
+        # 上边框那几个像素要么取不到行，要么取到视口上方的行（其 bbox 为空），两种都算未命中
+        box = treeview.bbox(item_id) if item_id else None
+        if not box:
+            if rows:
+                break
+            y += VISIBLE_SCAN_PROBE_STEP
+            continue
+        rows.append(item_id)
+        y = box[1] + box[3] + 1
+    return rows
 
 def build_resource_tree(
     pane: ttk.Frame, resource_list: dict[str, dict], url_text: tk.Text, status: str = "",
@@ -129,10 +157,13 @@ def build_resource_tree(
 
     tree_item_data: dict[str, dict] = {} # 键为树项 ID，值为资源数据
     tree_item_paths: dict[str, tuple[str, ...]] = {} # 保存完整分类路径，用于悬停提示
+    item_icon_generation: dict[str, int] = {} # 各树项图标合成时的代际，与当前代际不符即为待刷新
     tree_item_images: dict[str, ImageTk.PhotoImage] = {} # 持有树项图标（复选框与封面的合成图）的引用防止被回收，筛选后继续复用
     tree_cover_images: dict[str, Image.Image] = {} # 已加载封面的缩放图，勾选状态变化时与复选框重新合成
-    tree_preview_images: dict[str, ImageTk.PhotoImage] = {} # 缓存大尺寸封面，用于悬停预览
-    loading_tree_images: set[str] = set()
+    preview_cover_pils: OrderedDict[str, Image.Image] = OrderedDict() # 悬停预览用的大尺寸封面，按最近使用保留
+    loading_tree_images: set[str] = set() # 正在下载的封面，与 pending_covers 一样只在主线程改动
+    failed_tree_images: set[str] = set() # 下载失败的封面，本次运行不再重复请求
+    pending_covers: list[tuple[str, str]] = [] # 最近一次可见扫描得出的待载封面（树项 ID 与封面地址）
     checked_items: set[str] = set() # 已勾选末级资源的树项路径，搜索重建树视图后仍保留
     leaf_urls = {item_id: build_resource_url(item_id, data) for item_id, data in iter_leaf_resources(resource_list)}
     catalog_status = status # 资源目录就绪后置空，此前树视图中只显示一行提示
@@ -145,11 +176,12 @@ def build_resource_tree(
     checkbox_gap = scaled(6) # 复选框与封面、标题之间的间距
     preview_cover_size = (scaled(80), scaled(112))
     tree_content_width = 0
+    icon_generation = 0 # 勾选或配色变化后自增，屏幕外的树项据此标脏
 
     def get_tree_cover_gap(display_name: str) -> int: # 名称以中文左括号开头时不添加封面与标题间隔
         return 0 if display_name.startswith("（") else tree_cover_gap
 
-    def build_tree_items(parent: str, items: dict[str, dict], parent_names: tuple[str, ...], expand_all: bool) -> None: # 递归构建树视图项
+    def insert_tree_level(parent: str, items: dict[str, dict], parent_names: tuple[str, ...], expand_all: bool) -> None: # 插入一层树项
         nonlocal tree_content_width
         for option_id, option_data in items.items():
             item_id = f"{parent}:{option_id}" if parent else option_id
@@ -158,17 +190,20 @@ def build_resource_tree(
             tree_item_data[item_id] = option_data
             tree_item_paths[item_id] = path_names
             tree_item_images[item_id] = compose_item_image(item_id)
+            open_item = expand_all or not parent
             treeview.insert(
                 parent,
                 "end",
                 iid=item_id,
                 text=display_name,
                 image=tree_item_images[item_id],
-                open=expand_all or not parent,
+                open=open_item,
             )
             children: dict[str, dict] = option_data.get("children", {})
-            if children: # 如果有子项，递归构建子树项
-                build_tree_items(item_id, children, path_names, expand_all)
+            if children and open_item: # 展开的分类立即填充下一层
+                insert_tree_level(item_id, children, path_names, expand_all)
+            elif children: # 折叠的分类先挂占位子项，Tk 才会给它画展开箭头
+                treeview.insert(item_id, "end", iid=f"{item_id}{PLACEHOLDER_SUFFIX}", text="")
 
             depth_width = len(path_names) * scaled(20)
             if option_data.get("custom_properties", {}).get("thumbnails"):
@@ -176,6 +211,22 @@ def build_resource_tree(
             else:
                 image_width = checkbox_size + checkbox_gap
             tree_content_width = max(tree_content_width, depth_width + image_width + tree_font.measure(display_name) + scaled(20))
+
+    def on_tree_open(_event: tk.Event) -> None: # 首次展开分类时才插入它的子项
+        item_id = treeview.focus()
+        node = tree_item_data.get(item_id)
+        if node is None: # 资源目录尚未就绪时的提示行没有子项数据
+            return
+
+        children = treeview.get_children(item_id)
+        # 方向键右在末级资源上也会发这个事件；已经填充过的分类，子项不再是占位项
+        if len(children) != 1 or not children[0].endswith(PLACEHOLDER_SUFFIX):
+            return
+
+        treeview.delete(children[0])
+        insert_tree_level(item_id, node["children"], tree_item_paths[item_id], expand_all=False)
+        resize_tree_column(treeview.winfo_width()) # 新插入的项可能比现有内容更宽
+        schedule_visible_refresh()
 
     def resize_tree_column(width: int) -> None: # 让树列至少铺满可视区域，内容过长时启用横向滚动
         treeview.column("#0", width=max(tree_content_width, width - scaled(2)))
@@ -187,8 +238,14 @@ def build_resource_tree(
             checkbox_pils[state] = draw_checkbox_image(checkbox_size, state, theme.current_colors)
             checkbox_icons[state] = ImageTk.PhotoImage(ImageOps.expand(checkbox_pils[state], border=(0, 0, checkbox_gap, 0), fill=(0, 0, 0, 0)))
 
+    def invalidate_item_icons() -> None: # 标记全部树项图标过期，由可见行扫描按需重新合成
+        nonlocal icon_generation
+        icon_generation += 1
+
     def on_theme_changed() -> None: # 主题切换后重建复选框配色并刷新全部树项图标
         rebuild_checkbox_images()
+        invalidate_item_icons()
+        # 三态复选框是共享图片，换配色后旧图会被回收，已插入的树项都得当场换上新图
         for item_id in list(tree_item_data):
             refresh_item_image(item_id)
 
@@ -203,6 +260,7 @@ def build_resource_tree(
         return "checked" if item_id in checked_items else "unchecked"
 
     def compose_item_image(item_id: str) -> ImageTk.PhotoImage: # 合成树项图标：勾选状态对应的复选框与已加载的封面
+        item_icon_generation[item_id] = icon_generation # 合成即记账，供扫描判断该项是否还需要刷新
         state = item_check_state(item_id)
         cover = tree_cover_images.get(item_id)
         if cover is None: # 尚未加载封面的树项直接复用带间距的复选框图标
@@ -220,9 +278,29 @@ def build_resource_tree(
         if treeview.exists(item_id):
             treeview.item(item_id, image=image)
 
+    def remember_preview_cover(item_id: str, image: Image.Image) -> None: # 只留最近看过的若干张预览图，整个目录的大图不常驻
+        preview_cover_pils[item_id] = image
+        preview_cover_pils.move_to_end(item_id)
+        while len(preview_cover_pils) > PREVIEW_CACHE_SIZE:
+            preview_cover_pils.popitem(last=False)
+
+    def reload_preview_cover(item_id: str) -> None: # 预览图已被淘汰时重新取一次，下次悬停即可显示
+        if item_id in loading_tree_images or item_id in failed_tree_images:
+            return
+        thumbnails = (tree_item_data.get(item_id) or {}).get("custom_properties", {}).get("thumbnails")
+        if not thumbnails:
+            return
+
+        # 用户正看着这一项，直接下载而不排队：排队会被下一次可见扫描的整体替换挤掉，名额占满时更是永远轮不到
+        pending_covers[:] = [cover for cover in pending_covers if cover[0] != item_id]
+        loading_tree_images.add(item_id)
+        thread_it(load_tree_icon, item_id, thumbnails[0])
+
     def apply_tree_icon(item_id: str, image: Image.Image | None) -> None:
         loading_tree_images.discard(item_id)
-        if image is not None:
+        if image is None:
+            failed_tree_images.add(item_id)
+        else:
             tree_image = fit_cover_image(image, tree_cover_size)
             # 搜索重建后树项可能暂不在当前视图中，仍缓存封面供下次合成复用
             resource_data = tree_item_data.get(item_id) or find_tree_node(resource_list, item_id) or {}
@@ -230,8 +308,10 @@ def build_resource_tree(
             if cover_gap:
                 tree_image = ImageOps.expand(tree_image, border=(0, 0, cover_gap, 0), fill=(0, 0, 0, 0))
             tree_cover_images[item_id] = tree_image
-            tree_preview_images[item_id] = ImageTk.PhotoImage(image)
-        refresh_item_image(item_id)
+            remember_preview_cover(item_id, image)
+            item_icon_generation.pop(item_id, None) # 封面到了，图标要重新合成
+            refresh_visible_items(False)
+        pump_cover_queue() # 空出的并发名额立刻交给下一张封面
 
     def load_tree_icon(item_id: str, url: str) -> None: # 在线程中下载封面，在主线程中更新控件
         try:
@@ -245,21 +325,61 @@ def build_resource_tree(
             print_error(e)
             ui_call(apply_tree_icon, item_id, None)
 
-    def queue_tree_icon(item_id: str) -> None:
-        resource_data = tree_item_data[item_id]
-        thumbnails = resource_data.get("custom_properties", {}).get("thumbnails")
-        if thumbnails and item_id not in tree_cover_images and item_id not in loading_tree_images:
+    def pump_cover_queue() -> None: # 在并发上限内把待载封面交给后台线程
+        while pending_covers and len(loading_tree_images) < COVER_WORKERS:
+            item_id, url = pending_covers.pop(0)
             loading_tree_images.add(item_id)
-            thread_it(load_tree_icon, item_id, thumbnails[0])
+            thread_it(load_tree_icon, item_id, url)
 
-    def load_visible_tree_icons() -> None: # 搜索或滚动后只加载当前可见资源的封面
-        for item_id, resource_data in tree_item_data.items():
-            if not resource_data.get("children") and treeview.bbox(item_id):
-                queue_tree_icon(item_id)
+    def queue_tree_icons(covers: list[tuple[str, str]]) -> None: # 待载封面始终取自最近一次可见扫描，滚出视野的项随之作废
+        pending_covers[:] = [cover for cover in covers if cover[0] not in loading_tree_images]
+        pump_cover_queue()
+
+    scan_after_id: str | None = None
+    deferred_since = 0.0 # 本轮推迟从何时开始，用来限制扫描最多被推迟多久
+
+    def refresh_visible_items(queue_covers: bool) -> None: # 只处理屏幕上的行，开销与目录规模无关
+        covers: list[tuple[str, str]] = []
+        for item_id in visible_tree_rows(treeview):
+            resource_data = tree_item_data.get(item_id) # 提示行与占位子项不是资源
+            if resource_data is None:
+                continue
+            if item_icon_generation.get(item_id) != icon_generation:
+                refresh_item_image(item_id)
+            if not queue_covers or item_id in tree_cover_images or item_id in failed_tree_images:
+                continue
+            thumbnails = resource_data.get("custom_properties", {}).get("thumbnails")
+            if thumbnails:
+                covers.append((item_id, thumbnails[0]))
+        if queue_covers:
+            queue_tree_icons(covers)
+
+    def run_cover_scan() -> None: # 推迟到期，扫一次可见行并重新开始计时
+        nonlocal scan_after_id, deferred_since
+        scan_after_id = None
+        deferred_since = 0.0
+        refresh_visible_items(True)
+
+    def schedule_visible_refresh() -> None: # 滚动期间只保留一个待执行的扫描
+        nonlocal scan_after_id, deferred_since
+        now = time.monotonic()
+        if scan_after_id is None: # 新一轮推迟从这一刻算起，手势的第一个事件不会当场扫描
+            deferred_since = now
+        else:
+            runtime.root.after_cancel(scan_after_id)
+            scan_after_id = None
+
+        # 每次重排都缩短到距最长间隔的剩余时间，滚动不停时扫描也不会被一再推迟
+        delay = min(SCAN_DEBOUNCE_MS, round(SCAN_MAX_WAIT_MS - (now - deferred_since) * 1000))
+        if delay <= 0:
+            run_cover_scan()
+            return
+        scan_after_id = runtime.root.after(delay, run_cover_scan)
 
     def on_tree_view_change(first: str, last: str) -> None:
         auto_hide_scrollbar(treeview_scrollbar, first, last)
-        ui_call(load_visible_tree_icons)
+        refresh_visible_items(False) # 滚进视野的行要立刻显示正确的勾选状态
+        schedule_visible_refresh()
 
     def refresh_resource_tree() -> None: # 根据搜索词重建树视图
         nonlocal tree_content_width
@@ -270,8 +390,9 @@ def build_resource_tree(
         treeview.delete(*treeview.get_children())
         tree_item_data.clear()
         tree_item_paths.clear()
+        item_icon_generation.clear()
         tree_content_width = 0
-        build_tree_items("", visible_items, (), expand_all=bool(query))
+        insert_tree_level("", visible_items, (), expand_all=bool(query))
         resize_tree_column(treeview.winfo_width())
         clear_search_btn.state(["!disabled"] if query else ["disabled"])
 
@@ -282,7 +403,7 @@ def build_resource_tree(
 
         result_count = count_resource_items(visible_items)
         search_status_label.config(text=f"{result_count} 项" if result_count else "无匹配资源")
-        ui_call(load_visible_tree_icons)
+        ui_call(refresh_visible_items, True)
 
     def insert_resource_urls(urls: list[str]) -> None: # 将链接追加到 URL 输入框，跳过已存在的行
         existing_lines = {line.strip() for line in url_text.get("1.0", "end").splitlines()}
@@ -336,20 +457,13 @@ def build_resource_tree(
     def sync_checked_items() -> None: # 粘贴、删除、撤销以及树项操作统一以输入框中的链接为准
         urls = {line.strip() for line in url_text.get("1.0", "end").splitlines()}
         new_checked_items = {item_id for item_id, url in leaf_urls.items() if url in urls}
-        changed_ids = checked_items.symmetric_difference(new_checked_items)
-        if not changed_ids:
+        if new_checked_items == checked_items:
             return
         checked_items.clear()
         checked_items.update(new_checked_items)
 
-        refresh_ids: set[str] = set() # 状态变化的末级资源及其各级祖先分类都需要刷新图标
-        for leaf_id in changed_ids:
-            segments = leaf_id.split(":")
-            refresh_ids.update(":".join(segments[:index]) for index in range(1, len(segments) + 1))
-        for refresh_id in refresh_ids:
-            if refresh_id in tree_item_data:
-                refresh_item_image(refresh_id)
-
+        invalidate_item_icons() # 末级资源与各级祖先分类的图标都可能变，屏幕外的等滚进视野再合成
+        refresh_visible_items(False)
         update_checked_count()
 
     def on_urls_modified(_event: tk.Event) -> None:
@@ -378,19 +492,21 @@ def build_resource_tree(
 
     tooltip_window: tk.Toplevel | None = None
     tooltip_after_id: str | None = None
+    tooltip_preview: ImageTk.PhotoImage | None = None # 持有预览图引用防止被回收
     hovered_tree_item = ""
 
     def hide_tree_tooltip() -> None:
-        nonlocal tooltip_window, tooltip_after_id
+        nonlocal tooltip_window, tooltip_after_id, tooltip_preview
         if tooltip_after_id:
             runtime.root.after_cancel(tooltip_after_id)
             tooltip_after_id = None
         if tooltip_window:
             tooltip_window.destroy()
             tooltip_window = None
+            tooltip_preview = None
 
     def show_tree_tooltip(item_id: str, x_root: int, y_root: int) -> None: # 悬停时显示完整名称与分类路径
-        nonlocal tooltip_window, tooltip_after_id
+        nonlocal tooltip_window, tooltip_after_id, tooltip_preview
         tooltip_after_id = None
         if item_id != hovered_tree_item or not treeview.exists(item_id):
             return
@@ -410,16 +526,20 @@ def build_resource_tree(
         )
         tooltip_body.pack()
 
-        preview_image = tree_preview_images.get(item_id)
-        if preview_image:
+        preview_cover = preview_cover_pils.get(item_id)
+        if preview_cover is None:
+            reload_preview_cover(item_id) # 预览图已被淘汰，重新取一次，本次先只显示文字
+        else:
+            preview_cover_pils.move_to_end(item_id)
+            tooltip_preview = ImageTk.PhotoImage(preview_cover)
             tk.Label(
                 tooltip_body,
-                image=preview_image,
+                image=tooltip_preview,
                 background=theme.current_colors["surface"],
                 borderwidth=0,
             ).grid(row=0, column=0, rowspan=2, padx=(0, scaled(12)))
 
-        text_column = 1 if preview_image else 0
+        text_column = 1 if preview_cover is not None else 0
         tk.Label(
             tooltip_body,
             text=path_names[-1],
@@ -510,7 +630,7 @@ def build_resource_tree(
     search_var.trace_add("write", schedule_search)
     treeview.configure(yscrollcommand=on_tree_view_change)
     treeview.bind("<space>", on_tree_space)
-    treeview.bind("<<TreeviewOpen>>", lambda _event: ui_call(load_visible_tree_icons))
+    treeview.bind("<<TreeviewOpen>>", on_tree_open)
     treeview.bind("<Configure>", lambda event: resize_tree_column(event.width))
     treeview.bind("<Motion>", on_tree_motion)
     treeview.bind("<Leave>", lambda _event: leave_tree())
