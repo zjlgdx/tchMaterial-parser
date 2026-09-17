@@ -156,6 +156,7 @@ def build_resource_tree(
 
     tree_item_data: dict[str, dict] = {} # 键为树项 ID，值为资源数据
     tree_item_paths: dict[str, tuple[str, ...]] = {} # 保存完整分类路径，用于悬停提示
+    item_icon_generation: dict[str, int] = {} # 各树项图标合成时的代际，与当前代际不符即为待刷新
     tree_item_images: dict[str, ImageTk.PhotoImage] = {} # 持有树项图标（复选框与封面的合成图）的引用防止被回收，筛选后继续复用
     tree_cover_images: dict[str, Image.Image] = {} # 已加载封面的缩放图，勾选状态变化时与复选框重新合成
     tree_preview_images: dict[str, ImageTk.PhotoImage] = {} # 缓存大尺寸封面，用于悬停预览
@@ -172,6 +173,7 @@ def build_resource_tree(
     checkbox_gap = scaled(6) # 复选框与封面、标题之间的间距
     preview_cover_size = (scaled(80), scaled(112))
     tree_content_width = 0
+    icon_generation = 0 # 勾选或配色变化后自增，屏幕外的树项据此标脏
 
     def get_tree_cover_gap(display_name: str) -> int: # 名称以中文左括号开头时不添加封面与标题间隔
         return 0 if display_name.startswith("（") else tree_cover_gap
@@ -233,8 +235,14 @@ def build_resource_tree(
             checkbox_pils[state] = draw_checkbox_image(checkbox_size, state, theme.current_colors)
             checkbox_icons[state] = ImageTk.PhotoImage(ImageOps.expand(checkbox_pils[state], border=(0, 0, checkbox_gap, 0), fill=(0, 0, 0, 0)))
 
+    def invalidate_item_icons() -> None: # 标记全部树项图标过期，由可见行扫描按需重新合成
+        nonlocal icon_generation
+        icon_generation += 1
+
     def on_theme_changed() -> None: # 主题切换后重建复选框配色并刷新全部树项图标
         rebuild_checkbox_images()
+        invalidate_item_icons()
+        # 三态复选框是共享图片，换配色后旧图会被回收，已插入的树项都得当场换上新图
         for item_id in list(tree_item_data):
             refresh_item_image(item_id)
 
@@ -249,6 +257,7 @@ def build_resource_tree(
         return "checked" if item_id in checked_items else "unchecked"
 
     def compose_item_image(item_id: str) -> ImageTk.PhotoImage: # 合成树项图标：勾选状态对应的复选框与已加载的封面
+        item_icon_generation[item_id] = icon_generation # 合成即记账，供扫描判断该项是否还需要刷新
         state = item_check_state(item_id)
         cover = tree_cover_images.get(item_id)
         if cover is None: # 尚未加载封面的树项直接复用带间距的复选框图标
@@ -268,16 +277,19 @@ def build_resource_tree(
 
     def apply_tree_icon(item_id: str, image: Image.Image | None) -> None:
         loading_tree_images.discard(item_id)
-        if image is not None:
-            tree_image = fit_cover_image(image, tree_cover_size)
-            # 搜索重建后树项可能暂不在当前视图中，仍缓存封面供下次合成复用
-            resource_data = tree_item_data.get(item_id) or find_tree_node(resource_list, item_id) or {}
-            cover_gap = get_tree_cover_gap(resource_data.get("display_name", ""))
-            if cover_gap:
-                tree_image = ImageOps.expand(tree_image, border=(0, 0, cover_gap, 0), fill=(0, 0, 0, 0))
-            tree_cover_images[item_id] = tree_image
-            tree_preview_images[item_id] = ImageTk.PhotoImage(image)
-        refresh_item_image(item_id)
+        if image is None:
+            return
+
+        tree_image = fit_cover_image(image, tree_cover_size)
+        # 搜索重建后树项可能暂不在当前视图中，仍缓存封面供下次合成复用
+        resource_data = tree_item_data.get(item_id) or find_tree_node(resource_list, item_id) or {}
+        cover_gap = get_tree_cover_gap(resource_data.get("display_name", ""))
+        if cover_gap:
+            tree_image = ImageOps.expand(tree_image, border=(0, 0, cover_gap, 0), fill=(0, 0, 0, 0))
+        tree_cover_images[item_id] = tree_image
+        tree_preview_images[item_id] = ImageTk.PhotoImage(image)
+        item_icon_generation.pop(item_id, None) # 封面到了，图标要重新合成
+        refresh_visible_items(False)
 
     def load_tree_icon(item_id: str, url: str) -> None: # 在线程中下载封面，在主线程中更新控件
         try:
@@ -309,6 +321,8 @@ def build_resource_tree(
             resource_data = tree_item_data.get(item_id) # 提示行与占位子项不是资源
             if resource_data is None:
                 continue
+            if item_icon_generation.get(item_id) != icon_generation:
+                refresh_item_image(item_id)
             if queue_covers and not resource_data.get("children"):
                 queue_tree_icon(item_id)
 
@@ -330,6 +344,7 @@ def build_resource_tree(
 
     def on_tree_view_change(first: str, last: str) -> None:
         auto_hide_scrollbar(treeview_scrollbar, first, last)
+        refresh_visible_items(False) # 滚进视野的行要立刻显示正确的勾选状态
         schedule_visible_refresh()
 
     def refresh_resource_tree() -> None: # 根据搜索词重建树视图
@@ -341,6 +356,7 @@ def build_resource_tree(
         treeview.delete(*treeview.get_children())
         tree_item_data.clear()
         tree_item_paths.clear()
+        item_icon_generation.clear()
         tree_content_width = 0
         insert_tree_level("", visible_items, (), expand_all=bool(query))
         resize_tree_column(treeview.winfo_width())
@@ -407,20 +423,13 @@ def build_resource_tree(
     def sync_checked_items() -> None: # 粘贴、删除、撤销以及树项操作统一以输入框中的链接为准
         urls = {line.strip() for line in url_text.get("1.0", "end").splitlines()}
         new_checked_items = {item_id for item_id, url in leaf_urls.items() if url in urls}
-        changed_ids = checked_items.symmetric_difference(new_checked_items)
-        if not changed_ids:
+        if new_checked_items == checked_items:
             return
         checked_items.clear()
         checked_items.update(new_checked_items)
 
-        refresh_ids: set[str] = set() # 状态变化的末级资源及其各级祖先分类都需要刷新图标
-        for leaf_id in changed_ids:
-            segments = leaf_id.split(":")
-            refresh_ids.update(":".join(segments[:index]) for index in range(1, len(segments) + 1))
-        for refresh_id in refresh_ids:
-            if refresh_id in tree_item_data:
-                refresh_item_image(refresh_id)
-
+        invalidate_item_icons() # 末级资源与各级祖先分类的图标都可能变，屏幕外的等滚进视野再合成
+        refresh_visible_items(False)
         update_checked_count()
 
     def on_urls_modified(_event: tk.Event) -> None:

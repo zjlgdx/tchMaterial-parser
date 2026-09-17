@@ -19,6 +19,15 @@ from src.tchmaterial_parser.ui import resource_tree, runtime, theme
 
 
 visible_tree_rows = resource_tree.visible_tree_rows # 未打桩的实现，供需要真实几何的用例使用
+treeview_item = ttk.Treeview.item # 未打桩的实现，供计数包装复用
+
+
+def counting_item(calls): # 记录 Treeview.item 的调用，用来确认图标刷新只落在可见行上
+    def item(self, item_id, option=None, **kwargs):
+        calls.append(item_id)
+        return treeview_item(self, item_id, option, **kwargs)
+
+    return item
 
 
 def all_tree_rows(treeview): # 隐藏窗口没有真实几何，测试里把已插入的树项全部视为可见
@@ -33,6 +42,12 @@ RESOURCES = {"books": {"display_name": "电子教材", "children": {
     "primary": {"display_name": "小学", "children": {
         "a": {"display_name": "语文 一年级上册", "content_id": "a"},
         "b": {"display_name": "语文 一年级下册", "content_id": "b", "custom_properties": {"thumbnails": ["https://example.com/cover.png"]}},
+    }},
+}}}
+
+MANY_RESOURCES = {"books": {"display_name": "电子教材", "children": { # 末级资源远多于一屏，用来确认刷新只落在可见行上
+    "primary": {"display_name": "小学", "children": {
+        f"n{index}": {"display_name": f"语文 第 {index} 册", "content_id": f"n{index}"} for index in range(40)
     }},
 }}}
 
@@ -114,6 +129,15 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.mainloop()
         self.root.update()
 
+    def build_many_tree(self):
+        pane = ttk.Frame(self.root)
+        self.urls = tk.Text(self.root, undo=True)
+        resource_tree.build_resource_tree(pane, MANY_RESOURCES, self.urls)
+        self.tree = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Treeview))
+        self.root.update()
+        self.expand("books:primary")
+        return self.tree
+
     def filter(self, query):
         self.search.delete(0, "end")
         self.search.insert(0, query)
@@ -167,6 +191,57 @@ class ResourceTreeUITest(unittest.TestCase):
         self.expand("books:primary")
         self.assert_state("books:primary:a", "checked")
         self.assert_state("books:primary:b", "unchecked")
+
+    def test_checking_a_large_category_only_repaints_visible_rows(self):
+        tree = self.build_many_tree()
+        visible = ["books:primary:n0", "books:primary:n1"]
+        calls = []
+        with patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)), \
+                patch.object(ttk.Treeview, "item", counting_item(calls)):
+            self.toggle("books")
+
+        self.assertEqual(len(tree.get_children("books:primary")), 40)
+        self.assertLessEqual(len(calls), len(visible) + 2)
+        self.assert_state("books:primary:n0", "checked")
+        self.assert_state("books:primary:n1", "checked")
+
+    def test_rows_scrolled_into_view_show_the_new_check_state(self):
+        tree = self.build_many_tree()
+        visible = ["books:primary:n0"]
+        with patch.object(resource_tree, "SCAN_MAX_WAIT_MS", 60000), \
+                patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)):
+            self.toggle("books")
+            self.assert_state("books:primary:n0", "checked")
+            self.assert_state("books:primary:n20", "unchecked") # 屏幕外的行先保持旧图标
+
+            visible[:] = ["books:primary:n20"]
+            self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
+            self.assert_state("books:primary:n20", "checked")
+
+    def test_theme_change_keeps_offscreen_icons_usable(self):
+        self.expand("books:primary")
+        with patch.object(resource_tree, "visible_tree_rows", lambda _treeview: ["books"]):
+            theme.apply_theme("dark")
+            self.root.update()
+
+        for item_id in ("books", "books:primary", "books:primary:a", "books:primary:b"):
+            self.assertGreater(self.image(item_id).width, 0)
+        self.assert_state("books:primary:a", "unchecked") # 屏幕外的行也要换上新配色的复选框
+
+    def test_status_row_gets_no_icon_and_no_cover_request(self):
+        requests_before = resource_tree.session.get.call_count
+        pane = ttk.Frame(self.root)
+        urls = tk.Text(self.root, undo=True)
+        resource_tree.build_resource_tree(pane, {}, urls, "正在加载资源列表…")
+        tree = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Treeview))
+        self.root.update()
+        self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
+        self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit) # 等去抖后的封面扫描也跑一遍
+        self.root.mainloop()
+        self.root.update()
+
+        self.assertEqual(tree.item(resource_tree.STATUS_ITEM_ID, "image"), "")
+        self.assertEqual(resource_tree.session.get.call_count, requests_before)
 
     def test_cover_and_checkbox_survive_search_clear_and_theme_changes(self):
         self.expand("books:primary")
