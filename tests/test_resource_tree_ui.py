@@ -32,6 +32,14 @@ def counting_item(calls): # 记录 Treeview.item 的调用，用来确认图标�
     return item
 
 
+def counting_rows(calls): # 记录可见行扫描的次数
+    def visible(treeview):
+        calls.append(treeview)
+        return all_tree_rows(treeview)
+
+    return visible
+
+
 def all_tree_rows(treeview): # 隐藏窗口没有真实几何，测试里把已插入的树项全部视为可见
     def walk(parent):
         for item in treeview.get_children(parent):
@@ -51,6 +59,14 @@ RESOURCES = {"books": {"display_name": "电子教材", "children": {
 MANY_RESOURCES = {"books": {"display_name": "电子教材", "children": { # 末级资源远多于一屏，用来确认刷新只落在可见行上
     "primary": {"display_name": "小学", "children": {
         f"n{index}": {"display_name": f"语文 第 {index} 册", "content_id": f"n{index}"} for index in range(40)
+    }},
+}}}
+
+NESTED_RESOURCES = {"books": {"display_name": "电子教材", "children": { # 三层分类，用来观察反复展开与列宽
+    "primary": {"display_name": "小学", "children": {
+        "unit": {"display_name": "第一单元", "children": {
+            "a": {"display_name": "语文 一年级上册（含教师教学用书与配套音频）", "content_id": "a"},
+        }},
     }},
 }}}
 
@@ -320,6 +336,68 @@ class ResourceTreeUITest(unittest.TestCase):
             self.hover(tree, "books:primary:c1") # 换一行再回来，否则沿用同一次悬停
             self.hover(tree, "books:primary:c0")
             self.assertTrue(any(label.cget("image") for label in self.tooltip_labels()))
+
+    def test_scroll_events_merge_into_one_cover_scan(self):
+        tree = self.build_tree(MANY_RESOURCES)
+        scans = []
+        events = 10
+        with patch.object(resource_tree, "SCAN_MAX_WAIT_MS", 60000), \
+                patch.object(resource_tree, "visible_tree_rows", counting_rows(scans)):
+            for _index in range(events):
+                self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
+                self.root.update()
+            self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit)
+            self.root.mainloop()
+            self.root.update()
+
+        # 每次事件固定有一次同步图标刷新，此外的封面扫描被合并成一次
+        self.assertLessEqual(len(scans), events + 1)
+
+    def test_second_scan_does_not_repaint_unchanged_rows(self):
+        tree = self.build_tree(MANY_RESOURCES)
+        with patch.object(resource_tree, "visible_tree_rows", lambda _treeview: ["books:primary:n0", "books:primary:n1"]):
+            self.toggle("books")
+            self.scan(tree)
+            calls = []
+            with patch.object(ttk.Treeview, "item", counting_item(calls)):
+                self.scan(tree)
+
+        self.assertEqual(calls, []) # 图标没有过期，再扫一次不重绘任何行
+
+    def test_reexpanding_keeps_already_inserted_children(self):
+        tree = self.build_tree(NESTED_RESOURCES)
+        self.expand("books:primary:unit")
+        self.assertEqual(tree.get_children("books:primary:unit"), ("books:primary:unit:a",))
+
+        tree.item("books:primary", open=False)
+        self.root.update()
+        self.expand("books:primary")
+
+        self.assertEqual(tree.get_children("books:primary"), ("books:primary:unit",)) # 没有重复插入
+        self.assertEqual(tree.get_children("books:primary:unit"), ("books:primary:unit:a",))
+        self.assertTrue(tree.item("books:primary:unit", "open")) # 子分类保持展开
+
+    def test_expanding_widens_the_tree_column(self):
+        tree = self.build_tree(NESTED_RESOURCES)
+        width = tree.column("#0", "width")
+        self.expand("books:primary:unit") # 这一层的标题更长
+        self.assertGreater(tree.column("#0", "width"), width)
+
+    def test_failed_cover_releases_its_slot(self):
+        failed = type("FailedResponse", (), {"ok": False})()
+        started = []
+        with patch.object(resource_tree, "COVER_WORKERS", 1), \
+                patch.object(resource_tree, "thread_it", lambda worker, *args: started.append((worker, args))), \
+                patch.object(resource_tree, "visible_tree_rows", lambda _treeview: ["books:primary:c0", "books:primary:c1"]):
+            self.build_tree(COVER_RESOURCES)
+            self.assertEqual([args[0] for _worker, args in started], ["books:primary:c0"]) # 名额只有一个
+
+            with patch.object(resource_tree.session, "get", return_value=failed):
+                worker, args = started[0]
+                worker(*args) # 第一张下载失败
+                self.root.update()
+
+            self.assertEqual([args[0] for _worker, args in started], ["books:primary:c0", "books:primary:c1"])
 
     def test_hover_reload_dispatches_once_while_all_slots_are_busy(self):
         started = []
