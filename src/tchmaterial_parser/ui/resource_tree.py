@@ -328,8 +328,6 @@ def build_resource_tree(
     def pump_cover_queue() -> None: # 在并发上限内把待载封面交给后台线程
         while pending_covers and len(loading_tree_images) < COVER_WORKERS:
             item_id, url = pending_covers.pop(0)
-            if item_id in loading_tree_images: # 已经在下载的项不占名额，也不重复派发
-                continue
             loading_tree_images.add(item_id)
             thread_it(load_tree_icon, item_id, url)
 
