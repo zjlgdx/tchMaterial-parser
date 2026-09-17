@@ -364,7 +364,8 @@ def build_resource_tree(
         if scan_after_id:
             runtime.root.after_cancel(scan_after_id)
             scan_after_id = None
-        if time.monotonic() - last_cover_scan >= SCAN_MAX_WAIT_MS / 1000: # 一直滚动时也要按时补上封面
+        waited = (time.monotonic() - last_cover_scan) * 1000
+        if waited >= SCAN_MAX_WAIT_MS: # 一直滚动时也要按时补上封面
             refresh_visible_items(True)
             return
 
@@ -373,7 +374,8 @@ def build_resource_tree(
             scan_after_id = None
             refresh_visible_items(True)
 
-        scan_after_id = runtime.root.after(SCAN_DEBOUNCE_MS, run_scan)
+        # 每次重排都缩短到距最长间隔的剩余时间，滚动不停时扫描也不会被一再推迟
+        scan_after_id = runtime.root.after(min(SCAN_DEBOUNCE_MS, round(SCAN_MAX_WAIT_MS - waited)), run_scan)
 
     def on_tree_view_change(first: str, last: str) -> None:
         auto_hide_scrollbar(treeview_scrollbar, first, last)
