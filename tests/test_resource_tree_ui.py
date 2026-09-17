@@ -357,21 +357,27 @@ class ResourceTreeUITest(unittest.TestCase):
 
     def cover_scan_probe(self, clock):
         # 受控时钟从建树前就生效：建树期间记下的时刻也得来自它，否则调度看到的是两套时间
-        # 可见行里放一张还没开始下载的封面，派发记录就等于"跑了几次带封面排队的扫描"
+        # 可见行里放一张还没开始下载的封面：扫描计数看有没有扫，派发记录看扫到的是不是这一次
         started = []
+        scans = []
         visible = []
         enter = self.context.enter_context
+
+        def visible_rows(_treeview):
+            scans.append(1)
+            return list(visible)
+
         # 只替换资源树模块看到的时钟，别冻住整个进程的 time.monotonic
         enter(patch.object(resource_tree, "time", SimpleNamespace(monotonic=lambda: clock[0])))
         enter(patch.object(resource_tree, "thread_it", lambda _worker, *args: started.append(args[0])))
-        enter(patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)))
+        enter(patch.object(resource_tree, "visible_tree_rows", visible_rows))
         tree = self.build_tree(COVER_RESOURCES)
         visible.append("books:primary:c0")
-        return tree, started
+        return tree, started, scans
 
     def test_scroll_events_leave_one_pending_cover_scan(self):
         clock = [1000.0]
-        tree, started = self.cover_scan_probe(clock)
+        tree, started, scans = self.cover_scan_probe(clock)
         timers = self.install_fake_timers()
         for _index in range(5):
             clock[0] += 0.005
@@ -381,12 +387,15 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(len(pending), 1) # 五次事件只留一个待执行的扫描
         self.assertEqual(pending[0][0], resource_tree.SCAN_DEBOUNCE_MS)
         self.assertEqual(started, []) # 到点之前一张封面也不派发
+
+        before = len(scans)
         pending[0][1]()
-        self.assertEqual(started, ["books:primary:c0"]) # 到点后只扫一次
+        self.assertEqual(len(scans) - before, 1) # 到点后只扫一次
+        self.assertEqual(started, ["books:primary:c0"])
 
     def test_first_event_after_an_idle_period_is_still_deferred(self):
         clock = [1000.0]
-        tree, started = self.cover_scan_probe(clock)
+        tree, started, _scans = self.cover_scan_probe(clock)
         timers = self.install_fake_timers()
 
         clock[0] += 10 # 用户停了很久才继续滚动
@@ -399,7 +408,7 @@ class ResourceTreeUITest(unittest.TestCase):
 
     def test_continuous_scrolling_scans_at_the_longest_interval(self):
         clock = [1000.0]
-        tree, started = self.cover_scan_probe(clock)
+        tree, started, _scans = self.cover_scan_probe(clock)
         timers = self.install_fake_timers()
 
         self.scroll(tree) # 本轮推迟从这里开始计时
