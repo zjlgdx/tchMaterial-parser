@@ -199,7 +199,7 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
 
     def scan(self, tree):
-        self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
+        self.scroll(tree)
         self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit) # 等去抖后的封面扫描跑完
         self.root.mainloop()
         self.root.update()
