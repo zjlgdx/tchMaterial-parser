@@ -32,14 +32,6 @@ def counting_item(calls): # 记录 Treeview.item 的调用，用来确认图标�
     return item
 
 
-def counting_rows(calls): # 记录可见行扫描的次数
-    def visible(treeview):
-        calls.append(treeview)
-        return all_tree_rows(treeview)
-
-    return visible
-
-
 def all_tree_rows(treeview): # 隐藏窗口没有真实几何，测试里把已插入的树项全部视为可见
     def walk(parent):
         for item in treeview.get_children(parent):
@@ -178,6 +170,31 @@ class ResourceTreeUITest(unittest.TestCase):
     def tooltip_labels(self):
         tooltip = next(widget for widget in self.root.winfo_children() if isinstance(widget, tk.Toplevel))
         return tooltip.winfo_children()[0].winfo_children()
+
+    def install_fake_timers(self, clock):
+        # 不真正计时：记录下每个定时器，由用例决定何时触发，并让产品代码读到受控时钟
+        timers = []
+        enter = self.context.enter_context
+
+        def after(delay, callback=None, *args):
+            timers.append([delay, callback, f"timer{len(timers)}"])
+            return timers[-1][2]
+
+        def after_cancel(timer_id):
+            for timer in timers:
+                if timer[2] == timer_id:
+                    timer[1] = None
+
+        enter(patch.object(self.root, "after", after))
+        enter(patch.object(self.root, "after_cancel", after_cancel))
+        enter(patch.object(resource_tree.time, "monotonic", lambda: clock[0]))
+        return timers
+
+    def live_timers(self, timers):
+        return [timer for timer in timers if timer[1] is not None]
+
+    def scroll(self, tree):
+        self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
 
     def scan(self, tree):
         self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
@@ -338,21 +355,61 @@ class ResourceTreeUITest(unittest.TestCase):
             self.hover(tree, "books:primary:c0")
             self.assertTrue(any(label.cget("image") for label in self.tooltip_labels()))
 
-    def test_scroll_events_merge_into_one_cover_scan(self):
-        tree = self.build_tree(MANY_RESOURCES)
-        scans = []
-        events = 10
-        with patch.object(resource_tree, "SCAN_MAX_WAIT_MS", 60000), \
-                patch.object(resource_tree, "visible_tree_rows", counting_rows(scans)):
-            for _index in range(events):
-                self.root.tk.call(tree.cget("yscrollcommand"), "0.0", "1.0") # 滚动时 Tk 调用的就是这个回调
-                self.root.update()
-            self.root.after(resource_tree.SCAN_DEBOUNCE_MS * 2, self.root.quit)
-            self.root.mainloop()
-            self.root.update()
+    def cover_scan_probe(self):
+        # 可见行里放一张还没开始下载的封面，派发记录就等于"跑了几次带封面排队的扫描"
+        started = []
+        visible = []
+        self.context.enter_context(patch.object(resource_tree, "thread_it", lambda _worker, *args: started.append(args[0])))
+        self.context.enter_context(patch.object(resource_tree, "visible_tree_rows", lambda _treeview: list(visible)))
+        tree = self.build_tree(COVER_RESOURCES)
+        visible.append("books:primary:c0")
+        return tree, started
 
-        # 每次事件固定有一次同步图标刷新，此外的封面扫描被合并成一次
-        self.assertLessEqual(len(scans), events + 1)
+    def test_scroll_events_leave_one_pending_cover_scan(self):
+        clock = [1000.0]
+        tree, started = self.cover_scan_probe()
+        timers = self.install_fake_timers(clock)
+        for _index in range(5):
+            clock[0] += 0.005
+            self.scroll(tree)
+
+        pending = self.live_timers(timers)
+        self.assertEqual(len(pending), 1) # 五次事件只留一个待执行的扫描
+        self.assertEqual(pending[0][0], resource_tree.SCAN_DEBOUNCE_MS)
+        self.assertEqual(started, []) # 到点之前一张封面也不派发
+        pending[0][1]()
+        self.assertEqual(started, ["books:primary:c0"]) # 到点后只扫一次
+
+    def test_first_event_after_an_idle_period_is_still_deferred(self):
+        clock = [1000.0]
+        tree, started = self.cover_scan_probe()
+        timers = self.install_fake_timers(clock)
+
+        clock[0] += 10 # 用户停了很久才继续滚动
+        self.scroll(tree)
+
+        pending = self.live_timers(timers)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0][0], resource_tree.SCAN_DEBOUNCE_MS) # 新一轮的第一个事件照样要等
+        self.assertEqual(started, [])
+
+    def test_continuous_scrolling_scans_at_the_longest_interval(self):
+        clock = [1000.0]
+        tree, started = self.cover_scan_probe()
+        timers = self.install_fake_timers(clock)
+
+        self.scroll(tree) # 本轮推迟从这里开始计时
+        clock[0] += resource_tree.SCAN_MAX_WAIT_MS / 1000 - 0.010
+        self.scroll(tree)
+        pending = self.live_timers(timers)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0][0], 10) # 延迟缩到距最长间隔的剩余时间
+        self.assertEqual(started, [])
+
+        clock[0] += 0.020 # 越过最长间隔
+        self.scroll(tree)
+        self.assertEqual(started, ["books:primary:c0"]) # 立刻扫一次
+        self.assertEqual(self.live_timers(timers), []) # 并重新开始计时
 
     def test_second_scan_does_not_repaint_unchanged_rows(self):
         tree = self.build_tree(MANY_RESOURCES)
