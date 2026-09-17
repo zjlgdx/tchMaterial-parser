@@ -8,6 +8,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import ttk
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -187,7 +188,8 @@ class ResourceTreeUITest(unittest.TestCase):
 
         enter(patch.object(self.root, "after", after))
         enter(patch.object(self.root, "after_cancel", after_cancel))
-        enter(patch.object(resource_tree.time, "monotonic", lambda: clock[0]))
+        # 只替换资源树模块看到的时钟，别冻住整个进程的 time.monotonic
+        enter(patch.object(resource_tree, "time", SimpleNamespace(monotonic=lambda: clock[0])))
         return timers
 
     def live_timers(self, timers):
