@@ -173,6 +173,12 @@ class ResourceTreeUITest(unittest.TestCase):
         return tooltip.winfo_children()[0].winfo_children()
 
     def install_fake_timers(self):
+        # 先把建树排下的真实定时器跑完：产品要是握着真实定时器 id 进入替身阶段，取消就成了空操作
+        deadline = time.monotonic() + 2
+        while self.root.tk.eval("after info") and time.monotonic() < deadline:
+            self.root.update()
+        self.assertFalse(self.root.tk.eval("after info"), "建树遗留的真实定时器未到点")
+
         # 不真正计时：记录下每个定时器，由用例决定何时触发
         timers = []
         enter = self.context.enter_context
@@ -379,13 +385,13 @@ class ResourceTreeUITest(unittest.TestCase):
         enter(patch.object(resource_tree, "thread_it", lambda _worker, *args: started.append(args[0])))
         enter(patch.object(resource_tree, "visible_tree_rows", visible_rows))
         tree = self.build_tree(COVER_RESOURCES)
-        visible.append("books:primary:c0")
-        return tree, started, scans
+        timers = self.install_fake_timers()
+        visible.append("books:primary:c0") # 定时器替身就位后再让这张封面可见
+        return tree, started, scans, timers
 
     def test_scroll_events_leave_one_pending_cover_scan(self):
         clock = [1000.0]
-        tree, started, scans = self.cover_scan_probe(clock)
-        timers = self.install_fake_timers()
+        tree, started, scans, timers = self.cover_scan_probe(clock)
         for _index in range(5):
             clock[0] += 0.005
             self.scroll(tree)
@@ -408,8 +414,7 @@ class ResourceTreeUITest(unittest.TestCase):
 
     def test_first_event_after_an_idle_period_is_still_deferred(self):
         clock = [1000.0]
-        tree, started, _scans = self.cover_scan_probe(clock)
-        timers = self.install_fake_timers()
+        tree, started, _scans, timers = self.cover_scan_probe(clock)
 
         clock[0] += 10 # 用户停了很久才继续滚动
         self.scroll(tree)
@@ -421,8 +426,7 @@ class ResourceTreeUITest(unittest.TestCase):
 
     def test_continuous_scrolling_scans_at_the_longest_interval(self):
         clock = [1000.0]
-        tree, started, _scans = self.cover_scan_probe(clock)
-        timers = self.install_fake_timers()
+        tree, started, _scans, timers = self.cover_scan_probe(clock)
 
         self.scroll(tree) # 本轮推迟从这里开始计时
         clock[0] += resource_tree.SCAN_MAX_WAIT_MS / 1000 - 0.010
