@@ -52,6 +52,11 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     # GUI
     root = tk.Tk()
 
+    def report_callback_exception(exc_type: type, exc_value: BaseException, exc_traceback: object) -> None: # Tk 与界面队列的回调异常统一落到日志
+        logger.error("界面回调出错", exc_info=(exc_type, exc_value, exc_traceback))
+
+    root.report_callback_exception = report_callback_exception
+
     # 主窗口、界面字体与缩放因子由本函数创建，但其余模块也要用到，
     # 因此在此写入对应模块，供它们通过 runtime.root、runtime.ui_scale 等访问
     runtime.bind_root(root)
