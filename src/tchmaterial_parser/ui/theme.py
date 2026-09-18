@@ -11,7 +11,7 @@ import sv_ttk # Sun Valley（Windows 11 风格）主题
 
 from . import runtime
 from .runtime import scaled
-from ..platform_utils import ctypes, os_name, print_error, winreg
+from ..platform_utils import ctypes, os_name, print_error, tk_patchlevel, winreg
 
 switched_theme = "system" # 选择的主题
 current_theme = "light" # 当前主题，若 switched_theme 为 `system` 则 current_theme 为系统主题（`light` 或 `dark`）
@@ -32,6 +32,8 @@ THEME_COLORS = {
 ACCENT_BUTTON_STYLE = "Accent.TButton"
 SWITCH_STYLE = "Switch.TCheckbutton"
 FLAT_TREEVIEW_FIELD = "Flat.Treeview.field" # 纯色的树视图底板元素，替换 sv-ttk 的卡片贴图
+BUILTIN_TREEITEM_INDICATOR = "Builtin.Treeitem.indicator" # 内置的展开箭头元素，替换 sv-ttk 的箭头贴图
+MIN_TK_WITHOUT_ITEM_STATES = (9,) # 自这个 Tk 版本起，树项的展开/末级状态不再传给树项元素
 
 # 本程序使用的命名字体，格式为 字体名称: (基准字号（像素）, 是否加粗, 是否添加下划线)
 APP_FONTS = {
@@ -141,21 +143,38 @@ def apply_widget_theme(widget: tk.Widget) -> None: # 为单个 tk 原生控件�
             selectforeground=current_colors["selfg"], borderwidth=0, relief="flat", highlightthickness=0,
         )
 
-def use_flat_treeview_field(style: ttk.Style) -> None: # 把树视图的底板换成纯色元素
-    # sv-ttk 的 Treeview.field 是一张 50×50 的九宫格卡片贴图，aqua 每帧都要把它平铺满整个树区域，
-    # 滚动与展开因此掉到 40 fps 上下。改用 default 主题里不含图片的 field 元素后可以跑满刷新率，
-    # 而这圈卡片描边在浅色与深色下本就几乎看不出来。
+def clone_element(name: str, source_theme: str, source_element: str) -> None: # 从内置主题克隆一个元素
     try:
-        runtime.root.tk.call("ttk::style", "element", "create", FLAT_TREEVIEW_FIELD, "from", "default", "Treeview.field")
+        runtime.root.tk.call("ttk::style", "element", "create", name, "from", source_theme, source_element)
     except tk.TclError: # 元素按 ttk 主题注册，浅色与深色各建一次；同一主题里重复创建会报错
         pass
 
+def replace_layout_element(layout: list, old: str, new: str) -> list: # 把布局里的某个元素换掉，其余结构原样保留
+    replaced = []
+    for name, options in layout:
+        options = dict(options)
+        if "children" in options:
+            options["children"] = replace_layout_element(options["children"], old, new)
+        replaced.append((new if name == old else name, options))
+    return replaced
+
+def use_flat_treeview_field(style: ttk.Style) -> None: # 把树视图的底板换成纯色元素
+    # sv-ttk 的 Treeview.field 是一张 50×50 的九宫格卡片贴图，aqua 每帧都要把它平铺满整个树区域，
+    # 滚动与展开因此掉到 40 fps 上下。改用不含图片的 field 元素后可以跑满刷新率，
+    # 而这圈卡片描边在浅色与深色下本就几乎看不出来。
+    clone_element(FLAT_TREEVIEW_FIELD, "default", "Treeview.field")
     style.layout("Custom.Treeview", [
         (FLAT_TREEVIEW_FIELD, { "sticky": "nswe", "border": "1", "children": [
             ("Treeview.padding", { "sticky": "nswe", "children": [("Treeview.treearea", { "sticky": "nswe" })] }),
         ] }),
     ])
     style.configure("Custom.Treeview", fieldbackground=current_colors["surface"]) # 贴图没了，空白区的底色要自己给
+
+def use_builtin_treeitem_indicator(style: ttk.Style) -> None: # 把展开箭头换回内置元素
+    # Tk 9 不再把树项的展开与末级状态传给树项元素，贴图做的箭头于是只会一直画同一张，
+    # 展开之后仍显示折叠的样子。内置元素自己知道该画哪一个，换回它即可。
+    clone_element(BUILTIN_TREEITEM_INDICATOR, "default", "Treeitem.indicator")
+    style.layout("Custom.Treeview.Item", replace_layout_element(style.layout("Item"), "Treeitem.indicator", BUILTIN_TREEITEM_INDICATOR))
 
 def apply_theme(theme: Literal["system", "light", "dark"]) -> None: # 应用浅色/深色主题
     global switched_theme, current_theme, current_colors
@@ -181,6 +200,8 @@ def apply_theme(theme: Literal["system", "light", "dark"]) -> None: # 应用浅�
     style.configure("Custom.Treeview", font="AppBodyFont", background=current_colors["surface"], rowheight=scaled(38))
     if os_name == "Darwin": # 只有 aqua 需要，Windows 与 Linux 保持 sv-ttk 原样
         use_flat_treeview_field(style)
+    if tk_patchlevel(runtime.root) >= MIN_TK_WITHOUT_ITEM_STATES: # 与平台无关，取决于 Tk 版本
+        use_builtin_treeitem_indicator(style)
     button_padding = (scaled(10), scaled(4)) # 增加纵向留白，使按钮在各 DPI 下保持接近 Win11 的紧凑比例
     style.configure("TButton", padding=button_padding)
     style.configure("Accent.TButton", padding=button_padding)

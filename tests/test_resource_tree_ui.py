@@ -758,6 +758,60 @@ class ResourceTreeUITest(unittest.TestCase):
 
         self.assertEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
 
+    def item_layout(self, style): # 当前生效的树项布局
+        return style.layout("Custom.Treeview.Item")
+
+    def indicator_names(self, layout): # 布局里所有指示器元素的名字
+        found = []
+        for name, options in layout:
+            if "indicator" in name:
+                found.append(name)
+            found.extend(self.indicator_names(options.get("children", [])))
+        return found
+
+    def element_names(self, layout):
+        found = []
+        for name, options in layout:
+            found.append(name)
+            found.extend(self.element_names(options.get("children", [])))
+        return found
+
+    def test_newer_tk_uses_the_builtin_expand_indicator(self):
+        # Tk 9 不再把展开状态传给树项元素，贴图做的箭头会一直停在折叠的样子
+        style = ttk.Style(self.root)
+        with patch.object(theme, "tk_patchlevel", lambda _root: (9, 0, 3)):
+            theme.apply_theme("light")
+
+        layout = self.item_layout(style)
+        self.assertEqual(self.indicator_names(layout), [theme.BUILTIN_TREEITEM_INDICATOR])
+        # 勾选框与封面是画在树项图片上的，换箭头不能把它们挤掉
+        self.assertIn("Treeitem.image", self.element_names(layout))
+        self.assertIn("Treeitem.text", self.element_names(layout))
+
+    def test_older_tk_keeps_the_themed_expand_indicator(self):
+        style = ttk.Style(self.root)
+        stock = style.layout("Item")
+        style.layout("Custom.Treeview.Item", stock) # 先还原，免得受本进程 Tk 版本影响
+        with patch.object(theme, "tk_patchlevel", lambda _root: (8, 6, 12)):
+            theme.apply_theme("light")
+
+        self.assertEqual(self.indicator_names(self.item_layout(style)), ["Treeitem.indicator"])
+
+    def test_an_unreadable_tk_version_keeps_the_themed_indicator(self):
+        style = ttk.Style(self.root)
+        style.layout("Custom.Treeview.Item", style.layout("Item"))
+        with patch.object(theme, "tk_patchlevel", lambda _root: ()): # 版本号读不到时不动布局
+            theme.apply_theme("light")
+
+        self.assertEqual(self.indicator_names(self.item_layout(style)), ["Treeitem.indicator"])
+
+    def test_switching_themes_repeatedly_keeps_the_builtin_indicator(self):
+        style = ttk.Style(self.root)
+        with patch.object(theme, "tk_patchlevel", lambda _root: (9, 0, 3)):
+            for name in ("light", "dark", "light", "dark"): # 元素按主题注册，重复创建会抛 TclError
+                theme.apply_theme(name)
+                self.assertEqual(self.indicator_names(self.item_layout(style)), [theme.BUILTIN_TREEITEM_INDICATOR])
+
     def test_switching_themes_repeatedly_keeps_the_flat_field(self):
         # 元素按 ttk 主题注册，浅色与深色是两个主题；重复创建同名元素会抛 TclError
         style = ttk.Style(self.root)
@@ -828,6 +882,24 @@ def test_visible_rows_probe_the_top_border_a_bounded_number_of_times():
     tree = FakeTreeview(50, border=6)
     assert resource_tree.visible_tree_rows(tree)[0] == "n0"
     assert [y for y in tree.identify_calls if y < tree.border] == [0, 2, 4]
+
+
+def test_replace_layout_element_only_swaps_the_named_element():
+    layout = [("A.field", {"sticky": "nswe", "children": [
+        ("A.padding", {"children": [("A.indicator", {"side": "left"}), ("A.text", {"side": "left"})]}),
+    ]})]
+
+    replaced = theme.replace_layout_element(layout, "A.indicator", "B.indicator")
+
+    assert replaced == [("A.field", {"sticky": "nswe", "children": [
+        ("A.padding", {"children": [("B.indicator", {"side": "left"}), ("A.text", {"side": "left"})]}),
+    ]})]
+    assert layout[0][1]["children"][0][1]["children"][0][0] == "A.indicator" # 原布局不被就地改写
+
+
+def test_replace_layout_element_leaves_unrelated_layouts_alone():
+    layout = [("X.field", {"sticky": "nswe"})]
+    assert theme.replace_layout_element(layout, "A.indicator", "B.indicator") == layout
 
 
 def test_visible_rows_are_empty_without_items():
