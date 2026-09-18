@@ -168,7 +168,9 @@ def use_flat_treeview_field(style: ttk.Style) -> None: # 把树视图的底板�
             ("Treeview.padding", { "sticky": "nswe", "children": [("Treeview.treearea", { "sticky": "nswe" })] }),
         ] }),
     ])
-    style.configure("Custom.Treeview", fieldbackground=current_colors["surface"]) # 贴图没了，空白区的底色要自己给
+    # 贴图没了，空白区的底色要自己给；Tk 9 的这个元素还会在树视图取得键盘焦点时画一圈蓝色焦点框，
+    # 而卡片贴图从来不画，关掉它才能保持原有观感（Tk 8.6 的同名元素没有这个选项，多给也无妨）
+    style.configure("Custom.Treeview", fieldbackground=current_colors["surface"], focuswidth=0)
 
 def use_builtin_treeitem_indicator(style: ttk.Style) -> None: # 把展开箭头换回内置元素
     # Tk 9 不再把树项的展开与末级状态传给树项元素，贴图做的箭头于是只会一直画同一张，

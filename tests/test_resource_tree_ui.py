@@ -758,6 +758,14 @@ class ResourceTreeUITest(unittest.TestCase):
 
         self.assertEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
 
+    def test_the_flat_field_draws_no_focus_ring(self):
+        # 纯色底板在 Tk 9 上会给取得键盘焦点的控件画一圈蓝边，而原本的卡片贴图从不画
+        style = ttk.Style(self.root)
+        with patch.object(theme, "os_name", "Darwin"):
+            theme.apply_theme("light")
+
+        self.assertEqual(str(style.lookup("Custom.Treeview", "focuswidth")), "0")
+
     def item_layout(self, style): # 当前生效的树项布局
         return style.layout("Custom.Treeview.Item")
 
