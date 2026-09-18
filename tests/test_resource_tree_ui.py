@@ -793,6 +793,7 @@ class ResourceTreeUITest(unittest.TestCase):
         with patch.object(theme, "os_name", "Darwin"):
             theme.apply_theme("light")
 
+        self.assertIn(theme.FLAT_TREEVIEW_FIELD, style.element_names()) # 元素没建出来时布局只是引用了个空名字
         self.assertNotEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
         self.assertEqual(style.lookup("Custom.Treeview", "fieldbackground"), theme.current_colors["surface"])
 
@@ -837,6 +838,7 @@ class ResourceTreeUITest(unittest.TestCase):
             theme.apply_theme("light")
 
         layout = self.item_layout(style)
+        self.assertIn(theme.BUILTIN_TREEITEM_INDICATOR, style.element_names()) # 元素没建出来时布局只是引用了个空名字
         self.assertEqual(self.indicator_names(layout), [theme.BUILTIN_TREEITEM_INDICATOR])
         # 勾选框与封面是画在树项图片上的，换箭头不能把它们挤掉
         self.assertIn("Treeitem.image", self.element_names(layout))

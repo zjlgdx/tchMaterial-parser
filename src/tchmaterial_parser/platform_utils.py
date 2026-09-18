@@ -3,7 +3,7 @@
 #
 # 这里只用标准库 logging，不导入本包的 logging_utils：后者要经由 config 反过来用到本模块。
 
-import logging, os, subprocess, sys, platform, webbrowser
+import logging, os, re, subprocess, sys, platform, webbrowser
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -17,10 +17,21 @@ def print_error(e: Exception) -> None: # 记录错误信息与调用栈
 def tk_patchlevel(window: object) -> tuple[int, ...]: # 解析 Tk 的完整版本号，读不到或格式异常时返回空元组
     try:
         raw = str(window.getvar("tk_patchLevel"))
-        return tuple(int(part) for part in raw.split("."))
-    except Exception as e: # 版本号不是数字时无从比较，与读不到一样按「不判断」处理
-        print_error(e)
+    except Exception as e: # 读不到就不判断，这条路径不该刷出调用栈
+        logger.debug("读取 Tk 版本号失败：%s", e)
         return ()
+
+    numbers: list[int] = []
+    for segment in raw.split("."):
+        leading_digits = re.match(r"\d+", segment) # 预发布版形如 9.1b1，取前导数字仍可比较
+        if not leading_digits:
+            break
+        numbers.append(int(leading_digits.group()))
+
+    if len(numbers) < 2: # 正常的 patchlevel 至少是「主版本.次版本」，短于此说明根本没解析出来
+        logger.debug("无法解析 Tk 版本号：%s", raw)
+        return ()
+    return tuple(numbers)
 
 def outdated_macos_tk(window: object) -> str: # macOS 上 Tk 过旧时返回它的版本号，否则返回空字符串
     if os_name != "Darwin":

@@ -211,7 +211,7 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
         description_items.append((
             "⚠️",
             f"当前 Python 自带的 Tk 为 {outdated_tk}，在此版本的 macOS 上鼠标点击可能不会被登记。"
-            "请改用 Python 3.11.7 或更高版本，或直接使用 Releases 中提供的应用。",
+            "请改用 python.org 的 Python 3.11.7 或更高版本，或直接使用 Releases 中提供的应用。",
         ))
 
     description_icons: list[ImageTk.PhotoImage] = [] # 保存 Tk 图片引用，避免图标被垃圾回收
