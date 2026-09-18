@@ -102,7 +102,7 @@ PREVIEW_CACHE_SIZE = 200 # 悬停预览缓存的封面张数
 COVER_WORKERS = 4 # 同时下载封面的线程数
 CATALOG_TICK_MS = 1000 # 加载期间刷新提示行的间隔
 CATALOG_SLOW_SECONDS = 45 # 加载超过这么久就补一句可操作的建议；单次请求的读超时是 60 秒
-CATALOG_SLOW_HINT = "，网络较慢，可先在右侧手动填写资源链接下载"
+CATALOG_SLOW_HINT = "，网络较慢" # 「可以先手动填链接」在上方的功能说明里常驻，提示行只说状态，免得长到放不下
 # 以下阈值只用于耗时日志；滚动与可见行刷新是每帧热路径，不在其中记日志
 TREE_REBUILD_SLOW_MS = 300 # 搜索后重建树视图
 TREE_EXPAND_SLOW_MS = 100 # 首次展开一个分类
@@ -204,14 +204,25 @@ def build_resource_tree(
             return catalog_status
         return f"{catalog_status}（已用 {elapsed} 秒{CATALOG_SLOW_HINT if elapsed >= CATALOG_SLOW_SECONDS else ''}）"
 
+    def show_catalog_status_row() -> None: # 写入提示行文字，并把它计入内容宽度
+        nonlocal tree_content_width
+        text = catalog_status_text()
+        treeview.item(STATUS_ITEM_ID, text=text)
+        # 提示行不经过 insert_tree_level，宽度得在这里算；否则长文案会被树列直接裁掉，横向也滚不出来
+        tree_content_width = max(tree_content_width, tree_font.measure(text) + scaled(20))
+        resize_tree_column(treeview.winfo_width())
+
     def update_catalog_status_row() -> None: # 只改提示行的文字，不重建整棵树
         if treeview.exists(STATUS_ITEM_ID):
-            treeview.item(STATUS_ITEM_ID, text=catalog_status_text())
+            show_catalog_status_row()
 
     def cancel_catalog_tick() -> None:
         nonlocal catalog_tick_after_id
         if catalog_tick_after_id:
-            runtime.root.after_cancel(catalog_tick_after_id)
+            try:
+                runtime.root.after_cancel(catalog_tick_after_id)
+            except tk.TclError as e: # 解释器收尾时主窗口可能已经销毁
+                logger.debug("取消目录加载计时失败：%s", e)
             catalog_tick_after_id = None
 
     def schedule_catalog_tick() -> None: # 加载期间每秒刷新一次提示行，让「还在加载」与「卡死」看得出区别
@@ -447,7 +458,8 @@ def build_resource_tree(
             clear_search_btn.state(["!disabled"] if query else ["disabled"])
 
             if catalog_status: # 资源目录尚未就绪，用一行提示占位
-                treeview.insert("", "end", iid=STATUS_ITEM_ID, text=catalog_status_text())
+                treeview.insert("", "end", iid=STATUS_ITEM_ID, text="")
+                show_catalog_status_row()
                 search_status_label.config(text="")
                 return
 
@@ -664,13 +676,15 @@ def build_resource_tree(
 
     def apply_resource_list(items: dict[str, dict] | None, status: str = "") -> None: # 填入后台加载到的资源目录并重建树视图；items 为 None 表示目录仍在路上，只更新提示行，status 为当前阶段；items 非 None 时进入终态，status 非空表示加载未成功，改为在树视图中显示原因
         nonlocal resource_list, catalog_status, catalog_loading
-        catalog_status = status
         if items is None:
-            catalog_loading = True
+            if not catalog_loading: # 已是终态，迟到的阶段提示不能再把它顶掉、更不能重新起表
+                return
+            catalog_status = status
             update_catalog_status_row()
             schedule_catalog_tick()
             return
 
+        catalog_status = status
         catalog_loading = False # 就绪与失败都是终态：计时到此为止，失败原因不再被秒数改写
         cancel_catalog_tick()
         resource_list = items

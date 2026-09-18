@@ -665,7 +665,9 @@ class ResourceTreeUITest(unittest.TestCase):
         pane = ttk.Frame(self.root)
         urls = tk.Text(self.root, undo=True)
         apply_resource_list = resource_tree.build_resource_tree(pane, {}, urls, status)
-        tree = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Treeview))
+        widgets = list(self.descendants(pane))
+        tree = next(widget for widget in widgets if isinstance(widget, ttk.Treeview))
+        self.catalog_search = next(widget for widget in widgets if isinstance(widget, ttk.Entry)) # 这棵树自己的搜索框
         return apply_resource_list, tree
 
     def catalog_ticks(self, timers): # 仍然有效的目录计时器
@@ -682,7 +684,7 @@ class ResourceTreeUITest(unittest.TestCase):
         self.context.enter_context(patch.object(resource_tree, "time", SimpleNamespace(monotonic=lambda: clock[0])))
         return clock
 
-    def test_stage_updates_replace_the_status_row_without_dropping_the_tree(self):
+    def test_stage_updates_replace_the_status_row(self):
         apply_resource_list, tree = self.catalog_tree()
         self.root.update()
 
@@ -690,6 +692,50 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.update()
 
         self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["正在下载资源列表（第 2/4 部分）"])
+
+    def test_a_late_stage_update_cannot_replace_a_ready_catalog(self):
+        # 目录已经就绪之后再收到阶段提示，不能把整棵树换回一行提示，也不能重新起表
+        timers = self.install_fake_timers()
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        apply_resource_list(RESOURCES)
+        self.root.update()
+
+        apply_resource_list(None, "正在下载资源列表（第 3/4 部分）")
+        self.root.update()
+        self.catalog_search.insert(0, "语文") # 搜索会整棵重建，过期提示要是留着就会在这里冒出来
+        self.root.update()
+        for timer in self.live_timers(timers):
+            timer[1]()
+        self.root.update()
+
+        self.assertFalse(tree.exists(resource_tree.STATUS_ITEM_ID))
+        self.assertTrue(tree.exists("books:primary:a"))
+        self.assertEqual(self.catalog_ticks(timers), [])
+
+    def test_a_long_status_line_widens_the_tree_column(self):
+        # 提示行不经过插入树项那条路径，宽度没人算的话长文案会被裁掉，横向也滚不出来
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        narrow = tree.column("#0", "width")
+
+        long_status = "获取资源列表失败，可重新打开本程序重试：" + "ConnectionError：HTTPSConnectionPool(host='example.com', port=443)…"
+        apply_resource_list({}, long_status)
+        self.root.update()
+
+        self.assertEqual(self.status_text(tree), long_status)
+        self.assertGreater(tree.column("#0", "width"), narrow)
+
+    def test_destroying_the_tree_cancels_the_clock(self):
+        timers = self.install_fake_timers()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+        self.assertTrue(self.catalog_ticks(timers)) # 先确认真的有表在走
+
+        tree.destroy()
+        self.root.update()
+
+        self.assertEqual(self.catalog_ticks(timers), [])
 
     def test_elapsed_time_appears_while_the_catalog_is_loading(self):
         timers = self.install_fake_timers()

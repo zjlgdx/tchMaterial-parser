@@ -22,11 +22,15 @@ from .ui.widgets import auto_hide_scrollbar, bind_context_menu, bind_tab_navigat
 
 logger = logging.getLogger(__name__)
 
-FAILURE_REASON_MAX_LENGTH = 60 # 提示行只有一行，过长的原因要截断
+FAILURE_MESSAGE_MAX_LENGTH = 60 # 提示行只有一行，过长的异常消息要截断
 
 def failure_reason(e: Exception) -> str: # 把异常整理成一句能放进提示行的原因
-    reason = " ".join(redact_access_token(str(e)).split()) or type(e).__name__
-    return reason if len(reason) <= FAILURE_REASON_MAX_LENGTH else f"{reason[:FAILURE_REASON_MAX_LENGTH]}…"
+    # 类名放在最前且从不截断：连接失败与读取超时的消息开头都是一长串 HTTPSConnectionPool(host=…，
+    # 只留消息的话两者看起来一模一样
+    message = " ".join(redact_access_token(str(e)).split())
+    if len(message) > FAILURE_MESSAGE_MAX_LENGTH:
+        message = f"{message[:FAILURE_MESSAGE_MAX_LENGTH]}…"
+    return f"{type(e).__name__}：{message}" if message else type(e).__name__
 
 # 主界面上方的功能说明：Emoji 与正文分开渲染以保留系统字体的完整字形
 DESCRIPTION_ITEMS = (
@@ -277,7 +281,8 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
             resource_list = ResourceHelper().fetch_resource_list(report_stage)
         except Exception as e:
             logger.error("获取资源目录失败", exc_info=e)
-            ui_call(apply_resource_list, {}, f"获取资源列表失败（{failure_reason(e)}），可在右侧手动填写资源链接下载，或检查网络后重新打开本程序")
+            # 下一步与原因都放一行：前半句在默认窗口里读得全，后面的原因长了可以横向滚动
+            ui_call(apply_resource_list, {}, f"获取资源列表失败，可重新打开本程序重试：{failure_reason(e)}")
             return
         ui_call(apply_resource_list, resource_list)
 
