@@ -124,7 +124,7 @@ def show_about_window() -> None: # 打开关于窗口
     license_link.grid(row=2, column=1, sticky="nw", pady=(scaled(8), 0))
 
     log_dir = log_dir_path()
-    if log_dir: # 本工具尚未支持持久化的系统上没有日志目录，此时整行不出现，免得留个点不开的链接
+    if log_dir and log_dir.is_dir(): # 日志退化为只有控制台输出时目录并不存在，此时整行不出现，免得留个点不开的链接
         ttk.Label(info_card, text="日志", style="AboutCardMuted.TLabel").grid(
             row=3, column=0, sticky="nw", padx=(0, scaled(16)), pady=(scaled(8), 0),
         )

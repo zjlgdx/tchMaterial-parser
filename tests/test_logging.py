@@ -10,8 +10,11 @@ from unittest.mock import patch
 from src.tchmaterial_parser import config, logging_utils, platform_utils
 
 
-FAKE_TOKEN = "FAKE-ACCESS-TOKEN-0123456789"
+FAKE_TOKEN = "FAKE-ACCESS-TOKEN-0123456789" # 打桩进内存凭据的那一份
 FAKE_MAC_KEY = "FAKE-MAC-KEY-9876543210"
+# 出现在日志文本里、但并不等于内存凭据的一份：用它才能验出规则本身是否生效，
+# 而不是被「内存凭据字面值」那条兜底顺手遮掉
+SAMPLE_SECRET = "SAMPLE-SECRET-ABCDEFGHIJ"
 
 
 class LogDirPathTest(unittest.TestCase):
@@ -82,6 +85,16 @@ class SetupLoggingTest(unittest.TestCase):
 
         self.assertEqual(self.file_handlers(), [])
 
+    def test_an_unlocatable_home_directory_does_not_stop_startup(self) -> None:
+        # 缺少 HOME 时 Path.home() 抛的是 RuntimeError，而 setup_logging 是 main() 的第一步
+        def no_home() -> Path:
+            raise RuntimeError("Could not determine home directory")
+
+        with patch.object(logging_utils.config, "log_dir_path", no_home):
+            logging_utils.setup_logging() # 不应抛出异常
+
+        self.assertEqual(self.file_handlers(), [])
+
 
 class RedactionTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -105,24 +118,52 @@ class RedactionTest(unittest.TestCase):
             handler.flush()
         return self.log_file.read_text(encoding="utf-8")
 
-    def assert_no_plaintext(self, text: str) -> None:
-        self.assertNotIn(FAKE_TOKEN, text)
-        self.assertNotIn(FAKE_MAC_KEY, text)
+    def assert_no_plaintext(self, text: str, *secrets: str) -> None:
+        for secret in secrets or (SAMPLE_SECRET,):
+            self.assertNotIn(secret, text)
         self.assertIn(logging_utils.REDACTED, text)
 
     def test_message_and_args_are_redacted(self) -> None:
-        self.logger.info("请求 %s", f"https://example.com/file.pdf?accessToken={FAKE_TOKEN}&x=1")
-        self.logger.info("Authorization: Bearer %s", FAKE_TOKEN)
-        self.logger.info('X-ND-AUTH: MAC id="%s",nonce="0",mac="0"', FAKE_TOKEN)
-        self.logger.info("Cookie: session=%s", FAKE_TOKEN)
-        self.logger.info("裸串形式的凭据 %s 与 %s", FAKE_TOKEN, FAKE_MAC_KEY)
+        self.logger.info("请求 %s", f"https://example.com/file.pdf?accessToken={SAMPLE_SECRET}&x=1")
+        self.logger.info("Authorization: Bearer %s", SAMPLE_SECRET)
+        self.logger.info('X-ND-AUTH: MAC id="%s",nonce="0",mac="%s"', SAMPLE_SECRET, SAMPLE_SECRET)
+        self.logger.info("Cookie: session=%s; theme=dark", SAMPLE_SECRET)
 
         self.assert_no_plaintext(self.written())
+
+    def test_credentials_in_memory_are_masked_even_without_a_known_shape(self) -> None:
+        # 凭据也可能以裸串形式出现在某条消息里，认不出形态时靠内存里的值兜底
+        self.logger.info("凭据 %s 与 %s", FAKE_TOKEN, FAKE_MAC_KEY)
+
+        self.assert_no_plaintext(self.written(), FAKE_TOKEN, FAKE_MAC_KEY)
+
+    def test_token_is_redacted_in_every_shape_it_can_reach_the_log(self) -> None:
+        # 关掉内存凭据兜底，单独验规则本身；这些形态都可能出现在第三方库的异常文本里
+        with patch.multiple(logging_utils.config, access_token=None, mac_key=None):
+            for name, text in {
+                "查询串": f"https://a.com/x.pdf?accessToken={SAMPLE_SECRET}&p=1",
+                "下划线键名": f"https://a.com/x.pdf?access_token={SAMPLE_SECRET}&p=1",
+                "URL 编码": f"https://a.com/x.pdf%3FaccessToken%3D{SAMPLE_SECRET}",
+                "HTML 转义": f"https://a.com/x.pdf?a=1&amp;accessToken={SAMPLE_SECRET}",
+                "JSON 字段": f'{{"accessToken": "{SAMPLE_SECRET}", "x": 1}}',
+                "裸键值对": f"accessToken={SAMPLE_SECRET}",
+                "签名与 id": f'MAC id="{SAMPLE_SECRET}",nonce="0",mac="{SAMPLE_SECRET}"',
+            }.items():
+                with self.subTest(name):
+                    redacted = logging_utils.redact_sensitive(text)
+                    self.assertNotIn(SAMPLE_SECRET, redacted)
+                    self.assertIn(logging_utils.REDACTED, redacted)
+
+    def test_redaction_leaves_ordinary_text_alone(self) -> None: # 只锚定在键名上，不能见值就抹
+        with patch.multiple(logging_utils.config, access_token=None, mac_key=None):
+            for text in ("正在下载第 3/8 部分", "https://a.com/x.pdf?contentId=abc123&p=1", "Mac 上的窗口标题"):
+                with self.subTest(text):
+                    self.assertEqual(logging_utils.redact_sensitive(text), text)
 
     def test_exception_traceback_is_redacted(self) -> None:
         # requests 的连接异常会把完整 URL 写进消息里，而这段文本是 Formatter 事后才拼出来的
         try:
-            raise ConnectionError(f"HTTPSConnectionPool: /a.pdf?accessToken={FAKE_TOKEN} 连接失败")
+            raise ConnectionError(f"HTTPSConnectionPool: /a.pdf?accessToken={SAMPLE_SECRET} 连接失败")
         except ConnectionError as error:
             self.logger.error("下载失败", exc_info=error)
 
@@ -137,7 +178,7 @@ class RedactionTest(unittest.TestCase):
         self.assertIn("配置项 theme 必须是字符串", "\n".join(captured.output))
 
     def test_redact_access_token_keeps_the_rest_of_the_url(self) -> None:
-        redacted = logging_utils.redact_access_token(f"https://example.com/a.pdf?accessToken={FAKE_TOKEN}&page=3")
+        redacted = logging_utils.redact_access_token(f"https://example.com/a.pdf?accessToken={SAMPLE_SECRET}&page=3")
 
         self.assertEqual(redacted, f"https://example.com/a.pdf?accessToken={logging_utils.REDACTED}&page=3")
 

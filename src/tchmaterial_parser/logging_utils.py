@@ -26,22 +26,29 @@ UNKNOWN_VERSION = "未知"
 DEPENDENCIES = (("pillow", "PIL"), ("psutil", "psutil"), ("pypdf", "pypdf"), ("requests", "requests"), ("sv-ttk", "sv_ttk"))
 WINDOWS_DEPENDENCIES = (("pywin32", "win32api"),)
 
-_ACCESS_TOKEN_QUERY = re.compile(r"([?&]accessToken=)[^&\s'\"]+", re.IGNORECASE)
+# Token 可能以查询串、表单、URL 编码、HTML 转义或 JSON 字段等形态出现，统一锚定在键名上，
+# 键名之外一概不动，免得把正常文本也打成马赛克
+_TOKEN_KEY = r"access[_-]?token"
+_TOKEN_ASSIGNMENT = re.compile(rf"({_TOKEN_KEY}\s*(?:=|%3D))[^&\s'\"<;]+", re.IGNORECASE)
+_TOKEN_JSON = re.compile(rf"([\"']{_TOKEN_KEY}[\"']\s*:\s*[\"'])[^\"']*", re.IGNORECASE)
 _BEARER = re.compile(r"(Bearer\s+)[^\s'\",]+", re.IGNORECASE)
 _MAC_ID = re.compile(r"(MAC\s+id=\")[^\"]*", re.IGNORECASE)
+_MAC_SIGNATURE = re.compile(r"(\bmac=\")[^\"]*", re.IGNORECASE) # X-ND-AUTH 里的签名与 id 同样敏感
 _COOKIE = re.compile(r"((?:Cookie|Set-Cookie)\s*[:=]\s*)[^\r\n]+", re.IGNORECASE)
 
 logger = logging.getLogger(PACKAGE_LOGGER)
 _configured = False
 
 def redact_access_token(text: str) -> str:
-    """隐藏查询串里可能残留的 accessToken。本工具不再主动拼接该参数，但异常或用户粘贴的 URL 仍可能带上。"""
-    return _ACCESS_TOKEN_QUERY.sub(rf"\1{REDACTED}", text)
+    """隐藏文本里可能残留的 accessToken。本工具不再主动拼接该参数，但异常或用户粘贴的 URL 仍可能带上。"""
+    text = _TOKEN_ASSIGNMENT.sub(rf"\1{REDACTED}", text)
+    return _TOKEN_JSON.sub(rf"\1{REDACTED}", text)
 
 def redact_sensitive(text: str) -> str: # 在 accessToken 之外，再遮蔽鉴权头与内存中的凭据原文
     text = redact_access_token(text)
     text = _BEARER.sub(rf"\1{REDACTED}", text)
     text = _MAC_ID.sub(rf"\1{REDACTED}", text)
+    text = _MAC_SIGNATURE.sub(rf"\1{REDACTED}", text)
     text = _COOKIE.sub(rf"\1{REDACTED}", text)
     for secret in (config.access_token, config.mac_key): # 凭据也可能以裸串形式出现在日志里
         if secret and len(secret) >= 8: # 过短的值多半不是真凭据，全局替换反而会把正常文本打成马赛克
@@ -73,16 +80,19 @@ def setup_logging() -> None: # 配置本程序的日志输出，重复调用不�
         console_handler.setFormatter(formatter)
         logger.addHandler(console_handler)
 
-    log_dir = config.log_dir_path()
-    if not log_dir: # 本工具尚未支持该系统的持久化，没有确定的日志目录可用
-        return
+    log_dir = None
     try:
+        # 定位目录本身也可能失败：缺少 HOME 时 Path.home() 会抛 RuntimeError。
+        # 这是 main() 的第一步，无论如何都不能把程序拦在启动阶段，取不到就只留控制台输出。
+        log_dir = config.log_dir_path()
+        if not log_dir: # 本工具尚未支持该系统的持久化，没有确定的日志目录可用
+            return
         log_dir.mkdir(parents=True, exist_ok=True)
         file_handler = RotatingFileHandler(
             log_dir / LOG_FILE_NAME, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8", delay=True,
         )
-    except OSError as e: # 只读文件系统、权限不足等，退回到只有控制台输出，不能让程序起不来
-        logger.warning("无法创建日志目录 %s：%s", log_dir, e)
+    except (OSError, RuntimeError) as e: # 只读文件系统、权限不足、定位不到用户目录等
+        logger.warning("无法启用日志文件（%s）：%s", log_dir or "目录未知", e)
         return
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)

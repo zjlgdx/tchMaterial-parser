@@ -754,8 +754,10 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
         current_state["downloaded_size"], current_state["total_size"] = 0, 0
         try:
             os.remove(temp_path)
-        except Exception as e: # 半成品可能压根没建出来，删不掉不影响结局判定
-            logger.debug("清理临时文件 %s 失败：%s", temp_path, e)
+        except FileNotFoundError: # 这一轮没来得及建出半成品，属于常态
+            pass
+        except Exception as e: # 删不掉不影响本次结局，但残留的半成品会一直占着磁盘，值得留痕
+            logger.warning("清理临时文件 %s 失败：%s", temp_path, e)
 
     try:
         with _download_slots:
