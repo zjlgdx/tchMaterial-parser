@@ -2,6 +2,7 @@
 # 这里出现的 Token 全是显眼的假值：未被忽略的文件里不得留下任何真实凭据。
 import logging
 import tempfile
+import time
 import unittest
 from importlib import metadata
 from pathlib import Path
@@ -153,6 +154,41 @@ class RedactionTest(unittest.TestCase):
                     redacted = logging_utils.redact_sensitive(text)
                     self.assertNotIn(SAMPLE_SECRET, redacted)
                     self.assertIn(logging_utils.REDACTED, redacted)
+
+    def test_redaction_stops_at_the_separator_after_the_token(self) -> None:
+        # 遮住的只能是值本身：日志里 Token 后面往往还跟着别的参数、括号或正文
+        with patch.multiple(logging_utils.config, access_token=None, mac_key=None):
+            for name, (text, expected) in {
+                "URL 编码的后续参数": (
+                    "url%3FaccessToken%3D123%26page%3D2", f"url%3FaccessToken%3D{logging_utils.REDACTED}%26page%3D2"),
+                "逗号分隔的下一项": (
+                    "call(accessToken=secret, other=1)", f"call(accessToken={logging_utils.REDACTED}, other=1)"),
+                "圆括号与后文": (
+                    "(https://a.com?accessToken=xxx) 后文", f"(https://a.com?accessToken={logging_utils.REDACTED}) 后文"),
+                "方括号": (
+                    "[x](https://a.com?accessToken=xxx)", f"[x](https://a.com?accessToken={logging_utils.REDACTED})"),
+                "尖括号": (
+                    "<https://a.com?accessToken=xxx>", f"<https://a.com?accessToken={logging_utils.REDACTED}>"),
+                "花括号": (
+                    '{"u": "https://a.com?accessToken=xxx"}', f'{{"u": "https://a.com?accessToken={logging_utils.REDACTED}"}}'),
+            }.items():
+                with self.subTest(name):
+                    self.assertEqual(logging_utils.redact_access_token(text), expected)
+
+    def test_a_percent_encoded_token_value_is_redacted_whole(self) -> None:
+        # 值里的 %2B、%2F 是 Token 自身的转义，不能当成分隔符把值截成两半
+        with patch.multiple(logging_utils.config, access_token=None, mac_key=None):
+            redacted = logging_utils.redact_access_token("?accessToken=ab%2Bcd%2Fef&p=1")
+
+            self.assertEqual(redacted, f"?accessToken={logging_utils.REDACTED}&p=1")
+
+    def test_redaction_stays_linear_on_a_long_line(self) -> None:
+        # 值的匹配里带了前瞻，写错成嵌套量词就会在长行上退化
+        with patch.multiple(logging_utils.config, access_token=None, mac_key=None):
+            started = time.perf_counter()
+            logging_utils.redact_access_token("accessToken=" + "x" * 200_000)
+
+            self.assertLess(time.perf_counter() - started, 2.0)
 
     def test_redaction_leaves_ordinary_text_alone(self) -> None: # 只锚定在键名上，不能见值就抹
         with patch.multiple(logging_utils.config, access_token=None, mac_key=None):

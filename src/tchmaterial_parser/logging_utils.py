@@ -29,7 +29,10 @@ WINDOWS_DEPENDENCIES = (("pywin32", "win32api"),)
 # Token 可能以查询串、表单、URL 编码、HTML 转义或 JSON 字段等形态出现，统一锚定在键名上，
 # 键名之外一概不动，免得把正常文本也打成马赛克
 _TOKEN_KEY = r"access[_-]?token"
-_TOKEN_ASSIGNMENT = re.compile(rf"({_TOKEN_KEY}\s*(?:=|%3D))[^&\s'\"<;]+", re.IGNORECASE)
+# 值一直取到分隔符为止：除了 & 与各类括号、引号、逗号分号，URL 编码的 &（%26）同样算分隔符。
+# 不能整个排除 %，被编码的 Token 自身可能含 %2B、%2F 这类转义
+_TOKEN_VALUE = r"(?:(?!%26)[^&\s'\",;<>)\]}])+"
+_TOKEN_ASSIGNMENT = re.compile(rf"({_TOKEN_KEY}\s*(?:=|%3D)){_TOKEN_VALUE}", re.IGNORECASE)
 _TOKEN_JSON = re.compile(rf"([\"']{_TOKEN_KEY}[\"']\s*:\s*[\"'])[^\"']*", re.IGNORECASE)
 _BEARER = re.compile(r"(Bearer\s+)[^\s'\",]+", re.IGNORECASE)
 _MAC_ID = re.compile(r"(MAC\s+id=\")[^\"]*", re.IGNORECASE)
