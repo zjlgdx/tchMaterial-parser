@@ -31,6 +31,7 @@ THEME_COLORS = {
 
 ACCENT_BUTTON_STYLE = "Accent.TButton"
 SWITCH_STYLE = "Switch.TCheckbutton"
+FLAT_TREEVIEW_FIELD = "Flat.Treeview.field" # 纯色的树视图底板元素，替换 sv-ttk 的卡片贴图
 
 # 本程序使用的命名字体，格式为 字体名称: (基准字号（像素）, 是否加粗, 是否添加下划线)
 APP_FONTS = {
@@ -140,6 +141,22 @@ def apply_widget_theme(widget: tk.Widget) -> None: # 为单个 tk 原生控件�
             selectforeground=current_colors["selfg"], borderwidth=0, relief="flat", highlightthickness=0,
         )
 
+def use_flat_treeview_field(style: ttk.Style) -> None: # 把树视图的底板换成纯色元素
+    # sv-ttk 的 Treeview.field 是一张 50×50 的九宫格卡片贴图，aqua 每帧都要把它平铺满整个树区域，
+    # 滚动与展开因此掉到 40 fps 上下。改用 default 主题里不含图片的 field 元素后可以跑满刷新率，
+    # 而这圈卡片描边在浅色与深色下本就几乎看不出来。
+    try:
+        runtime.root.tk.call("ttk::style", "element", "create", FLAT_TREEVIEW_FIELD, "from", "default", "Treeview.field")
+    except tk.TclError: # 元素按 ttk 主题注册，浅色与深色各建一次；同一主题里重复创建会报错
+        pass
+
+    style.layout("Custom.Treeview", [
+        (FLAT_TREEVIEW_FIELD, { "sticky": "nswe", "border": "1", "children": [
+            ("Treeview.padding", { "sticky": "nswe", "children": [("Treeview.treearea", { "sticky": "nswe" })] }),
+        ] }),
+    ])
+    style.configure("Custom.Treeview", fieldbackground=current_colors["surface"]) # 贴图没了，空白区的底色要自己给
+
 def apply_theme(theme: Literal["system", "light", "dark"]) -> None: # 应用浅色/深色主题
     global switched_theme, current_theme, current_colors
     switched_theme = theme if theme in ("system", "light", "dark") else "system"
@@ -162,6 +179,8 @@ def apply_theme(theme: Literal["system", "light", "dark"]) -> None: # 应用浅�
     style.configure("Caption.TLabel", font="AppCaptionFont", foreground=current_colors["muted"])
     style.configure("Description.TLabel", font="AppBodyFont", foreground=current_colors["muted"], background=current_colors["surface"]) # 该样式用于卡片内的文字，背景需与卡片一致
     style.configure("Custom.Treeview", font="AppBodyFont", background=current_colors["surface"], rowheight=scaled(38))
+    if os_name == "Darwin": # 只有 aqua 需要，Windows 与 Linux 保持 sv-ttk 原样
+        use_flat_treeview_field(style)
     button_padding = (scaled(10), scaled(4)) # 增加纵向留白，使按钮在各 DPI 下保持接近 Win11 的紧凑比例
     style.configure("TButton", padding=button_padding)
     style.configure("Accent.TButton", padding=button_padding)

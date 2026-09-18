@@ -661,6 +661,32 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.update()
         self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["获取资源列表失败，请手动填写资源链接，或重新打开本程序"])
 
+    def test_macos_replaces_the_card_treeview_field(self):
+        # 卡片贴图要逐帧平铺满整个树区域，aqua 上每帧多花十几毫秒
+        style = ttk.Style(self.root)
+        with patch.object(theme, "os_name", "Darwin"):
+            theme.apply_theme("light")
+
+        self.assertNotEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
+        self.assertEqual(style.lookup("Custom.Treeview", "fieldbackground"), theme.current_colors["surface"])
+
+    def test_other_systems_keep_the_card_treeview_field(self):
+        style = ttk.Style(self.root)
+        style.layout("Custom.Treeview", style.layout("Treeview")) # 先还原成 sv-ttk 的原始布局
+        with patch.object(theme, "os_name", "Windows"):
+            theme.apply_theme("light")
+
+        self.assertEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
+
+    def test_switching_themes_repeatedly_keeps_the_flat_field(self):
+        # 元素按 ttk 主题注册，浅色与深色是两个主题；重复创建同名元素会抛 TclError
+        style = ttk.Style(self.root)
+        with patch.object(theme, "os_name", "Darwin"):
+            for name in ("light", "dark", "light", "dark"):
+                theme.apply_theme(name)
+                self.assertNotEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
+                self.assertEqual(style.lookup("Custom.Treeview", "fieldbackground"), theme.current_colors["surface"])
+
     def test_paste_whitespace_and_undo_sync_without_changing_other_urls(self):
         self.expand("books:primary")
         external = "https://example.com/manual"
