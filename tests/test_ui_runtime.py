@@ -17,9 +17,6 @@ if __name__ == "__main__":
 from src.tchmaterial_parser.ui import runtime
 
 
-UI_POLL_SECONDS = runtime.UI_QUEUE_POLL_MS / 1000 * 3 # 足够走完几轮轮询
-
-
 class RecordingRoot: # 记录调度调用的假主窗口：不需要 Tk，也就不受 Tk 版本与有无桌面影响
     def __init__(self) -> None:
         self.scheduled: list[tuple[str, str]] = []
@@ -36,6 +33,45 @@ class RecordingRoot: # 记录调度调用的假主窗口：不需要 Tk，也就
 
     def after_cancel(self, *_args: object) -> None:
         self._record("after_cancel")
+
+
+class WorkerThreadSchedulingTest(unittest.TestCase):
+    """跨线程投递的机制护栏。
+
+    这一条要能在任何实现上跑起来才有意义，所以既不开窗口，也不碰投递机制的内部符号：
+    只用假主窗口看「工作线程有没有去动 Tk 的定时器」。
+    """
+
+    def setUp(self) -> None:
+        self.addCleanup(self.drop_queued_tasks)
+
+    def drop_queued_tasks(self) -> None: # 本用例投进去的任务不留给别的用例
+        pending = getattr(runtime, "_ui_queue", None)
+        while pending is not None and not pending.empty():
+            pending.get_nowait()
+
+    def test_worker_thread_delivery_never_touches_the_tk_scheduler(self) -> None:
+        # Tk 9 下工作线程排进去的回调拿得到编号却永远不执行，没人唤醒主循环。
+        # 跨线程投递因此只能入队列，交给主线程轮询取走。
+        fake_root = RecordingRoot()
+        worker_name = "投递线程"
+
+        with patch.object(runtime, "root", fake_root, create=True), patch.object(runtime, "app_closing", False):
+            worker = threading.Thread(target=lambda: runtime.ui_call(len, "x"), name=worker_name)
+            worker.start()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+
+        from_worker = [call for call in fake_root.scheduled if call[1] == worker_name]
+        self.assertEqual(
+            from_worker, [],
+            "工作线程不得调用 root.after / root.after_idle：Tk 9 下这样排进去的回调永远不会被执行，"
+            f"跨线程投递必须只入队列。实际发生了 {from_worker}",
+        )
+        self.assertEqual(
+            getattr(runtime, "_ui_queue").qsize(), 1,
+            "工作线程投递的任务必须留在队列里等主线程轮询取走，队列却是空的",
+        )
 
 
 class UiCallTest(unittest.TestCase):
@@ -93,29 +129,6 @@ class UiCallTest(unittest.TestCase):
         self.assertTrue(self.drain(done), "工作线程投递的回调没有在主线程被执行")
         self.assertEqual(seen, [(True, (1, "二"), {"key": "值"})])
 
-    def test_worker_thread_delivery_never_touches_the_tk_scheduler(self) -> None:
-        # Tk 9 下工作线程排进去的回调拿得到编号却永远不执行，没人唤醒主循环。
-        # 这条不依赖 Tk 版本，也不需要窗口：只看投递走的是队列还是 Tk 的定时器。
-        fake_root = RecordingRoot()
-        worker_name = "投递线程"
-
-        with patch.object(runtime, "root", fake_root, create=True):
-            worker = threading.Thread(target=lambda: runtime.ui_call(len, "x"), name=worker_name)
-            worker.start()
-            worker.join(5)
-        self.assertFalse(worker.is_alive())
-
-        from_worker = [call for call in fake_root.scheduled if call[1] == worker_name]
-        self.assertEqual(
-            from_worker, [],
-            "工作线程不得调用 root.after / root.after_idle：Tk 9 下这样排进去的回调永远不会被执行，"
-            f"跨线程投递必须只入队列。实际发生了 {from_worker}",
-        )
-        self.assertEqual(
-            runtime._ui_queue.qsize(), 1,
-            "工作线程投递的任务必须留在队列里等主线程轮询取走，队列却是空的",
-        )
-
     def test_main_thread_delivery_runs_within_one_update(self) -> None:
         # 既有测试依赖这条时序：主线程投递后调一次 update() 就应看到效果，不能退化成要等下一轮轮询
         seen: list[int] = []
@@ -152,7 +165,7 @@ class UiCallTest(unittest.TestCase):
 
         runtime.ui_call(seen.append, "关闭后投递")
         self.root.update()
-        time.sleep(UI_POLL_SECONDS)
+        time.sleep(runtime.UI_QUEUE_POLL_MS / 1000 * 3) # 足够走完几轮轮询
         self.root.update()
 
         self.assertEqual(seen, [])
