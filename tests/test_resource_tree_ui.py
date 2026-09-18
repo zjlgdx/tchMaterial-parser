@@ -162,7 +162,9 @@ class ResourceTreeUITest(unittest.TestCase):
         return self.tree
 
     def hover(self, tree, item_id):
-        y = next(y for y in range(4, 800, 4) if tree.identify_row(y) == item_id)
+        y = next((y for y in range(4, 800, 4) if tree.identify_row(y) == item_id), None)
+        if y is None: # Tk 9 起，窗口未映射时 identify_row 不再解析出行，这类用例取不到真实几何
+            self.skipTest(f"当前 Tk（{self.root.getvar('tk_patchLevel')}）在窗口未映射时不解析 identify_row，取不到 {item_id} 的真实几何")
         tree.event_generate("<Motion>", x=10, y=y)
         self.root.after(600, self.root.quit) # 悬停提示有 450 毫秒延迟
         self.root.mainloop()
@@ -736,10 +738,13 @@ def test_resource_tree_interaction(case):
         capture_output=True, text=True, encoding="utf-8", timeout=20,
     )
     if result.returncode == 77:
-        pytest.skip("当前环境没有图形显示服务，需在桌面环境或 Xvfb 中运行")
+        reason = result.stdout.strip().splitlines() # 子进程把跳过原因写在标准输出的最后一行
+        pytest.skip(reason[-1] if reason else "当前环境没有图形显示服务，需在桌面环境或 Xvfb 中运行")
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":
     result = unittest.TextTestRunner().run(unittest.TestSuite([ResourceTreeUITest(sys.argv[1])]))
+    if result.skipped: # 父进程只看得到退出码与输出，跳过原因要显式送出去
+        print(result.skipped[0][1])
     raise SystemExit(77 if result.skipped else int(not result.wasSuccessful()))
