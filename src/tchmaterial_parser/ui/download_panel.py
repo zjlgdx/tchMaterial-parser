@@ -2,7 +2,7 @@
 # 下载面板：解析并复制直链、下载资源文件与进度反馈
 # 本模块持有与下载相关的几个控件句柄，因此这些控件的读写不必跨模块
 
-import os, re, threading, time, traceback
+import logging, os, re, threading, time, traceback
 import tkinter as tk
 from collections import Counter
 from collections.abc import Callable
@@ -17,8 +17,11 @@ from .runtime import thread_it, ui_call
 from .. import config
 from ..api import ResourceInfo, parse
 from ..bookmarks import add_bookmarks
+from ..logging_utils import redact_access_token
 from ..network import REQUEST_TIMEOUT, request_headers, session
 from ..platform_utils import print_error
+
+logger = logging.getLogger(__name__)
 
 download_states: list[dict] = [] # 初始化下载状态
 _STOP_POLL_INTERVAL = 0.05 # 轮询停止请求的时间片；最长只用来切一次 3 秒的退避等待，代价可以忽略
@@ -77,10 +80,6 @@ _MIN_REQUEST_INTERVAL = 0.2
 _download_slots = threading.BoundedSemaphore(3)
 _rate_lock = threading.Lock()
 _last_request_at = 0.0
-
-def redact_access_token(text: str) -> str:
-    """隐藏查询串里可能残留的 accessToken。本工具不再主动拼接该参数，但异常或用户粘贴的 URL 仍可能带上。"""
-    return re.sub(r"([?&]accessToken=)[^&\s'\"]+", r"\1<已隐藏>", text, flags=re.IGNORECASE)
 
 def download_mirror_urls(url: str) -> list[str]:
     """按原地址优先的顺序生成私有 CDN 镜像，普通下载地址保持不变。"""
@@ -726,8 +725,8 @@ def close_active_responses(control: BatchControl) -> None:
     for response in responses:
         try:
             response.close()
-        except Exception:
-            pass
+        except Exception as e: # 连接可能已经断开，断连本就是尽力而为，记下即可
+            logger.debug("断开下载响应失败：%s", e)
 
 def download_file(url: str, save_path: str, chapters: list[dict] | None = None, current_state: dict | None = None) -> None: # 下载文件
     if current_state is None: # 保留单独下载文件的调用方式
@@ -755,8 +754,8 @@ def download_file(url: str, save_path: str, chapters: list[dict] | None = None, 
         current_state["downloaded_size"], current_state["total_size"] = 0, 0
         try:
             os.remove(temp_path)
-        except Exception:
-            pass
+        except Exception as e: # 半成品可能压根没建出来，删不掉不影响结局判定
+            logger.debug("清理临时文件 %s 失败：%s", temp_path, e)
 
     try:
         with _download_slots:

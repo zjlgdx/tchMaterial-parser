@@ -2,6 +2,7 @@
 # 左侧资源列表：勾选教材或分类、搜索筛选、封面按需加载与悬停预览
 
 import io
+import logging
 import time
 import tkinter as tk
 from collections import OrderedDict
@@ -15,8 +16,11 @@ from .runtime import scaled, thread_it, ui_call
 from .widgets import auto_hide_scrollbar, bind_context_menu
 from ..catalog import count_resource_items, filter_resource_items
 from ..images import fit_cover_image
+from ..logging_utils import log_duration
 from ..network import session
 from ..platform_utils import os_name, print_error
+
+logger = logging.getLogger(__name__)
 
 def build_resource_url(item_path: str, resource_data: dict) -> str: # 根据树项路径与资源数据生成资源页面链接
     resource_type = resource_data.get("resource_type_code") or "assets_document"
@@ -96,6 +100,10 @@ SCAN_MAX_WAIT_MS = 250 # 连续滚动时两次扫描的最长间隔，避免去�
 VISIBLE_SCAN_PROBE_STEP = 2 # 扫描起点的试探步长，用于跨过树视图上边框
 PREVIEW_CACHE_SIZE = 200 # 悬停预览缓存的封面张数
 COVER_WORKERS = 4 # 同时下载封面的线程数
+# 以下阈值只用于耗时日志；滚动与可见行刷新是每帧热路径，不在其中记日志
+TREE_REBUILD_SLOW_MS = 300 # 搜索后重建树视图
+TREE_EXPAND_SLOW_MS = 100 # 首次展开一个分类
+CHECK_SYNC_SLOW_MS = 100 # 勾选状态与 URL 输入框同步
 
 def visible_tree_rows(treeview: ttk.Treeview) -> list[str]: # 逐行取出当前屏幕上的树项
     if not treeview.get_children():
@@ -223,9 +231,10 @@ def build_resource_tree(
         if len(children) != 1 or not children[0].endswith(PLACEHOLDER_SUFFIX):
             return
 
-        treeview.delete(children[0])
-        insert_tree_level(item_id, node["children"], tree_item_paths[item_id], expand_all=False)
-        resize_tree_column(treeview.winfo_width()) # 新插入的项可能比现有内容更宽
+        with log_duration(logger, f"展开分类 {item_id}", TREE_EXPAND_SLOW_MS):
+            treeview.delete(children[0])
+            insert_tree_level(item_id, node["children"], tree_item_paths[item_id], expand_all=False)
+            resize_tree_column(treeview.winfo_width()) # 新插入的项可能比现有内容更宽
         schedule_visible_refresh()
 
     def resize_tree_column(width: int) -> None: # 让树列至少铺满可视区域，内容过长时启用横向滚动
@@ -317,6 +326,7 @@ def build_resource_tree(
         try:
             resp = session.get(url)
             if not resp.ok:
+                logger.info("封面 %s 返回 %s，本次运行不再重试", item_id, resp.status_code)
                 ui_call(apply_tree_icon, item_id, None)
                 return
             image = fit_cover_image(Image.open(io.BytesIO(resp.content)), preview_cover_size)
@@ -383,26 +393,27 @@ def build_resource_tree(
 
     def refresh_resource_tree() -> None: # 根据搜索词重建树视图
         nonlocal tree_content_width
-        query = search_var.get().strip()
-        visible_items = filter_resource_items(resource_list, query)
+        with log_duration(logger, "重建资源树", TREE_REBUILD_SLOW_MS):
+            query = search_var.get().strip()
+            visible_items = filter_resource_items(resource_list, query)
 
-        leave_tree()
-        treeview.delete(*treeview.get_children())
-        tree_item_data.clear()
-        tree_item_paths.clear()
-        item_icon_generation.clear()
-        tree_content_width = 0
-        insert_tree_level("", visible_items, (), expand_all=bool(query))
-        resize_tree_column(treeview.winfo_width())
-        clear_search_btn.state(["!disabled"] if query else ["disabled"])
+            leave_tree()
+            treeview.delete(*treeview.get_children())
+            tree_item_data.clear()
+            tree_item_paths.clear()
+            item_icon_generation.clear()
+            tree_content_width = 0
+            insert_tree_level("", visible_items, (), expand_all=bool(query))
+            resize_tree_column(treeview.winfo_width())
+            clear_search_btn.state(["!disabled"] if query else ["disabled"])
 
-        if catalog_status: # 资源目录尚未就绪，用一行提示占位
-            treeview.insert("", "end", iid=STATUS_ITEM_ID, text=catalog_status)
-            search_status_label.config(text="")
-            return
+            if catalog_status: # 资源目录尚未就绪，用一行提示占位
+                treeview.insert("", "end", iid=STATUS_ITEM_ID, text=catalog_status)
+                search_status_label.config(text="")
+                return
 
-        result_count = count_resource_items(visible_items)
-        search_status_label.config(text=f"{result_count} 项" if result_count else "无匹配资源")
+            result_count = count_resource_items(visible_items)
+            search_status_label.config(text=f"{result_count} 项" if result_count else "无匹配资源")
         ui_call(refresh_visible_items, True)
 
     def insert_resource_urls(urls: list[str]) -> None: # 将链接追加到 URL 输入框，跳过已存在的行
@@ -459,12 +470,13 @@ def build_resource_tree(
         new_checked_items = {item_id for item_id, url in leaf_urls.items() if url in urls}
         if new_checked_items == checked_items:
             return
-        checked_items.clear()
-        checked_items.update(new_checked_items)
+        with log_duration(logger, "同步勾选状态", CHECK_SYNC_SLOW_MS):
+            checked_items.clear()
+            checked_items.update(new_checked_items)
 
-        invalidate_item_icons() # 末级资源与各级祖先分类的图标都可能变，屏幕外的等滚进视野再合成
-        refresh_visible_items(False)
-        update_checked_count()
+            invalidate_item_icons() # 末级资源与各级祖先分类的图标都可能变，屏幕外的等滚进视野再合成
+            refresh_visible_items(False)
+            update_checked_count()
 
     def on_urls_modified(_event: tk.Event) -> None:
         if url_text.edit_modified():

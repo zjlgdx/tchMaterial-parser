@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 程序主流程：初始化配置、拉取资源列表、装配主窗口并进入主循环
 
-import os, sys
+import logging, os, sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 import psutil
@@ -11,13 +11,16 @@ from . import __version__
 from .catalog import ResourceHelper
 from .config import load_access_token, load_config, save_config
 from .images import make_icon_image, render_system_emoji
-from .platform_utils import ctypes, os_name, print_error, resource_path, win32api, win32con, win32gui, win32print
+from .logging_utils import log_environment, redact_access_token, setup_logging
+from .platform_utils import ctypes, os_name, resource_path, win32api, win32con, win32gui, win32print
 from .ui import download_panel, runtime, theme
 from .ui.about_window import show_about_window
 from .ui.resource_tree import build_resource_tree
 from .ui.runtime import scaled, thread_it, ui_call
 from .ui.token_window import show_access_token_window
 from .ui.widgets import auto_hide_scrollbar, bind_context_menu, bind_tab_navigation, center_window
+
+logger = logging.getLogger(__name__)
 
 # 主界面上方的功能说明：Emoji 与正文分开渲染以保留系统字体的完整字形
 DESCRIPTION_ITEMS = (
@@ -29,6 +32,7 @@ DESCRIPTION_ITEMS = (
 
 
 def main() -> None: # 程序入口：初始化界面并进入主循环
+    setup_logging() # 先把日志接好，配置读写与界面初始化出错时才有落点
     scale: float | None = None
 
     # 在 Windows 上进行高 DPI 适配
@@ -51,6 +55,7 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     # 主窗口、界面字体与缩放因子由本函数创建，但其余模块也要用到，
     # 因此在此写入对应模块，供它们通过 runtime.root、runtime.ui_scale 等访问
     runtime.bind_root(root)
+    log_environment(root)
     theme.bind_font_family(theme.pick_ui_font_family())
 
     if not scale: # 若获取缩放因子失败，通过 Tkinter 估算缩放因子
@@ -244,7 +249,7 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
         try:
             resource_list = ResourceHelper().fetch_resource_list()
         except Exception as e:
-            print_error(e)
+            logger.error("获取资源目录失败：%s", redact_access_token(str(e)), exc_info=e)
             ui_call(apply_resource_list, {}, "获取资源列表失败，请手动填写资源链接，或重新打开本程序")
             return
         ui_call(apply_resource_list, resource_list)
