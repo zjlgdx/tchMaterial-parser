@@ -7,7 +7,9 @@ import threading
 import time
 import tkinter as tk
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from unittest.mock import patch
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -16,6 +18,24 @@ from src.tchmaterial_parser.ui import runtime
 
 
 UI_POLL_SECONDS = runtime.UI_QUEUE_POLL_MS / 1000 * 3 # 足够走完几轮轮询
+
+
+class RecordingRoot: # 记录调度调用的假主窗口：不需要 Tk，也就不受 Tk 版本与有无桌面影响
+    def __init__(self) -> None:
+        self.scheduled: list[tuple[str, str]] = []
+
+    def _record(self, name: str) -> str:
+        self.scheduled.append((name, threading.current_thread().name))
+        return "after#0"
+
+    def after(self, *_args: object) -> str:
+        return self._record("after")
+
+    def after_idle(self, *_args: object) -> str:
+        return self._record("after_idle")
+
+    def after_cancel(self, *_args: object) -> None:
+        self._record("after_cancel")
 
 
 class UiCallTest(unittest.TestCase):
@@ -34,25 +54,21 @@ class UiCallTest(unittest.TestCase):
         cls.root.destroy()
 
     def setUp(self) -> None:
-        self.previous_root = getattr(runtime, "root", None)
-        runtime.root = self.root
-        runtime.app_closing = False
-        runtime._ui_queue = queue.Queue() # 每条用例从空队列开始，免得互相看到对方的残留
-        runtime._pump_after_id = None
-        self.addCleanup(self.restore_runtime)
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        enter = self.context.enter_context
+        enter(patch.object(runtime, "root", self.root, create=True))
+        enter(patch.object(runtime, "app_closing", False))
+        enter(patch.object(runtime, "_ui_queue", queue.Queue())) # 每条用例从空队列开始，免得互相看到对方的残留
+        enter(patch.object(runtime, "_pump_after_id", None))
+        self.addCleanup(self.cancel_pending_pump) # 先于上面的还原执行，此时读到的还是本用例排下的定时器
 
         self.errors: list[BaseException] = []
-        self.previous_reporter = self.root.report_callback_exception
-        self.root.report_callback_exception = lambda _type, error, _traceback: self.errors.append(error)
+        enter(patch.object(self.root, "report_callback_exception", lambda _type, error, _traceback: self.errors.append(error)))
 
-    def restore_runtime(self) -> None:
-        runtime.app_closing = False
-        self.root.report_callback_exception = self.previous_reporter
+    def cancel_pending_pump(self) -> None: # 不把轮询定时器留给下一条用例
         if runtime._pump_after_id is not None:
             self.root.after_cancel(runtime._pump_after_id)
-            runtime._pump_after_id = None
-        if self.previous_root is not None:
-            runtime.root = self.previous_root
 
     def drain(self, done: threading.Event, timeout: float = 5.0) -> bool: # 转主循环直到事件置位或超时
         deadline = time.monotonic() + timeout
@@ -76,6 +92,29 @@ class UiCallTest(unittest.TestCase):
 
         self.assertTrue(self.drain(done), "工作线程投递的回调没有在主线程被执行")
         self.assertEqual(seen, [(True, (1, "二"), {"key": "值"})])
+
+    def test_worker_thread_delivery_never_touches_the_tk_scheduler(self) -> None:
+        # Tk 9 下工作线程排进去的回调拿得到编号却永远不执行，没人唤醒主循环。
+        # 这条不依赖 Tk 版本，也不需要窗口：只看投递走的是队列还是 Tk 的定时器。
+        fake_root = RecordingRoot()
+        worker_name = "投递线程"
+
+        with patch.object(runtime, "root", fake_root, create=True):
+            worker = threading.Thread(target=lambda: runtime.ui_call(len, "x"), name=worker_name)
+            worker.start()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+
+        from_worker = [call for call in fake_root.scheduled if call[1] == worker_name]
+        self.assertEqual(
+            from_worker, [],
+            "工作线程不得调用 root.after / root.after_idle：Tk 9 下这样排进去的回调永远不会被执行，"
+            f"跨线程投递必须只入队列。实际发生了 {from_worker}",
+        )
+        self.assertEqual(
+            runtime._ui_queue.qsize(), 1,
+            "工作线程投递的任务必须留在队列里等主线程轮询取走，队列却是空的",
+        )
 
     def test_main_thread_delivery_runs_within_one_update(self) -> None:
         # 既有测试依赖这条时序：主线程投递后调一次 update() 就应看到效果，不能退化成要等下一轮轮询
