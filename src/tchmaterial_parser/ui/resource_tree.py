@@ -100,6 +100,9 @@ SCAN_MAX_WAIT_MS = 250 # 连续滚动时两次扫描的最长间隔，避免去�
 VISIBLE_SCAN_PROBE_STEP = 2 # 扫描起点的试探步长，用于跨过树视图上边框
 PREVIEW_CACHE_SIZE = 200 # 悬停预览缓存的封面张数
 COVER_WORKERS = 4 # 同时下载封面的线程数
+CATALOG_TICK_MS = 1000 # 加载期间刷新提示行的间隔
+CATALOG_SLOW_SECONDS = 45 # 加载超过这么久就补一句可操作的建议；单次请求的读超时是 60 秒
+CATALOG_SLOW_HINT = "，网络较慢，可先在右侧手动填写资源链接下载"
 # 以下阈值只用于耗时日志；滚动与可见行刷新是每帧热路径，不在其中记日志
 TREE_REBUILD_SLOW_MS = 300 # 搜索后重建树视图
 TREE_EXPAND_SLOW_MS = 100 # 首次展开一个分类
@@ -175,6 +178,9 @@ def build_resource_tree(
     checked_items: set[str] = set() # 已勾选末级资源的树项路径，搜索重建树视图后仍保留
     leaf_urls = {item_id: build_resource_url(item_id, data) for item_id, data in iter_leaf_resources(resource_list)}
     catalog_status = status # 资源目录就绪后置空，此前树视图中只显示一行提示
+    catalog_loading = bool(status) # 提示行分两种：加载中的阶段提示会带上已用时间，终态（就绪或失败）的文案原样保留
+    catalog_started_at = time.monotonic()
+    catalog_tick_after_id: str | None = None
     checkbox_pils: dict[str, Image.Image] = {} # 三态复选框底图，跟随主题配色重建
     checkbox_icons: dict[str, ImageTk.PhotoImage] = {} # 无封面树项直接使用的复选框图标（已含右侧间距）
     tree_font = tkfont.nametofont("AppBodyFont")
@@ -188,6 +194,39 @@ def build_resource_tree(
 
     def get_tree_cover_gap(display_name: str) -> int: # 名称以中文左括号开头时不添加封面与标题间隔
         return 0 if display_name.startswith("（") else tree_cover_gap
+
+    def catalog_status_text() -> str: # 加载中的提示带上已用时间，久了再补一句建议；终态文案原样返回
+        if not catalog_loading:
+            return catalog_status
+
+        elapsed = int(time.monotonic() - catalog_started_at)
+        if elapsed < 1:
+            return catalog_status
+        return f"{catalog_status}（已用 {elapsed} 秒{CATALOG_SLOW_HINT if elapsed >= CATALOG_SLOW_SECONDS else ''}）"
+
+    def update_catalog_status_row() -> None: # 只改提示行的文字，不重建整棵树
+        if treeview.exists(STATUS_ITEM_ID):
+            treeview.item(STATUS_ITEM_ID, text=catalog_status_text())
+
+    def cancel_catalog_tick() -> None:
+        nonlocal catalog_tick_after_id
+        if catalog_tick_after_id:
+            runtime.root.after_cancel(catalog_tick_after_id)
+            catalog_tick_after_id = None
+
+    def schedule_catalog_tick() -> None: # 加载期间每秒刷新一次提示行，让「还在加载」与「卡死」看得出区别
+        nonlocal catalog_tick_after_id
+        cancel_catalog_tick()
+        if catalog_loading:
+            catalog_tick_after_id = runtime.root.after(CATALOG_TICK_MS, on_catalog_tick)
+
+    def on_catalog_tick() -> None:
+        nonlocal catalog_tick_after_id
+        catalog_tick_after_id = None
+        if not catalog_loading: # 已经是终态，不能再把秒数写回文案上
+            return
+        update_catalog_status_row()
+        schedule_catalog_tick()
 
     def insert_tree_level(parent: str, items: dict[str, dict], parent_names: tuple[str, ...], expand_all: bool) -> None: # 插入一层树项
         nonlocal tree_content_width
@@ -408,7 +447,7 @@ def build_resource_tree(
             clear_search_btn.state(["!disabled"] if query else ["disabled"])
 
             if catalog_status: # 资源目录尚未就绪，用一行提示占位
-                treeview.insert("", "end", iid=STATUS_ITEM_ID, text=catalog_status)
+                treeview.insert("", "end", iid=STATUS_ITEM_ID, text=catalog_status_text())
                 search_status_label.config(text="")
                 return
 
@@ -623,10 +662,18 @@ def build_resource_tree(
         delta_unit = 1 if os_name == "Darwin" else 120
         return scroll_tree_horizontally(-event.delta / delta_unit)
 
-    def apply_resource_list(items: dict[str, dict], status: str = "") -> None: # 填入后台加载到的资源目录并重建树视图；status 非空表示加载未成功，改为在树视图中显示原因
-        nonlocal resource_list, catalog_status
-        resource_list = items
+    def apply_resource_list(items: dict[str, dict] | None, status: str = "") -> None: # 填入后台加载到的资源目录并重建树视图；items 为 None 表示目录仍在路上，只更新提示行，status 为当前阶段；items 非 None 时进入终态，status 非空表示加载未成功，改为在树视图中显示原因
+        nonlocal resource_list, catalog_status, catalog_loading
         catalog_status = status
+        if items is None:
+            catalog_loading = True
+            update_catalog_status_row()
+            schedule_catalog_tick()
+            return
+
+        catalog_loading = False # 就绪与失败都是终态：计时到此为止，失败原因不再被秒数改写
+        cancel_catalog_tick()
+        resource_list = items
         leaf_urls.clear()
         leaf_urls.update({item_id: build_resource_url(item_id, data) for item_id, data in iter_leaf_resources(resource_list)})
         refresh_resource_tree()
@@ -636,6 +683,7 @@ def build_resource_tree(
     theme.on_theme_applied(on_theme_changed) # 主题切换后重建复选框配色并刷新树项图标
     update_checked_count()
     refresh_resource_tree() # 初始展示完整资源树并展开一级目录
+    schedule_catalog_tick()
     sync_checked_items()
     url_text.edit_modified(False)
     url_text.bind("<<Modified>>", on_urls_modified, add="+")
@@ -646,6 +694,7 @@ def build_resource_tree(
     treeview.bind("<Configure>", lambda event: resize_tree_column(event.width))
     treeview.bind("<Motion>", on_tree_motion)
     treeview.bind("<Leave>", lambda _event: leave_tree())
+    treeview.bind("<Destroy>", lambda _event: cancel_catalog_tick(), add="+")
     treeview.bind("<ButtonPress>", on_tree_press)
     treeview.bind("<Shift-MouseWheel>", on_tree_shift_mousewheel)
     treeview.bind("<Shift-Button-4>", lambda _event: scroll_tree_horizontally(-1))

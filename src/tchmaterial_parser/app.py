@@ -22,6 +22,12 @@ from .ui.widgets import auto_hide_scrollbar, bind_context_menu, bind_tab_navigat
 
 logger = logging.getLogger(__name__)
 
+FAILURE_REASON_MAX_LENGTH = 60 # 提示行只有一行，过长的原因要截断
+
+def failure_reason(e: Exception) -> str: # 把异常整理成一句能放进提示行的原因
+    reason = " ".join(redact_access_token(str(e)).split()) or type(e).__name__
+    return reason if len(reason) <= FAILURE_REASON_MAX_LENGTH else f"{reason[:FAILURE_REASON_MAX_LENGTH]}…"
+
 # 主界面上方的功能说明：Emoji 与正文分开渲染以保留系统字体的完整字形
 DESCRIPTION_ITEMS = (
     ("📌", "在右侧的文本框中输入一个或多个资源页面的网址（每行一个），或直接在左侧的列表中选择资源。"),
@@ -264,11 +270,14 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     apply_resource_list = build_resource_tree(treeview_pane, {}, url_text, "正在加载资源列表…")
 
     def load_resource_list() -> None: # 在后台线程获取资源列表，避免窗口迟迟不出现；加载期间仍可手动填写资源链接并下载
+        def report_stage(stage: str) -> None: # 阶段提示交给主线程写进提示行
+            ui_call(apply_resource_list, None, stage)
+
         try:
-            resource_list = ResourceHelper().fetch_resource_list()
+            resource_list = ResourceHelper().fetch_resource_list(report_stage)
         except Exception as e:
-            logger.error("获取资源目录失败：%s", redact_access_token(str(e)), exc_info=e)
-            ui_call(apply_resource_list, {}, "获取资源列表失败，请手动填写资源链接，或重新打开本程序")
+            logger.error("获取资源目录失败", exc_info=e)
+            ui_call(apply_resource_list, {}, f"获取资源列表失败（{failure_reason(e)}），可在右侧手动填写资源链接下载，或检查网络后重新打开本程序")
             return
         ui_call(apply_resource_list, resource_list)
 

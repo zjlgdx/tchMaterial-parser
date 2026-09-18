@@ -2,6 +2,7 @@
 # 获取平台上的资源目录树，并提供按分类路径筛选与计数的辅助函数
 
 import gzip, json, logging, os
+from collections.abc import Callable
 
 from .config import catalog_cache_path
 from .logging_utils import log_duration
@@ -77,14 +78,16 @@ class ResourceHelper: # 获取网站上资源的数据
                 parsed[ch["tag_id"]] = { "display_name": ch["tag_name"], "children": self.parse_hierarchy(ch["hierarchies"]) }
         return parsed
 
-    def fetch_book_list(self, list_data: list[str]) -> dict: # 获取课本列表（list_data 为 fetch_book_version() 取得的分片地址）
+    def fetch_book_list(self, list_data: list[str], progress: Callable[[str], None] | None = None) -> dict: # 获取课本列表（list_data 为 fetch_book_version() 取得的分片地址）
         # 获取电子课本层级数据
         tags_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/tch_material_tag.json")
         tags_data: dict = tags_resp.json()
         parsed_hier = self.parse_hierarchy(tags_data["hierarchies"])
 
         # 获取电子课本列表
-        for url in list_data:
+        for index, url in enumerate(list_data, start=1):
+            if progress:
+                progress(f"正在下载资源列表（第 {index}/{len(list_data)} 部分）")
             book_resp = session.get(url)
             book_data: list[dict] = book_resp.json()
             if not isinstance(book_data, list) or not book_data: # 分片内容异常时整体失败，避免把残缺的目录写进缓存后长期复用
@@ -181,15 +184,20 @@ class ResourceHelper: # 获取网站上资源的数据
 
         return parsed_hier
 
-    def fetch_resource_list(self) -> dict: # 获取资源列表：目录版本未变时直接使用本地缓存，避免每次启动都重新下载全部分片
+    def fetch_resource_list(self, progress: Callable[[str], None] | None = None) -> dict: # 获取资源列表：目录版本未变时直接使用本地缓存，避免每次启动都重新下载全部分片
         with log_duration(logger, "获取资源目录", CATALOG_SLOW_MS):
+            if progress:
+                progress("正在检查资源列表版本")
             version, list_data = fetch_book_version()
+
+            if progress:
+                progress("正在读取本地缓存")
             cached_list = load_cached_resource_list(version)
             if cached_list is not None:
                 logger.info("资源目录来自本地缓存，共 %d 个顶层分类", len(cached_list))
                 return cached_list
 
-            book_hier = self.fetch_book_list(list_data)
+            book_hier = self.fetch_book_list(list_data, progress)
             # 下面两类资源若要启用，其版本标识也应计入 version，否则它们更新后不会刷新缓存
             # national_lesson_hier = self.fetch_national_lesson_list()
             # prepare_lesson_hier = self.fetch_prepare_lesson_list()

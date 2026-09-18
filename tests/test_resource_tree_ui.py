@@ -661,6 +661,86 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.update()
         self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["获取资源列表失败，请手动填写资源链接，或重新打开本程序"])
 
+    def catalog_tree(self, status="正在加载资源列表…"): # 建一棵仍在等目录的树，返回填入函数与树视图
+        pane = ttk.Frame(self.root)
+        urls = tk.Text(self.root, undo=True)
+        apply_resource_list = resource_tree.build_resource_tree(pane, {}, urls, status)
+        tree = next(widget for widget in self.descendants(pane) if isinstance(widget, ttk.Treeview))
+        return apply_resource_list, tree
+
+    def catalog_ticks(self, timers): # 仍然有效的目录计时器
+        return [timer for timer in timers if timer[0] == resource_tree.CATALOG_TICK_MS and timer[1] is not None]
+
+    def fire_catalog_tick(self, timers):
+        self.catalog_ticks(timers)[-1][1]()
+
+    def status_text(self, tree):
+        return tree.item(resource_tree.STATUS_ITEM_ID, "text")
+
+    def loading_clock(self):
+        clock = [1000.0] # 自造时钟，免得用例真的等上几十秒
+        self.context.enter_context(patch.object(resource_tree, "time", SimpleNamespace(monotonic=lambda: clock[0])))
+        return clock
+
+    def test_stage_updates_replace_the_status_row_without_dropping_the_tree(self):
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+
+        apply_resource_list(None, "正在下载资源列表（第 2/4 部分）")
+        self.root.update()
+
+        self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["正在下载资源列表（第 2/4 部分）"])
+
+    def test_elapsed_time_appears_while_the_catalog_is_loading(self):
+        timers = self.install_fake_timers()
+        clock = self.loading_clock()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+        self.assertEqual(self.status_text(tree), "正在加载资源列表…") # 刚开始不显示 0 秒
+
+        clock[0] += 12
+        self.fire_catalog_tick(timers)
+
+        self.assertEqual(self.status_text(tree), "正在加载资源列表…（已用 12 秒）")
+
+    def test_a_long_wait_adds_an_actionable_hint(self):
+        timers = self.install_fake_timers()
+        clock = self.loading_clock()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+
+        clock[0] += resource_tree.CATALOG_SLOW_SECONDS
+        self.fire_catalog_tick(timers)
+
+        self.assertIn(resource_tree.CATALOG_SLOW_HINT, self.status_text(tree))
+
+    def test_failure_stops_the_clock_and_keeps_its_own_wording(self):
+        failure = "获取资源列表失败（连接超时），可在右侧手动填写资源链接下载，或检查网络后重新打开本程序"
+        timers = self.install_fake_timers()
+        clock = self.loading_clock()
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        tick = self.catalog_ticks(timers)[-1][1] # 先抓住回调，取消之后就拿不到了
+
+        apply_resource_list({}, failure)
+        self.root.update()
+
+        self.assertEqual(self.catalog_ticks(timers), []) # 终态不再计时
+        clock[0] += 600
+        tick() # 即便回调被再触发一次，失败原因也不能被秒数改写
+        self.assertEqual(self.status_text(tree), failure)
+
+    def test_a_ready_catalog_stops_the_clock(self):
+        timers = self.install_fake_timers()
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+
+        apply_resource_list(RESOURCES)
+        self.root.update()
+
+        self.assertEqual(self.catalog_ticks(timers), [])
+        self.assertFalse(tree.exists(resource_tree.STATUS_ITEM_ID))
+
     def test_macos_replaces_the_card_treeview_field(self):
         # 卡片贴图要逐帧平铺满整个树区域，aqua 上每帧多花十几毫秒
         style = ttk.Style(self.root)

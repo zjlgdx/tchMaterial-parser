@@ -61,9 +61,9 @@ class CatalogCacheTest(unittest.TestCase):
         context.enter_context(patch.object(catalog, "catalog_cache_path", lambda: self.cache_file))
         context.enter_context(patch.object(catalog, "print_error", self.errors.append))
 
-    def fetch(self):
+    def fetch(self, progress=None):
         self.session.calls.clear()
-        return catalog.ResourceHelper().fetch_resource_list()
+        return catalog.ResourceHelper().fetch_resource_list(progress)
 
     def cached_payload(self):
         with gzip.open(self.cache_file, "rt", encoding="utf-8") as f:
@@ -161,6 +161,26 @@ class CatalogCacheTest(unittest.TestCase):
         self.fetch()
         self.assertEqual(self.temp_files(), [])
         self.assertEqual(self.errors, [])
+
+    def test_cold_start_reports_every_part_it_downloads(self):
+        stages = []
+
+        self.fetch(stages.append)
+
+        self.assertEqual(stages[:2], ["正在检查资源列表版本", "正在读取本地缓存"])
+        self.assertEqual(stages[2:], [f"正在下载资源列表（第 {index}/4 部分）" for index in range(1, 5)])
+
+    def test_cache_hit_stops_reporting_after_the_cache_is_read(self):
+        self.fetch()
+        stages = []
+
+        self.fetch(stages.append)
+
+        self.assertEqual(stages, ["正在检查资源列表版本", "正在读取本地缓存"]) # 命中缓存时没有分片可下
+
+    def test_fetching_without_a_progress_callback_still_works(self):
+        self.assertEqual(sorted(self.fetch()["books"]["children"]["primary"]["children"]),
+                         ["book-0", "book-1", "book-2", "book-3"])
 
     def test_cache_file_sits_next_to_the_config_file(self):
         cache_file = config.catalog_cache_path()
