@@ -751,8 +751,12 @@ class ResourceTreeUITest(unittest.TestCase):
             raise tk.TclError('invalid command name "after"')
 
         with patch.object(self.root, "after_cancel", refuse_to_cancel):
-            tree.destroy() # 不应抛出异常
+            tree.destroy()
         self.root.update()
+
+        # <Destroy> 回调里漏出来的异常由 tkinter 转交 report_callback_exception，destroy() 自己从不抛，
+        # 所以真正能判定护栏在位的是这里：没有异常被转交出来
+        self.assertEqual(self.errors, [])
 
     def test_destroying_the_tree_cancels_the_clock(self):
         timers = self.install_fake_timers()

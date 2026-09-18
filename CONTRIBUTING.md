@@ -34,7 +34,7 @@ python ./src/main.py
 > python -c "import tkinter; print(tkinter.Tcl().eval('info patchlevel'))"
 > ```
 >
-> 这条命令打印的是 Tcl 的版本，且不会打开窗口。python.org 的安装包与 uv 托管的解释器中 Tcl 与 Tk 版本一致，可以据此判断；若 Tcl 与 Tk 由发行版或 Homebrew 分开安装，两者可能不同，请以本程序日志首行记录的 Tk 版本为准。
+> 这条命令打印的是 Tcl 的版本，且不会打开窗口。python.org 的安装包与 uv 托管的解释器中 Tcl 与 Tk 版本一致，可以据此判断；若 Tcl 与 Tk 由发行版或 Homebrew 分开安装，两者可能不同，请以本程序日志中 `Tk x.y.z | Tcl … | windowingsystem …` 那一行记录的 Tk 版本为准。
 >
 > 此外，精简安装的 Linux 系统可能缺少中文字体与 Emoji 字体，此时界面上可能会出现方框等异常现象。可按需安装，例如在 Debian/Ubuntu 上执行 `sudo apt install fonts-noto-cjk fonts-noto-color-emoji`。
 

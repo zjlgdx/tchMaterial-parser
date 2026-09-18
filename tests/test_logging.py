@@ -165,12 +165,27 @@ class RedactionTest(unittest.TestCase):
                     "call(accessToken=secret, other=1)", f"call(accessToken={logging_utils.REDACTED}, other=1)"),
                 "圆括号与后文": (
                     "(https://a.com?accessToken=xxx) 后文", f"(https://a.com?accessToken={logging_utils.REDACTED}) 后文"),
-                "方括号": (
-                    "[x](https://a.com?accessToken=xxx)", f"[x](https://a.com?accessToken={logging_utils.REDACTED})"),
+                "方括号": ( # 收尾的是方括号本身，不能借道后面的圆括号或引号
+                    "tokens=[accessToken=xxx]", f"tokens=[accessToken={logging_utils.REDACTED}]"),
                 "尖括号": (
                     "<https://a.com?accessToken=xxx>", f"<https://a.com?accessToken={logging_utils.REDACTED}>"),
                 "花括号": (
-                    '{"u": "https://a.com?accessToken=xxx"}', f'{{"u": "https://a.com?accessToken={logging_utils.REDACTED}"}}'),
+                    "{accessToken=xxx}", f"{{accessToken={logging_utils.REDACTED}}}"),
+                "全角圆括号": ( # 本程序的日志是中文，URL 后面紧跟的多半是全角标点
+                    "下载失败（https://a.com?accessToken=xxx）请稍后重试",
+                    f"下载失败（https://a.com?accessToken={logging_utils.REDACTED}）请稍后重试"),
+                "全角逗号": (
+                    "地址 https://a.com?accessToken=xxx，稍后重试",
+                    f"地址 https://a.com?accessToken={logging_utils.REDACTED}，稍后重试"),
+                "全角句号": (
+                    "地址 https://a.com?accessToken=xxx。下一句",
+                    f"地址 https://a.com?accessToken={logging_utils.REDACTED}。下一句"),
+                "顿号与书名号": (
+                    "《https://a.com?accessToken=xxx》、另一个",
+                    f"《https://a.com?accessToken={logging_utils.REDACTED}》、另一个"),
+                "全角空格": (
+                    "地址 https://a.com?accessToken=xxx　后文",
+                    f"地址 https://a.com?accessToken={logging_utils.REDACTED}　后文"),
             }.items():
                 with self.subTest(name):
                     self.assertEqual(logging_utils.redact_access_token(text), expected)
