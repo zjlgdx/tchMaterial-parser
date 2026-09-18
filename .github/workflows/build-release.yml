@@ -55,6 +55,30 @@ jobs:
         with:
           python-version: "3.14"
 
+      # 捆绑进 macOS 包的 Tk 若早于 8.6.13，用户的鼠标点击不会被登记（CPython gh-110218）
+      - name: Check Tcl/Tk version
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform, sys, tkinter
+
+          MIN_MACOS_TK = (8, 6, 13)
+
+          patchlevel = tkinter.Tcl().eval("info patchlevel")
+          print("Tcl", patchlevel)
+          try: # runner 上不一定起得来图形界面，起不来就用 Tcl 版本代替（官方安装包两者同版本）
+              root = tkinter.Tk()
+              root.withdraw()
+              patchlevel = root.getvar("tk_patchLevel")
+              print("Tk", patchlevel, "| windowingsystem", root.tk.call("tk", "windowingsystem"))
+              root.destroy()
+          except Exception as error:
+              print("Tk 无法初始化，改用 Tcl 版本判断：", error)
+
+          if platform.system() == "Darwin" and tuple(int(part) for part in patchlevel.split(".")) < MIN_MACOS_TK:
+              sys.exit(f"捆绑的 Tk {patchlevel} 早于 {'.'.join(map(str, MIN_MACOS_TK))}，macOS 上的鼠标点击不会被登记")
+          PY
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip

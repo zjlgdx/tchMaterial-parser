@@ -8,8 +8,28 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# CPython gh-110218：更早的 Tk 在 macOS Sonoma 及以后的系统上收不到鼠标点击，界面看上去像是卡死
+MIN_MACOS_TK = (8, 6, 13)
+
 def print_error(e: Exception) -> None: # 记录错误信息与调用栈
     logger.error("%s", e, exc_info=e)
+
+def tk_patchlevel(window: object) -> tuple[int, ...]: # 解析 Tk 的完整版本号，读不到或格式异常时返回空元组
+    try:
+        raw = str(window.getvar("tk_patchLevel"))
+        return tuple(int(part) for part in raw.split("."))
+    except Exception as e: # 版本号不是数字时无从比较，与读不到一样按「不判断」处理
+        print_error(e)
+        return ()
+
+def outdated_macos_tk(window: object) -> str: # macOS 上 Tk 过旧时返回它的版本号，否则返回空字符串
+    if os_name != "Darwin":
+        return ""
+
+    patchlevel = tk_patchlevel(window)
+    if not patchlevel or patchlevel >= MIN_MACOS_TK: # 空元组表示版本号没解析出来，此时不猜也不提示
+        return ""
+    return ".".join(str(part) for part in patchlevel)
 
 def resource_path(*parts: str) -> Path: # 获取源码或 PyInstaller 打包后的只读资源路径
     bundle_root = getattr(sys, "_MEIPASS", None)

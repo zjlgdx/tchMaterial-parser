@@ -12,7 +12,7 @@ from .catalog import ResourceHelper
 from .config import load_access_token, load_config, save_config
 from .images import make_icon_image, render_system_emoji
 from .logging_utils import log_environment, redact_access_token, setup_logging
-from .platform_utils import ctypes, os_name, resource_path, win32api, win32con, win32gui, win32print
+from .platform_utils import MIN_MACOS_TK, ctypes, os_name, outdated_macos_tk, resource_path, win32api, win32con, win32gui, win32print
 from .ui import download_panel, runtime, theme
 from .ui.about_window import show_about_window
 from .ui.resource_tree import build_resource_tree
@@ -62,6 +62,11 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     runtime.bind_root(root)
     log_environment(root)
     theme.bind_font_family(theme.pick_ui_font_family())
+
+    # 过旧的 Tk 会丢掉鼠标点击，此时不能用弹窗提示：弹窗上的按钮同样点不动
+    outdated_tk = outdated_macos_tk(root)
+    if outdated_tk:
+        logger.warning("当前 Tk %s 早于 %s，macOS 上鼠标点击可能不被登记", outdated_tk, ".".join(str(part) for part in MIN_MACOS_TK))
 
     if not scale: # 若获取缩放因子失败，通过 Tkinter 估算缩放因子
         try:
@@ -191,10 +196,18 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     description_card.pack(fill="x", pady=(scaled(14), 0))
     description_card.columnconfigure(1, weight=1)
 
+    description_items = list(DESCRIPTION_ITEMS)
+    if outdated_tk: # 点击可能失灵时，把原因与出路直接摆在说明里，用户至少知道该换什么
+        description_items.append((
+            "⚠️",
+            f"当前 Python 自带的 Tk 为 {outdated_tk}，在此版本的 macOS 上鼠标点击可能不会被登记。"
+            "请改用 Python 3.11.7 或更高版本，或直接使用 Releases 中提供的应用。",
+        ))
+
     description_icons: list[ImageTk.PhotoImage] = [] # 保存 Tk 图片引用，避免图标被垃圾回收
     description_labels: list[ttk.Label] = []
-    for row, (symbol, text) in enumerate(DESCRIPTION_ITEMS):
-        row_padding = (0, scaled(1)) if row < len(DESCRIPTION_ITEMS) - 1 else 0
+    for row, (symbol, text) in enumerate(description_items):
+        row_padding = (0, scaled(1)) if row < len(description_items) - 1 else 0
         emoji_image = render_system_emoji(symbol, description_icon_size)
         if emoji_image is not None:
             photo = ImageTk.PhotoImage(emoji_image)

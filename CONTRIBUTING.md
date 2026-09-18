@@ -28,6 +28,12 @@ python ./src/main.py
 > [!NOTE]
 > 本工具使用 **Tkinter** 构建图形界面。Windows 与 macOS 的官方 Python 通常已自带，而部分 Linux 发行版需要单独安装，例如在 Debian/Ubuntu 上执行 `sudo apt install python3-tk`。
 >
+> 在 **macOS** 上还需要 **Tk 8.6.13 或更高版本**（python.org 的 Python **3.11.7**、**3.12.0** 及以后的安装包才满足）。更早的 Tk 在 macOS Sonoma 及以后的系统上收不到鼠标点击，界面看上去像是卡死。可用下面的命令查看当前版本，本工具启动时也会在界面上提示：
+>
+> ```sh
+> python -c "import tkinter; root = tkinter.Tk(); print(root.getvar('tk_patchLevel'))"
+> ```
+>
 > 此外，精简安装的 Linux 系统可能缺少中文字体与 Emoji 字体，此时界面上可能会出现方框等异常现象。可按需安装，例如在 Debian/Ubuntu 上执行 `sudo apt install fonts-noto-cjk fonts-noto-color-emoji`。
 
 ## 测试与检查
