@@ -12,12 +12,13 @@ license = "MIT"
 license-files = ["LICENSE", "licenses/*.txt"]
 authors = [{name = "肥宅水水呀"}, {name = "晨叶梦春", email = "wuziqian211@126.com"}]
 dependencies = [
-    "pillow>=10,<13",
-    "psutil>=5.9,<8",
-    "pypdf>=5,<7",
-    "requests>=2.31,<3",
-    "sv-ttk>=2.6,<3",
-    "pywin32>=306; sys_platform == 'win32'",
+    "pillow>=12,<13",
+    "psutil>=7,<8",
+    "pypdf>=6,<7",
+    "requests>=2.33,<3",
+    # sv-ttk 自 2.6.1 起才兼容 Tk 9，而 macOS 的发布构建已经在 Tk 9 上
+    "sv-ttk>=2.6.1,<3",
+    "pywin32>=312; sys_platform == 'win32'",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
