@@ -726,6 +726,34 @@ class ResourceTreeUITest(unittest.TestCase):
         self.assertEqual(self.status_text(tree), long_status)
         self.assertGreater(tree.column("#0", "width"), narrow)
 
+    def test_the_widened_column_comes_back_when_the_catalog_arrives(self):
+        # 撑开是为了让长提示读得全，目录到了就该按资源本身的宽度重新算，否则横向滚动条一直挂着
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        apply_resource_list({}, "获取资源列表失败，可重新打开本程序重试：" + "ConnectionError：HTTPSConnectionPool(host='example.com')…")
+        self.root.update()
+        widened = tree.column("#0", "width")
+
+        apply_resource_list(RESOURCES)
+        self.root.update()
+
+        self.assertFalse(tree.exists(resource_tree.STATUS_ITEM_ID))
+        self.assertLess(tree.column("#0", "width"), widened)
+
+    def test_destroying_the_tree_survives_a_failing_timer_cancel(self):
+        # 解释器收尾时主窗口可能已经没了，取消定时器会抛 TclError，不能让销毁流程跟着炸
+        timers = self.install_fake_timers()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+        self.assertTrue(self.catalog_ticks(timers))
+
+        def refuse_to_cancel(_timer_id):
+            raise tk.TclError('invalid command name "after"')
+
+        with patch.object(self.root, "after_cancel", refuse_to_cancel):
+            tree.destroy() # 不应抛出异常
+        self.root.update()
+
     def test_destroying_the_tree_cancels_the_clock(self):
         timers = self.install_fake_timers()
         _apply, tree = self.catalog_tree()
