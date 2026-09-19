@@ -43,6 +43,10 @@ def catalog_cache_path() -> Path | None: # 获取资源目录缓存的文件路�
     config_path = config_file_path()
     return config_path.with_name("catalog-cache.json.gz") if config_path else None
 
+def log_dir_path() -> Path | None: # 获取日志目录，与配置文件放在同一目录下（Windows 的配置在注册表，此处仍用那个备用目录）
+    config_path = config_file_path()
+    return config_path.with_name("logs") if config_path else None
+
 def config_location() -> str: # 获取配置存放位置的描述文本，用于提示用户
     if os_name == "Windows":
         return f"已写入注册表：HKEY_CURRENT_USER\\{REGISTRY_PATH}"

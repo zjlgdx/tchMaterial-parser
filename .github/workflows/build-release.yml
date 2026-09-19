@@ -51,14 +51,50 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
+
+      # 捆绑进 macOS 包的 Tk 若早于 8.6.13，用户的鼠标点击不会被登记（CPython gh-110218）
+      - name: Check Tcl/Tk version
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re, sys, tkinter
+
+          MIN_MACOS_TK = (8, 6, 13)
+
+          patchlevel = tkinter.Tcl().eval("info patchlevel")
+          print("Tcl", patchlevel)
+          try: # runner 上不一定起得来图形界面，起不来就用 Tcl 版本代替（官方安装包两者同版本）
+              root = tkinter.Tk()
+              root.withdraw()
+              patchlevel = root.getvar("tk_patchLevel")
+              print("Tk", patchlevel, "| windowingsystem", root.tk.call("tk", "windowingsystem"))
+              root.destroy()
+          except Exception as error:
+              print("Tk 无法初始化，改用 Tcl 版本判断：", error)
+
+          # 与 platform_utils.tk_patchlevel() 同一套规则：预发布版形如 9.1b1，取每段的前导数字，
+          # 遇到不以数字开头的段就停下，少于两段视为没解析出来
+          numbers = []
+          for part in patchlevel.split("."):
+              leading_digits = re.match(r"\d+", part)
+              if not leading_digits:
+                  break
+              numbers.append(int(leading_digits.group()))
+
+          if len(numbers) < 2: # 这是防回退断言，确认不了就不能放行
+              sys.exit(f"无法解析版本号 {patchlevel}，无法确认捆绑的 Tk 是否满足最低要求")
+          if tuple(numbers) < MIN_MACOS_TK:
+              sys.exit(f"捆绑的 Tk {patchlevel} 早于 {'.'.join(map(str, MIN_MACOS_TK))}，macOS 上的鼠标点击不会被登记")
+          PY
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyinstaller
+          pip install "pyinstaller>=6.22"
           pip install .
 
       - name: Build app with PyInstaller
@@ -76,7 +112,7 @@ jobs:
         run: /usr/bin/ditto -c -k --keepParent -rsrc "dist/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
       - name: Upload Release Asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/${{ matrix.asset }}
           tag_name: ${{ inputs.tag || github.ref_name }}

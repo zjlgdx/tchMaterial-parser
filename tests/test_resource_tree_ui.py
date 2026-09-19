@@ -162,7 +162,9 @@ class ResourceTreeUITest(unittest.TestCase):
         return self.tree
 
     def hover(self, tree, item_id):
-        y = next(y for y in range(4, 800, 4) if tree.identify_row(y) == item_id)
+        y = next((y for y in range(4, 800, 4) if tree.identify_row(y) == item_id), None)
+        if y is None: # Tk 9 起，窗口未映射时 identify_row 不再解析出行，这类用例取不到真实几何
+            self.skipTest(f"当前 Tk（{self.root.getvar('tk_patchLevel')}）在窗口未映射时不解析 identify_row，取不到 {item_id} 的真实几何")
         tree.event_generate("<Motion>", x=10, y=y)
         self.root.after(600, self.root.quit) # 悬停提示有 450 毫秒延迟
         self.root.mainloop()
@@ -659,6 +661,254 @@ class ResourceTreeUITest(unittest.TestCase):
         self.root.update()
         self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["获取资源列表失败，请手动填写资源链接，或重新打开本程序"])
 
+    def catalog_tree(self, status="正在加载资源列表…"): # 建一棵仍在等目录的树，返回填入函数与树视图
+        pane = ttk.Frame(self.root)
+        urls = tk.Text(self.root, undo=True)
+        apply_resource_list = resource_tree.build_resource_tree(pane, {}, urls, status)
+        widgets = list(self.descendants(pane))
+        tree = next(widget for widget in widgets if isinstance(widget, ttk.Treeview))
+        self.catalog_search = next(widget for widget in widgets if isinstance(widget, ttk.Entry)) # 这棵树自己的搜索框
+        return apply_resource_list, tree
+
+    def catalog_ticks(self, timers): # 仍然有效的目录计时器
+        return [timer for timer in timers if timer[0] == resource_tree.CATALOG_TICK_MS and timer[1] is not None]
+
+    def fire_catalog_tick(self, timers):
+        self.catalog_ticks(timers)[-1][1]()
+
+    def status_text(self, tree):
+        return tree.item(resource_tree.STATUS_ITEM_ID, "text")
+
+    def loading_clock(self):
+        clock = [1000.0] # 自造时钟，免得用例真的等上几十秒
+        self.context.enter_context(patch.object(resource_tree, "time", SimpleNamespace(monotonic=lambda: clock[0])))
+        return clock
+
+    def test_stage_updates_replace_the_status_row(self):
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+
+        apply_resource_list(None, "正在下载资源列表（第 2/4 部分）")
+        self.root.update()
+
+        self.assertEqual([tree.item(item, "text") for item in tree.get_children()], ["正在下载资源列表（第 2/4 部分）"])
+
+    def test_a_late_stage_update_cannot_replace_a_ready_catalog(self):
+        # 目录已经就绪之后再收到阶段提示，不能把整棵树换回一行提示，也不能重新起表
+        timers = self.install_fake_timers()
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        apply_resource_list(RESOURCES)
+        self.root.update()
+
+        apply_resource_list(None, "正在下载资源列表（第 3/4 部分）")
+        self.root.update()
+        self.catalog_search.insert(0, "语文") # 搜索会整棵重建，过期提示要是留着就会在这里冒出来
+        self.root.update()
+        for timer in self.live_timers(timers):
+            timer[1]()
+        self.root.update()
+
+        self.assertFalse(tree.exists(resource_tree.STATUS_ITEM_ID))
+        self.assertTrue(tree.exists("books:primary:a"))
+        self.assertEqual(self.catalog_ticks(timers), [])
+
+    def test_a_long_status_line_widens_the_tree_column(self):
+        # 提示行不经过插入树项那条路径，宽度没人算的话长文案会被裁掉，横向也滚不出来
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        narrow = tree.column("#0", "width")
+
+        long_status = "获取资源列表失败，可重新打开本程序重试：" + "ConnectionError：HTTPSConnectionPool(host='example.com', port=443)…"
+        apply_resource_list({}, long_status)
+        self.root.update()
+
+        self.assertEqual(self.status_text(tree), long_status)
+        self.assertGreater(tree.column("#0", "width"), narrow)
+
+    def test_the_widened_column_comes_back_when_the_catalog_arrives(self):
+        # 撑开是为了让长提示读得全，目录到了就该按资源本身的宽度重新算，否则横向滚动条一直挂着
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        apply_resource_list({}, "获取资源列表失败，可重新打开本程序重试：" + "ConnectionError：HTTPSConnectionPool(host='example.com')…")
+        self.root.update()
+        widened = tree.column("#0", "width")
+
+        apply_resource_list(RESOURCES)
+        self.root.update()
+
+        self.assertFalse(tree.exists(resource_tree.STATUS_ITEM_ID))
+        self.assertLess(tree.column("#0", "width"), widened)
+
+    def test_destroying_the_tree_survives_a_failing_timer_cancel(self):
+        # 解释器收尾时主窗口可能已经没了，取消定时器会抛 TclError，不能让销毁流程跟着炸
+        timers = self.install_fake_timers()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+        self.assertTrue(self.catalog_ticks(timers))
+
+        def refuse_to_cancel(_timer_id):
+            raise tk.TclError('invalid command name "after"')
+
+        with patch.object(self.root, "after_cancel", refuse_to_cancel):
+            tree.destroy()
+        self.root.update()
+
+        # <Destroy> 回调里漏出来的异常由 tkinter 转交 report_callback_exception，destroy() 自己从不抛，
+        # 所以真正能判定护栏在位的是这里：没有异常被转交出来
+        self.assertEqual(self.errors, [])
+
+    def test_destroying_the_tree_cancels_the_clock(self):
+        timers = self.install_fake_timers()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+        self.assertTrue(self.catalog_ticks(timers)) # 先确认真的有表在走
+
+        tree.destroy()
+        self.root.update()
+
+        self.assertEqual(self.catalog_ticks(timers), [])
+
+    def test_elapsed_time_appears_while_the_catalog_is_loading(self):
+        timers = self.install_fake_timers()
+        clock = self.loading_clock()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+        self.assertEqual(self.status_text(tree), "正在加载资源列表…") # 刚开始不显示 0 秒
+
+        clock[0] += 12
+        self.fire_catalog_tick(timers)
+
+        self.assertEqual(self.status_text(tree), "正在加载资源列表…（已用 12 秒）")
+
+    def test_a_long_wait_adds_an_actionable_hint(self):
+        timers = self.install_fake_timers()
+        clock = self.loading_clock()
+        _apply, tree = self.catalog_tree()
+        self.root.update()
+
+        clock[0] += resource_tree.CATALOG_SLOW_SECONDS
+        self.fire_catalog_tick(timers)
+
+        self.assertIn(resource_tree.CATALOG_SLOW_HINT, self.status_text(tree))
+
+    def test_failure_stops_the_clock_and_keeps_its_own_wording(self):
+        failure = "获取资源列表失败（连接超时），可在右侧手动填写资源链接下载，或检查网络后重新打开本程序"
+        timers = self.install_fake_timers()
+        clock = self.loading_clock()
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+        tick = self.catalog_ticks(timers)[-1][1] # 先抓住回调，取消之后就拿不到了
+
+        apply_resource_list({}, failure)
+        self.root.update()
+
+        self.assertEqual(self.catalog_ticks(timers), []) # 终态不再计时
+        clock[0] += 600
+        tick() # 即便回调被再触发一次，失败原因也不能被秒数改写
+        self.assertEqual(self.status_text(tree), failure)
+
+    def test_a_ready_catalog_stops_the_clock(self):
+        timers = self.install_fake_timers()
+        apply_resource_list, tree = self.catalog_tree()
+        self.root.update()
+
+        apply_resource_list(RESOURCES)
+        self.root.update()
+
+        self.assertEqual(self.catalog_ticks(timers), [])
+        self.assertFalse(tree.exists(resource_tree.STATUS_ITEM_ID))
+
+    def test_macos_replaces_the_card_treeview_field(self):
+        # 卡片贴图要逐帧平铺满整个树区域，aqua 上每帧多花十几毫秒
+        style = ttk.Style(self.root)
+        with patch.object(theme, "os_name", "Darwin"):
+            theme.apply_theme("light")
+
+        self.assertIn(theme.FLAT_TREEVIEW_FIELD, style.element_names()) # 元素没建出来时布局只是引用了个空名字
+        self.assertNotEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
+        self.assertEqual(style.lookup("Custom.Treeview", "fieldbackground"), theme.current_colors["surface"])
+
+    def test_other_systems_keep_the_card_treeview_field(self):
+        style = ttk.Style(self.root)
+        style.layout("Custom.Treeview", style.layout("Treeview")) # 先还原成 sv-ttk 的原始布局
+        with patch.object(theme, "os_name", "Windows"):
+            theme.apply_theme("light")
+
+        self.assertEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
+
+    def test_the_flat_field_draws_no_focus_ring(self):
+        # 纯色底板在 Tk 9 上会给取得键盘焦点的控件画一圈蓝边，而原本的卡片贴图从不画
+        style = ttk.Style(self.root)
+        with patch.object(theme, "os_name", "Darwin"):
+            theme.apply_theme("light")
+
+        self.assertEqual(str(style.lookup("Custom.Treeview", "focuswidth")), "0")
+
+    def item_layout(self, style): # 当前生效的树项布局
+        return style.layout("Custom.Treeview.Item")
+
+    def indicator_names(self, layout): # 布局里所有指示器元素的名字
+        found = []
+        for name, options in layout:
+            if "indicator" in name:
+                found.append(name)
+            found.extend(self.indicator_names(options.get("children", [])))
+        return found
+
+    def element_names(self, layout):
+        found = []
+        for name, options in layout:
+            found.append(name)
+            found.extend(self.element_names(options.get("children", [])))
+        return found
+
+    def test_newer_tk_uses_the_builtin_expand_indicator(self):
+        # Tk 9 不再把展开状态传给树项元素，贴图做的箭头会一直停在折叠的样子
+        style = ttk.Style(self.root)
+        with patch.object(theme, "tk_patchlevel", lambda _root: (9, 0, 3)):
+            theme.apply_theme("light")
+
+        layout = self.item_layout(style)
+        self.assertIn(theme.BUILTIN_TREEITEM_INDICATOR, style.element_names()) # 元素没建出来时布局只是引用了个空名字
+        self.assertEqual(self.indicator_names(layout), [theme.BUILTIN_TREEITEM_INDICATOR])
+        # 勾选框与封面是画在树项图片上的，换箭头不能把它们挤掉
+        self.assertIn("Treeitem.image", self.element_names(layout))
+        self.assertIn("Treeitem.text", self.element_names(layout))
+
+    def test_older_tk_keeps_the_themed_expand_indicator(self):
+        style = ttk.Style(self.root)
+        stock = style.layout("Item")
+        style.layout("Custom.Treeview.Item", stock) # 先还原，免得受本进程 Tk 版本影响
+        with patch.object(theme, "tk_patchlevel", lambda _root: (8, 6, 12)):
+            theme.apply_theme("light")
+
+        self.assertEqual(self.indicator_names(self.item_layout(style)), ["Treeitem.indicator"])
+
+    def test_an_unreadable_tk_version_keeps_the_themed_indicator(self):
+        style = ttk.Style(self.root)
+        style.layout("Custom.Treeview.Item", style.layout("Item"))
+        with patch.object(theme, "tk_patchlevel", lambda _root: ()): # 版本号读不到时不动布局
+            theme.apply_theme("light")
+
+        self.assertEqual(self.indicator_names(self.item_layout(style)), ["Treeitem.indicator"])
+
+    def test_switching_themes_repeatedly_keeps_the_builtin_indicator(self):
+        style = ttk.Style(self.root)
+        with patch.object(theme, "tk_patchlevel", lambda _root: (9, 0, 3)):
+            for name in ("light", "dark", "light", "dark"): # 元素按主题注册，重复创建会抛 TclError
+                theme.apply_theme(name)
+                self.assertEqual(self.indicator_names(self.item_layout(style)), [theme.BUILTIN_TREEITEM_INDICATOR])
+
+    def test_switching_themes_repeatedly_keeps_the_flat_field(self):
+        # 元素按 ttk 主题注册，浅色与深色是两个主题；重复创建同名元素会抛 TclError
+        style = ttk.Style(self.root)
+        with patch.object(theme, "os_name", "Darwin"):
+            for name in ("light", "dark", "light", "dark"):
+                theme.apply_theme(name)
+                self.assertNotEqual(style.layout("Custom.Treeview")[0][0], "Treeview.field")
+                self.assertEqual(style.lookup("Custom.Treeview", "fieldbackground"), theme.current_colors["surface"])
+
     def test_paste_whitespace_and_undo_sync_without_changing_other_urls(self):
         self.expand("books:primary")
         external = "https://example.com/manual"
@@ -722,6 +972,24 @@ def test_visible_rows_probe_the_top_border_a_bounded_number_of_times():
     assert [y for y in tree.identify_calls if y < tree.border] == [0, 2, 4]
 
 
+def test_replace_layout_element_only_swaps_the_named_element():
+    layout = [("A.field", {"sticky": "nswe", "children": [
+        ("A.padding", {"children": [("A.indicator", {"side": "left"}), ("A.text", {"side": "left"})]}),
+    ]})]
+
+    replaced = theme.replace_layout_element(layout, "A.indicator", "B.indicator")
+
+    assert replaced == [("A.field", {"sticky": "nswe", "children": [
+        ("A.padding", {"children": [("B.indicator", {"side": "left"}), ("A.text", {"side": "left"})]}),
+    ]})]
+    assert layout[0][1]["children"][0][1]["children"][0][0] == "A.indicator" # 原布局不被就地改写
+
+
+def test_replace_layout_element_leaves_unrelated_layouts_alone():
+    layout = [("X.field", {"sticky": "nswe"})]
+    assert theme.replace_layout_element(layout, "A.indicator", "B.indicator") == layout
+
+
 def test_visible_rows_are_empty_without_items():
     tree = FakeTreeview(0)
     assert resource_tree.visible_tree_rows(tree) == []
@@ -736,10 +1004,13 @@ def test_resource_tree_interaction(case):
         capture_output=True, text=True, encoding="utf-8", timeout=20,
     )
     if result.returncode == 77:
-        pytest.skip("当前环境没有图形显示服务，需在桌面环境或 Xvfb 中运行")
+        reason = result.stdout.strip().splitlines() # 子进程把跳过原因写在标准输出的最后一行
+        pytest.skip(reason[-1] if reason else "当前环境没有图形显示服务，需在桌面环境或 Xvfb 中运行")
     assert result.returncode == 0, result.stdout + result.stderr
 
 
 if __name__ == "__main__":
     result = unittest.TextTestRunner().run(unittest.TestSuite([ResourceTreeUITest(sys.argv[1])]))
+    if result.skipped: # 父进程只看得到退出码与输出，跳过原因要显式送出去
+        print(result.skipped[0][1])
     raise SystemExit(77 if result.skipped else int(not result.wasSuccessful()))

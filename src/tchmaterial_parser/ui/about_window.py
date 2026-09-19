@@ -2,13 +2,16 @@
 # 关于窗口：展示程序、作者、项目地址与许可证信息
 
 import tkinter as tk
+from collections.abc import Callable
+from pathlib import Path
 from tkinter import messagebox, ttk
 import webbrowser
 
 from PIL import Image, ImageTk
 
 from .. import __version__
-from ..platform_utils import resource_path
+from ..config import log_dir_path
+from ..platform_utils import open_path, resource_path
 from . import runtime, theme
 from .runtime import scaled
 from .widgets import center_window
@@ -25,11 +28,18 @@ def open_url(url: str, parent: tk.Toplevel) -> None: # 使用系统默认浏览�
         messagebox.showerror("无法打开链接", f"请复制链接后在浏览器中打开：\n{url}\n\n{e}", parent=parent)
 
 def make_link(parent: tk.Widget, text: str, url: str, window: tk.Toplevel) -> ttk.Label: # 创建可通过鼠标或键盘打开的链接标签
+    return make_action_link(parent, text, lambda: open_url(url, window))
+
+def make_action_link(parent: tk.Widget, text: str, action: Callable[[], None]) -> ttk.Label: # 外观与链接一致，但点击后执行给定操作
     link = ttk.Label(parent, text=text, style="AboutLink.TLabel", cursor="hand2", takefocus=True)
-    link.bind("<Button-1>", lambda _event: open_url(url, window)) # 鼠标左键
-    link.bind("<Return>", lambda _event: open_url(url, window)) # 回车键
-    link.bind("<space>", lambda _event: open_url(url, window)) # 空格键
+    link.bind("<Button-1>", lambda _event: action()) # 鼠标左键
+    link.bind("<Return>", lambda _event: action()) # 回车键
+    link.bind("<space>", lambda _event: action()) # 空格键
     return link
+
+def open_log_dir(log_dir: Path, parent: tk.Toplevel) -> None: # 打开日志目录，失败时把路径告诉用户
+    if not open_path(log_dir):
+        messagebox.showerror("无法打开日志目录", f"请手动打开以下目录：\n{log_dir}", parent=parent)
 
 def show_about_window() -> None: # 打开关于窗口
     about_window = tk.Toplevel(runtime.root)
@@ -112,6 +122,14 @@ def show_about_window() -> None: # 打开关于窗口
     )
     license_link = make_link(info_card, "MIT License", LICENSE_URL, about_window)
     license_link.grid(row=2, column=1, sticky="nw", pady=(scaled(8), 0))
+
+    log_dir = log_dir_path()
+    if log_dir and log_dir.is_dir(): # 日志退化为只有控制台输出时目录并不存在，此时整行不出现，免得留个点不开的链接
+        ttk.Label(info_card, text="日志", style="AboutCardMuted.TLabel").grid(
+            row=3, column=0, sticky="nw", padx=(0, scaled(16)), pady=(scaled(8), 0),
+        )
+        log_link = make_action_link(info_card, "打开日志目录 ↗", lambda: open_log_dir(log_dir, about_window))
+        log_link.grid(row=3, column=1, sticky="nw", pady=(scaled(8), 0))
 
     # 第三方资源与许可证说明
     license_card = ttk.Frame(frame, style="Card.TFrame", padding=(scaled(16), scaled(12)))

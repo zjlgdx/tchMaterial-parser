@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 # 获取平台上的资源目录树，并提供按分类路径筛选与计数的辅助函数
 
-import gzip, json, os
+import gzip, json, logging, os
+from collections.abc import Callable
 
 from .config import catalog_cache_path
+from .logging_utils import log_duration
 from .network import session
 from .platform_utils import print_error
 
+logger = logging.getLogger(__name__)
+
 BOOK_VERSION_URL = "https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/resources/tch_material/version/data_version.json"
 CACHE_FORMAT = 1 # 缓存文件的结构版本，结构变动后旧缓存自然失效
+CATALOG_SLOW_MS = 15000 # 目录加载超过这个耗时就值得在日志里标出来
 
 def fetch_book_version() -> tuple[str, list[str]]: # 获取电子课本目录的版本标识与各分片地址（该文件很小，可先取它判断缓存是否仍然可用）
     version_data: dict = session.get(BOOK_VERSION_URL).json()
@@ -73,14 +78,16 @@ class ResourceHelper: # 获取网站上资源的数据
                 parsed[ch["tag_id"]] = { "display_name": ch["tag_name"], "children": self.parse_hierarchy(ch["hierarchies"]) }
         return parsed
 
-    def fetch_book_list(self, list_data: list[str]) -> dict: # 获取课本列表（list_data 为 fetch_book_version() 取得的分片地址）
+    def fetch_book_list(self, list_data: list[str], progress: Callable[[str], None] | None = None) -> dict: # 获取课本列表（list_data 为 fetch_book_version() 取得的分片地址）
         # 获取电子课本层级数据
         tags_resp = session.get("https://s-file-1.ykt.cbern.com.cn/zxx/ndrs/tags/tch_material_tag.json")
         tags_data: dict = tags_resp.json()
         parsed_hier = self.parse_hierarchy(tags_data["hierarchies"])
 
         # 获取电子课本列表
-        for url in list_data:
+        for index, url in enumerate(list_data, start=1):
+            if progress:
+                progress(f"正在下载资源列表（第 {index}/{len(list_data)} 部分）")
             book_resp = session.get(url)
             book_data: list[dict] = book_resp.json()
             if not isinstance(book_data, list) or not book_data: # 分片内容异常时整体失败，避免把残缺的目录写进缓存后长期复用
@@ -177,19 +184,27 @@ class ResourceHelper: # 获取网站上资源的数据
 
         return parsed_hier
 
-    def fetch_resource_list(self) -> dict: # 获取资源列表：目录版本未变时直接使用本地缓存，避免每次启动都重新下载全部分片
-        version, list_data = fetch_book_version()
-        cached_list = load_cached_resource_list(version)
-        if cached_list is not None:
-            return cached_list
+    def fetch_resource_list(self, progress: Callable[[str], None] | None = None) -> dict: # 获取资源列表：目录版本未变时直接使用本地缓存，避免每次启动都重新下载全部分片
+        with log_duration(logger, "获取资源目录", CATALOG_SLOW_MS):
+            if progress:
+                progress("正在检查资源列表版本")
+            version, list_data = fetch_book_version()
 
-        book_hier = self.fetch_book_list(list_data)
-        # 下面两类资源若要启用，其版本标识也应计入 version，否则它们更新后不会刷新缓存
-        # national_lesson_hier = self.fetch_national_lesson_list()
-        # prepare_lesson_hier = self.fetch_prepare_lesson_list()
-        resource_list = { **book_hier }
-        save_cached_resource_list(version, resource_list)
-        return resource_list
+            if progress:
+                progress("正在读取本地缓存")
+            cached_list = load_cached_resource_list(version)
+            if cached_list is not None:
+                logger.info("资源目录来自本地缓存，共 %d 个顶层分类", len(cached_list))
+                return cached_list
+
+            book_hier = self.fetch_book_list(list_data, progress)
+            # 下面两类资源若要启用，其版本标识也应计入 version，否则它们更新后不会刷新缓存
+            # national_lesson_hier = self.fetch_national_lesson_list()
+            # prepare_lesson_hier = self.fetch_prepare_lesson_list()
+            resource_list = { **book_hier }
+            save_cached_resource_list(version, resource_list)
+            logger.info("资源目录来自网络，共 %d 个分片、%d 个顶层分类", len(list_data), len(resource_list))
+            return resource_list
 
 def filter_resource_items(items: dict[str, dict], query: str) -> dict[str, dict]: # 按完整分类路径筛选资源树
     keywords = query.casefold().split()

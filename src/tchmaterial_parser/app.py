@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # 程序主流程：初始化配置、拉取资源列表、装配主窗口并进入主循环
 
-import os, sys
+import logging, os, sys
 import tkinter as tk
 from tkinter import ttk, messagebox
 import psutil
@@ -11,13 +11,26 @@ from . import __version__
 from .catalog import ResourceHelper
 from .config import load_access_token, load_config, save_config
 from .images import make_icon_image, render_system_emoji
-from .platform_utils import ctypes, os_name, print_error, resource_path, win32api, win32con, win32gui, win32print
+from .logging_utils import log_environment, redact_access_token, setup_logging
+from .platform_utils import MIN_MACOS_TK, ctypes, os_name, outdated_macos_tk, resource_path, win32api, win32con, win32gui, win32print
 from .ui import download_panel, runtime, theme
 from .ui.about_window import show_about_window
 from .ui.resource_tree import build_resource_tree
 from .ui.runtime import scaled, thread_it, ui_call
 from .ui.token_window import show_access_token_window
 from .ui.widgets import auto_hide_scrollbar, bind_context_menu, bind_tab_navigation, center_window
+
+logger = logging.getLogger(__name__)
+
+FAILURE_MESSAGE_MAX_LENGTH = 60 # 提示行只有一行，过长的异常消息要截断
+
+def failure_reason(e: Exception) -> str: # 把异常整理成一句能放进提示行的原因
+    # 类名放在最前且从不截断：连接失败与读取超时的消息开头都是一长串 HTTPSConnectionPool(host=…，
+    # 只留消息的话两者看起来一模一样
+    message = " ".join(redact_access_token(str(e)).split())
+    if len(message) > FAILURE_MESSAGE_MAX_LENGTH:
+        message = f"{message[:FAILURE_MESSAGE_MAX_LENGTH]}…"
+    return f"{type(e).__name__}：{message}" if message else type(e).__name__
 
 # 主界面上方的功能说明：Emoji 与正文分开渲染以保留系统字体的完整字形
 DESCRIPTION_ITEMS = (
@@ -29,6 +42,7 @@ DESCRIPTION_ITEMS = (
 
 
 def main() -> None: # 程序入口：初始化界面并进入主循环
+    setup_logging() # 先把日志接好，配置读写与界面初始化出错时才有落点
     scale: float | None = None
 
     # 在 Windows 上进行高 DPI 适配
@@ -48,10 +62,21 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     # GUI
     root = tk.Tk()
 
+    def report_callback_exception(exc_type: type, exc_value: BaseException, exc_traceback: object) -> None: # Tk 与界面队列的回调异常统一落到日志
+        logger.error("界面回调出错", exc_info=(exc_type, exc_value, exc_traceback))
+
+    root.report_callback_exception = report_callback_exception
+
     # 主窗口、界面字体与缩放因子由本函数创建，但其余模块也要用到，
     # 因此在此写入对应模块，供它们通过 runtime.root、runtime.ui_scale 等访问
     runtime.bind_root(root)
+    log_environment(root)
     theme.bind_font_family(theme.pick_ui_font_family())
+
+    # 过旧的 Tk 会丢掉鼠标点击，此时不能用弹窗提示：弹窗上的按钮同样点不动
+    outdated_tk = outdated_macos_tk(root)
+    if outdated_tk:
+        logger.warning("当前 Tk %s 早于 %s，macOS 上鼠标点击可能不被登记", outdated_tk, ".".join(str(part) for part in MIN_MACOS_TK))
 
     if not scale: # 若获取缩放因子失败，通过 Tkinter 估算缩放因子
         try:
@@ -181,10 +206,18 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     description_card.pack(fill="x", pady=(scaled(14), 0))
     description_card.columnconfigure(1, weight=1)
 
+    description_items = list(DESCRIPTION_ITEMS)
+    if outdated_tk: # 点击可能失灵时，把原因与出路直接摆在说明里，用户至少知道该换什么
+        description_items.append((
+            "⚠️",
+            f"当前 Python 自带的 Tk 为 {outdated_tk}，在此版本的 macOS 上鼠标点击可能不会被登记。"
+            "请改用 python.org 的 Python 3.11.7 或更高版本，或直接使用 Releases 中提供的应用。",
+        ))
+
     description_icons: list[ImageTk.PhotoImage] = [] # 保存 Tk 图片引用，避免图标被垃圾回收
     description_labels: list[ttk.Label] = []
-    for row, (symbol, text) in enumerate(DESCRIPTION_ITEMS):
-        row_padding = (0, scaled(1)) if row < len(DESCRIPTION_ITEMS) - 1 else 0
+    for row, (symbol, text) in enumerate(description_items):
+        row_padding = (0, scaled(1)) if row < len(description_items) - 1 else 0
         emoji_image = render_system_emoji(symbol, description_icon_size)
         if emoji_image is not None:
             photo = ImageTk.PhotoImage(emoji_image)
@@ -241,11 +274,15 @@ def main() -> None: # 程序入口：初始化界面并进入主循环
     apply_resource_list = build_resource_tree(treeview_pane, {}, url_text, "正在加载资源列表…")
 
     def load_resource_list() -> None: # 在后台线程获取资源列表，避免窗口迟迟不出现；加载期间仍可手动填写资源链接并下载
+        def report_stage(stage: str) -> None: # 阶段提示交给主线程写进提示行
+            ui_call(apply_resource_list, None, stage)
+
         try:
-            resource_list = ResourceHelper().fetch_resource_list()
+            resource_list = ResourceHelper().fetch_resource_list(report_stage)
         except Exception as e:
-            print_error(e)
-            ui_call(apply_resource_list, {}, "获取资源列表失败，请手动填写资源链接，或重新打开本程序")
+            logger.error("获取资源目录失败", exc_info=e)
+            # 下一步与原因都放一行：前半句在默认窗口里读得全，后面的原因长了可以横向滚动
+            ui_call(apply_resource_list, {}, f"获取资源列表失败，可重新打开本程序重试：{failure_reason(e)}")
             return
         ui_call(apply_resource_list, resource_list)
 
