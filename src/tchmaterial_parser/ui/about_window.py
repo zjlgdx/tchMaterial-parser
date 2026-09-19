@@ -16,8 +16,8 @@ from . import runtime, theme
 from .runtime import scaled
 from .widgets import center_window
 
-PROJECT_URL = "https://github.com/happycola233/tchMaterial-parser"
-LICENSE_URL = "https://github.com/happycola233/tchMaterial-parser/blob/main/LICENSE"
+PROJECT_URL = "https://github.com/zjlgdx/tchMaterial-parser"
+LICENSE_URL = "https://github.com/zjlgdx/tchMaterial-parser/blob/main/LICENSE"
 FLUENT_EMOJI_LICENSE_URL = "https://github.com/microsoft/fluentui-emoji/blob/main/LICENSE"
 
 def open_url(url: str, parent: tk.Toplevel) -> None: # 使用系统默认浏览器打开链接，并在失败时向用户给出明确提示
@@ -108,13 +108,15 @@ def show_about_window() -> None: # 打开关于窗口
     make_link(author_frame, "肥宅水水呀", "https://github.com/happycola233", about_window).pack(side="left")
     ttk.Label(author_frame, text="、", style="AboutCard.TLabel").pack(side="left")
     make_link(author_frame, "晨叶梦春", "https://github.com/wuziqian211", about_window).pack(side="left")
+    ttk.Label(author_frame, text="、", style="AboutCard.TLabel").pack(side="left")
+    make_link(author_frame, "Yvan", "https://github.com/zjlgdx", about_window).pack(side="left")
     ttk.Label(author_frame, text="及其他贡献者", style="AboutCard.TLabel").pack(side="left")
     author_frame.grid(row=0, column=1, sticky="nw")
 
     ttk.Label(info_card, text="仓库", style="AboutCardMuted.TLabel").grid(
         row=1, column=0, sticky="nw", padx=(0, scaled(16)), pady=(scaled(8), 0),
     )
-    project_link = make_link(info_card, "happycola233/tchMaterial-parser", PROJECT_URL, about_window)
+    project_link = make_link(info_card, "zjlgdx/tchMaterial-parser", PROJECT_URL, about_window)
     project_link.grid(row=1, column=1, sticky="nw", pady=(scaled(8), 0))
 
     ttk.Label(info_card, text="许可证", style="AboutCardMuted.TLabel").grid(

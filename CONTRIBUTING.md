@@ -15,7 +15,7 @@
 
 ```sh
 # 克隆项目
-git clone https://github.com/happycola233/tchMaterial-parser.git
+git clone https://github.com/zjlgdx/tchMaterial-parser.git
 cd tchMaterial-parser
 
 # 安装依赖

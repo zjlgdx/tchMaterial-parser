@@ -10,9 +10,9 @@
 
 <br />
 
-[![GitHub Release](https://img.shields.io/github/v/release/happycola233/tchMaterial-parser?style=flat-square&color=4c8bf5&logo=github)](../../releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/happycola233/tchMaterial-parser/total?style=flat-square&color=4c8bf5&label=downloads)](../../releases)
-[![Stars](https://img.shields.io/github/stars/happycola233/tchMaterial-parser?style=flat-square&color=f5a623)](../../stargazers)
+[![GitHub Release](https://img.shields.io/github/v/release/zjlgdx/tchMaterial-parser?style=flat-square&color=4c8bf5&logo=github)](../../releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/zjlgdx/tchMaterial-parser/total?style=flat-square&color=4c8bf5&label=downloads)](../../releases)
+[![Stars](https://img.shields.io/github/stars/zjlgdx/tchMaterial-parser?style=flat-square&color=f5a623)](../../stargazers)
 [![Python Version](https://img.shields.io/badge/Python-3.10+-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey?style=flat-square)](../../releases)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
@@ -213,11 +213,11 @@ https://basic.smartedu.cn/tchMaterial/detail?contentType=assets_document&content
 ## ⭐ Star History
 
 <div align="center">
-<a href="https://www.star-history.com/?repos=happycola233%2FtchMaterial-parser&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=zjlgdx%2FtchMaterial-parser&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=happycola233/tchMaterial-parser&type=date&theme=dark&legend=top-left&sealed_token=lp-dz0jwomojnfZdkKWtPYjxu2cIaluD151Uh_sKuhgbIy1MAw4WMMHg9KPtHrdNSur9Z6j6P4cR0NAR7-8vT_ttSDIBynMuDVy5ljc73IMV_4RAyLzs1GtoC6yH3QNnQtQahl8r9J2REXs-NNJ7Pu55SQ2X52m6JNy5v91zdGypyXAi758su9beu7pb" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=happycola233/tchMaterial-parser&type=date&legend=top-left&sealed_token=lp-dz0jwomojnfZdkKWtPYjxu2cIaluD151Uh_sKuhgbIy1MAw4WMMHg9KPtHrdNSur9Z6j6P4cR0NAR7-8vT_ttSDIBynMuDVy5ljc73IMV_4RAyLzs1GtoC6yH3QNnQtQahl8r9J2REXs-NNJ7Pu55SQ2X52m6JNy5v91zdGypyXAi758su9beu7pb" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=happycola233/tchMaterial-parser&type=date&legend=top-left&sealed_token=lp-dz0jwomojnfZdkKWtPYjxu2cIaluD151Uh_sKuhgbIy1MAw4WMMHg9KPtHrdNSur9Z6j6P4cR0NAR7-8vT_ttSDIBynMuDVy5ljc73IMV_4RAyLzs1GtoC6yH3QNnQtQahl8r9J2REXs-NNJ7Pu55SQ2X52m6JNy5v91zdGypyXAi758su9beu7pb" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=zjlgdx/tchMaterial-parser&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=zjlgdx/tchMaterial-parser&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=zjlgdx/tchMaterial-parser&type=date&legend=top-left" />
  </picture>
 </a>
 </div>
@@ -231,8 +231,8 @@ https://basic.smartedu.cn/tchMaterial/detail?contentType=assets_document&content
 感谢所有为本项目做出贡献的朋友：
 
 <div align="center">
-<a href="https://github.com/happycola233/tchMaterial-parser/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=happycola233/tchMaterial-parser" alt="Contributors" />
+<a href="https://github.com/zjlgdx/tchMaterial-parser/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=zjlgdx/tchMaterial-parser" alt="Contributors" />
 </a>
 </div>
 

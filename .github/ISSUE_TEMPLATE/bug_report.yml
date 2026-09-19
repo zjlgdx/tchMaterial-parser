@@ -13,11 +13,11 @@ body:
       label: 提交前的检查
       description: 大部分「下载失败」都能通过下面几步自行解决，请先确认一遍。
       options:
-        - label: 我已阅读 README 中的[常见问题](https://github.com/happycola233/tchMaterial-parser/blob/main/README.md#-常见问题)
+        - label: 我已阅读 README 中的[常见问题](https://github.com/zjlgdx/tchMaterial-parser/blob/main/README.md#-常见问题)
           required: true
-        - label: 我已尝试[重新获取并设置最新的 Access Token](https://github.com/happycola233/tchMaterial-parser/blob/main/README.md#2--%E8%AE%BE%E7%BD%AE-access-token%E5%8F%AF%E9%80%89)（Token 有效期一般为 7 天）
+        - label: 我已尝试[重新获取并设置最新的 Access Token](https://github.com/zjlgdx/tchMaterial-parser/blob/main/README.md#2--%E8%AE%BE%E7%BD%AE-access-token%E5%8F%AF%E9%80%89)（Token 有效期一般为 7 天）
           required: true
-        - label: 我搜索过已有的 [Issue](https://github.com/happycola233/tchMaterial-parser/issues)，没有找到相同的问题
+        - label: 我搜索过已有的 [Issue](https://github.com/zjlgdx/tchMaterial-parser/issues)，没有找到相同的问题
           required: true
 
   - type: input

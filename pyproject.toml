@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tchMaterial-parser"
-version = "4.2"
+version = "4.3"
 description = "国家中小学智慧教育平台 资源下载工具"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE", "licenses/*.txt"]
-authors = [{name = "肥宅水水呀"}, {name = "晨叶梦春", email = "wuziqian211@126.com"}]
+authors = [
+    {name = "肥宅水水呀"},
+    {name = "晨叶梦春", email = "wuziqian211@126.com"},
+    {name = "Yvan", email = "zjlgdx@gmail.com"},
+]
 dependencies = [
     "pillow>=12,<13",
     "psutil>=7,<8",
@@ -46,9 +50,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/happycola233/tchMaterial-parser"
-Repository = "https://github.com/happycola233/tchMaterial-parser"
-Issues = "https://github.com/happycola233/tchMaterial-parser/issues"
+Homepage = "https://github.com/zjlgdx/tchMaterial-parser"
+Repository = "https://github.com/zjlgdx/tchMaterial-parser"
+Issues = "https://github.com/zjlgdx/tchMaterial-parser/issues"
 
 [project.scripts]
 "tchmaterial-parser" = "tchmaterial_parser.app:main"
